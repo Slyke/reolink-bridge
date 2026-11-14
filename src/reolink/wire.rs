@@ -4,7 +4,7 @@ use aes::{
     Aes128,
     cipher::{AsyncStreamCipher, KeyIvInit},
 };
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -19,6 +19,9 @@ const IV: &[u8; 16] = b"0123456789abcdef";
 const XOR_KEY: [u8; 8] = [0x1f, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0xff];
 const TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_PACKET: usize = 8 * 1024 * 1024;
+const SNAPSHOT: u32 = 109;
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(18);
+const MAX_JPEG_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Device {
@@ -119,6 +122,65 @@ impl Session {
             .await
     }
 
+    pub async fn snapshot_jpeg(&mut self, channel: u8) -> Result<Vec<u8>> {
+        let extension =
+            format!(r#"<Extension version="1.1"><channelId>{channel}</channelId></Extension>"#);
+        let request = format!(
+            r#"<body><Snap version="1.1"><channelId>{channel}</channelId><logicChannel>0</logicChannel><time>0</time><fullFrame>0</fullFrame><streamType>main</streamType></Snap></body>"#
+        );
+        let deadline = tokio::time::Instant::now() + SNAPSHOT_TIMEOUT;
+        let mut packet = self
+            .exchange_with_timeout(
+                SNAPSHOT,
+                channel + 1,
+                &extension,
+                &request,
+                false,
+                SNAPSHOT_TIMEOUT,
+            )
+            .await?;
+        let sequence = packet.sequence;
+        let body = self.decode(&packet)?;
+        let xml = xml::document(&body)?;
+        let header = xml.root_element();
+        if let Some(reported) = xml::value(header, "channelId") {
+            ensure!(
+                reported.parse().ok() == Some(channel),
+                "camera reported a different snapshot channel"
+            );
+        }
+        let size = xml::value(header, "pictureSize")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|size| (4..=MAX_JPEG_BYTES).contains(size))
+            .context("invalid camera JPEG size")?;
+        let mut jpeg = Vec::with_capacity(size);
+        loop {
+            if let Some(data) = packet.binary(self) {
+                ensure!(
+                    jpeg.len() + data.len() <= size,
+                    "snapshot exceeded the announced JPEG size"
+                );
+                jpeg.extend_from_slice(&data);
+                if jpeg.len() == size {
+                    ensure!(jpeg.starts_with(&[0xff, 0xd8]), "snapshot is not JPEG");
+                    return Ok(jpeg);
+                }
+            }
+            loop {
+                packet = tokio::time::timeout_at(deadline, self.read())
+                    .await
+                    .context("Baichuan JPEG transfer timed out")??;
+                if packet.command == SNAPSHOT && packet.sequence == sequence {
+                    ensure!(
+                        matches!(packet.status, 200 | 201) && packet.offset < packet.body.len(),
+                        "snapshot ended before delivering the announced JPEG size"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     pub async fn logout(&mut self) {
         let _ = timeout(
             Duration::from_secs(2),
@@ -139,7 +201,20 @@ impl Session {
         body: &str,
         challenge: bool,
     ) -> Result<Packet> {
-        timeout(TIMEOUT, async {
+        self.exchange_with_timeout(command, channel, extension, body, challenge, TIMEOUT)
+            .await
+    }
+
+    async fn exchange_with_timeout(
+        &mut self,
+        command: u32,
+        channel: u8,
+        extension: &str,
+        body: &str,
+        challenge: bool,
+        deadline: Duration,
+    ) -> Result<Packet> {
+        timeout(deadline, async {
             self.sequence = (self.sequence + 1) & 0x00ff_ffff;
             let sequence = match command {
                 3 => {
@@ -172,7 +247,8 @@ impl Session {
                 let packet = self.read().await?;
                 if packet.command == command && packet.sequence == sequence {
                     ensure!(
-                        matches!(packet.status, 200 | 201 | 300)
+                        matches!(packet.status, 200 | 201)
+                            || (packet.status == 300 && !matches!(command, 18 | 19 | 295))
                             || (challenge && packet.status & 0xff00 == 0xdd00),
                         "Baichuan command {command} returned status {}",
                         packet.status

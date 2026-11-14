@@ -2,7 +2,10 @@ pub mod cgi;
 pub mod control;
 pub mod events;
 pub mod metadata;
+pub mod ptz;
 pub mod wire;
+
+use std::sync::Mutex;
 
 use anyhow::{Result, anyhow, ensure};
 use roxmltree::Node;
@@ -25,9 +28,20 @@ const ADVANCED_RULES: [(u32, &str); 5] = [
     (551, "loss"),
 ];
 
-pub async fn discover(device: &Device, webhook: Option<&Url>, id: &str, hub: &Hub) -> Result<()> {
+pub async fn discover(
+    device: &Device,
+    webhook: Option<&Url>,
+    id: &str,
+    hub: &Hub,
+    mode: crate::config::PtzMode,
+    capabilities: &Mutex<ptz::Capabilities>,
+) -> Result<()> {
     let mut session = device.connect().await?;
     let channel = device.channel;
+    let discovered = ptz::probe(&mut session, channel, mode).await;
+    let snapshot = discovered.snapshot();
+    *capabilities.lock().unwrap() = discovered;
+    hub.section(id, "capabilities", "ptz", snapshot);
     if let Ok(raw) = session.command(80, None, "").await
         && let Ok(doc) = xml::document(&raw)
         && let Some(info) = xml::find(doc.root_element(), "VersionInfo")

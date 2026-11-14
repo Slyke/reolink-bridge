@@ -20,7 +20,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
+use image::{ImageFormat, Rgb, RgbImage, codecs::jpeg::JpegEncoder};
 use rumqttc::v5::{
     AsyncClient, Event, MqttOptions,
     mqttbytes::{
@@ -44,6 +46,7 @@ const WS_TOKEN: &str = "fixture-websocket-token";
 const WEBHOOK_TOKEN: &str = "fixture-native-webhook-token";
 const PERSON_TOPIC: &str = "tns1:RuleEngine/MyRuleDetector/PeopleDetect";
 const VENDOR_TOPIC: &str = "tns1:RuleEngine/FutureDetector/ParcelMoved";
+const BROKER_PACKET_LIMIT: usize = 14_000;
 
 struct Fixture {
     addr: SocketAddr,
@@ -139,14 +142,35 @@ async fn local_broker_http_websocket_and_camera_controls() {
         .with_state(fixture.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
-    let mock = Arc::new(baichuan::Camera::default());
+    let mut noise: u32 = 1;
+    let image = RgbImage::from_fn(2560, 1440, |_, _| {
+        noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let [_, red, green, blue] = noise.to_le_bytes();
+        Rgb([red, green, blue])
+    });
+    let mut jpeg = Vec::new();
+    JpegEncoder::new(&mut jpeg).encode_image(&image).unwrap();
+    let mock = Arc::new(baichuan::Camera {
+        jpeg: Some(jpeg),
+        ..Default::default()
+    });
+    mock.ptz.store(true, Ordering::SeqCst);
     let baichuan_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let baichuan_port = baichuan_listener.local_addr().unwrap().port();
     tokio::spawn(mock.clone().serve(baichuan_listener));
 
+    let broker_path = directory.path().join("mosquitto.conf");
+    std::fs::write(
+        &broker_path,
+        format!(
+            "listener {} 127.0.0.1\nallow_anonymous true\nmax_packet_size {BROKER_PACKET_LIMIT}\n",
+            mqtt.port()
+        ),
+    )
+    .unwrap();
     let mut broker = Command::new("mosquitto")
-        .arg("-p")
-        .arg(mqtt.port().to_string())
+        .arg("-c")
+        .arg(broker_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -173,7 +197,9 @@ async fn local_broker_http_websocket_and_camera_controls() {
         "websocket":{"path":"/ws","token":"${FIXTURE_WS}"},
         "cameras":[{"id":"lab","host":"127.0.0.1","username":"admin","password":"${FIXTURE_PASSWORD}",
             "onvifPort":fixture.addr.port(),"baichuanPort":baichuan_port,
-            "eventTransport":"onvif_push","nativeWebhook":{"token":"${FIXTURE_NATIVE}"}}],
+            "eventTransport":"onvif_push","nativeWebhook":{"token":"${FIXTURE_NATIVE}"}},
+            {"id":"fixed","host":"127.0.0.1","username":"admin","password":"${FIXTURE_PASSWORD}",
+                "onvifPort":null,"baichuanPort":baichuan_port,"channel":1,"eventTransport":"baichuan"}],
         "callbacks":[
             {"id":"slow","url":"${FIXTURE_CALLBACK}","events":["person"]},
             {"id":"good","url":callback_url,"cameras":["lab"],"events":["person"]}
@@ -278,9 +304,18 @@ async fn local_broker_http_websocket_and_camera_controls() {
         "fixture-analytics"
     );
     assert_eq!(retained_seen["state/person"]["active"], false);
-    let (status, ready) = probe(&http, address, "/readyz").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(ready["checks"], json!({"cameras":true,"mqtt":true}));
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let (status, ready) = probe(&http, address, "/readyz").await;
+            if status == StatusCode::OK {
+                assert_eq!(ready["checks"], json!({"cameras":true,"mqtt":true}));
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("both camera channels and MQTT sessions should become ready");
 
     for (body, expected) in [
         (include_str!("fixtures/notify-active.xml"), true),
@@ -361,6 +396,16 @@ async fn local_broker_http_websocket_and_camera_controls() {
         next_ws(&mut websocket, |message| message["op"] == "event").await["event"],
         vendor
     );
+
+    check_ptz(
+        &http,
+        address,
+        &mut websocket,
+        &publisher,
+        &mut observed,
+        &mock,
+    )
+    .await;
 
     let before = mock.writes.load(Ordering::SeqCst);
     assert_eq!(before, 0);
@@ -444,6 +489,36 @@ async fn local_broker_http_websocket_and_camera_controls() {
     assert_code(&failure);
     assert!(!failure.to_string().contains("cause"));
 
+    publisher
+        .publish(
+            "site/cameras/lab/command/exec",
+            QoS::AtLeastOnce,
+            false,
+            r#"{"id":"snapshot-check","command":{"setting":"snapshot"}}"#,
+        )
+        .await
+        .unwrap();
+    let (retained, reply) = next_mqtt(&mut observed, "site/cameras/lab/command/result").await;
+    assert!(!retained);
+    assert_eq!(reply["id"], "snapshot-check");
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert!(reply.to_string().len() < BROKER_PACKET_LIMIT);
+    assert!(uuid::Uuid::parse_str(reply["correlation_id"].as_str().unwrap()).is_ok());
+    let result = &reply["result"];
+    assert_eq!(result["encoding"], "base64");
+    assert_eq!(result["content_type"], "image/png");
+    assert_eq!(result["original_width"], 2560);
+    assert_eq!(result["original_height"], 1440);
+    assert_eq!(result["resized"], true);
+    let png = STANDARD
+        .decode(result["data_base64"].as_str().unwrap())
+        .unwrap();
+    let image = image::load_from_memory_with_format(&png, ImageFormat::Png).unwrap();
+    assert_eq!(result["width"], image.width());
+    assert_eq!(result["height"], image.height());
+    assert!(image.width() < 1920 && image.height() < 1080);
+    assert!((image.width() * 9).abs_diff(image.height() * 16) < 16);
+
     until(|| mock.webhook.lock().unwrap().is_some()).await;
     let native = mock.webhook.lock().unwrap().clone().unwrap();
     assert!(native.ends_with(&format!("/ingest/reolink/lab/{WEBHOOK_TOKEN}")));
@@ -512,6 +587,229 @@ async fn local_broker_http_websocket_and_camera_controls() {
     let (_, state) = next_mqtt(&mut { offline }, "site/cameras/lab/availability").await;
     assert_eq!(state["online"], false);
     broker.kill().await.unwrap();
+}
+
+async fn check_ptz(
+    http: &reqwest::Client,
+    address: SocketAddr,
+    ws: &mut Ws,
+    publisher: &AsyncClient,
+    observed: &mut mpsc::UnboundedReceiver<Publish>,
+    camera: &baichuan::Camera,
+) {
+    let response = http
+        .post(format!("http://{address}/api/cameras/lab/command/exec"))
+        .body(r#"{"id":"no-auth","command":{"setting":"ptz","action":{"op":"status"}}}"#)
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let mut snapshot_id = 0;
+    timeout(Duration::from_secs(6), async {
+        loop {
+            snapshot_id += 1;
+            let snapshot = request(
+                ws,
+                json!({"id":format!("ptz-snapshot-{snapshot_id}"),"op":"snapshot"}),
+            )
+            .await;
+            let capabilities = snapshot["snapshots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|snapshot| {
+                    snapshot["camera_id"] == "lab" && snapshot["topic"] == "capabilities"
+                });
+            if let Some(capabilities) = capabilities
+                && capabilities["payload"]["ptz"]["supported"] == true
+            {
+                assert_eq!(
+                    capabilities["payload"]["ptz"]["zoom_range"],
+                    json!({"min":0,"max":27})
+                );
+                break;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let (status, fixed) = http_ptz(
+        http,
+        address,
+        "fixed",
+        "fixed-move",
+        json!({"op":"move","direction":"left","duration_ms":150}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{fixed}");
+    assert_eq!(fixed["errorKey"], "PTZ_UNSUPPORTED");
+    assert_code(&fixed);
+    assert!(camera.motions.lock().unwrap().is_empty());
+
+    camera.fail_next_stop.store(true, Ordering::SeqCst);
+    let (status, moved) = http_ptz(
+        http,
+        address,
+        "lab",
+        "http-move",
+        json!({"op":"move","direction":"left","duration_ms":150,"speed":16}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    assert_eq!(moved["result"]["stopped"], true);
+    assert_eq!(moved["verified"], false);
+    assert_eq!(
+        *camera.motions.lock().unwrap(),
+        [
+            ("Left".into(), Some(16)),
+            ("Stop".into(), None),
+            ("Stop".into(), None),
+        ]
+    );
+
+    let duplicate = request(ws, json!({"op":"control","id":"http-move","camera_id":"lab",
+        "command":{"setting":"ptz","action":{"op":"move","direction":"left","duration_ms":150,"speed":16}}})).await;
+    assert_eq!(duplicate["ok"], true, "{duplicate}");
+    assert_eq!(camera.motions.lock().unwrap().len(), 3);
+
+    let presets = request(
+        ws,
+        json!({"op":"control","id":"presets","camera_id":"lab",
+        "command":{"setting":"ptz","action":{"op":"list_presets"}}}),
+    )
+    .await;
+    assert_eq!(
+        presets["result"]["presets"],
+        json!([{"id":1,"name":"Fixture entrance"}])
+    );
+    let (status, unknown) = http_ptz(
+        http,
+        address,
+        "lab",
+        "unknown-preset",
+        json!({"op":"goto_preset","preset_id":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown["errorKey"], "PTZ_PRESET_UNKNOWN");
+    let preset = json!({"id":"mqtt-preset","command":{"setting":"ptz","action":{"op":"goto_preset","preset_id":1}}});
+    publisher
+        .publish(
+            "site/cameras/lab/command/exec",
+            QoS::AtLeastOnce,
+            false,
+            preset.to_string(),
+        )
+        .await
+        .unwrap();
+    let (retained, recalled) = next_mqtt(observed, "site/cameras/lab/command/result").await;
+    assert!(!retained);
+    assert_eq!(recalled["result"]["preset_id"], 1);
+    assert_eq!(
+        camera.motions.lock().unwrap().last().unwrap(),
+        &("toPos".into(), Some(1))
+    );
+
+    let (status, invalid) = http_ptz(
+        http,
+        address,
+        "lab",
+        "zoom-invalid",
+        json!({"op":"set_zoom","position":28}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(invalid["errorKey"], "PTZ_ZOOM_OUT_OF_RANGE");
+    let (status, zoom) = http_ptz(
+        http,
+        address,
+        "lab",
+        "zoom-in-range",
+        json!({"op":"set_zoom","position":12}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{zoom}");
+    assert_eq!(zoom["result"]["zoom"]["position"], 12);
+    assert_eq!(zoom["verified"], true);
+    let (_, state) = next_mqtt(observed, "site/cameras/lab/state/ptz").await;
+    assert_eq!(state["position"]["zoom"]["position"], 12);
+    let (status, location) = http_ptz(
+        http,
+        address,
+        "lab",
+        "status-update",
+        json!({"op":"status"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(location["result"]["pan"], 725);
+
+    let moved = json!({"op":"control","id":"ws-active-move","camera_id":"lab",
+        "command":{"setting":"ptz","action":{"op":"move","direction":"right","duration_ms":3000}}});
+    ws.send(Message::Text(moved.to_string().into()))
+        .await
+        .unwrap();
+    until(|| {
+        camera
+            .motions
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|motion| motion.0 == "Right")
+    })
+    .await;
+    let stopped_at = tokio::time::Instant::now();
+    let stop = json!({"op":"control","id":"ws-stop","camera_id":"lab","command":{"setting":"ptz","action":{"op":"stop"}}});
+    ws.send(Message::Text(stop.to_string().into()))
+        .await
+        .unwrap();
+    let mut replies = std::collections::BTreeMap::new();
+    for _ in 0..2 {
+        let reply = next_ws(ws, |message| {
+            matches!(message["id"].as_str(), Some("ws-active-move" | "ws-stop"))
+        })
+        .await;
+        replies.insert(reply["id"].as_str().unwrap().to_owned(), reply);
+    }
+    assert!(stopped_at.elapsed() < Duration::from_secs(2));
+    let movement = &replies["ws-active-move"];
+    assert!(
+        movement["result"]["interrupted"] == true
+            || movement["errorKey"] == "PTZ_START_INTERRUPTED",
+        "{movement}"
+    );
+    assert_eq!(replies["ws-stop"]["result"]["stopped"], true);
+}
+
+async fn http_ptz(
+    client: &reqwest::Client,
+    address: SocketAddr,
+    camera: &str,
+    id: &str,
+    action: Value,
+) -> (StatusCode, Value) {
+    let response = client
+        .post(format!(
+            "http://{address}/api/cameras/{camera}/command/exec"
+        ))
+        .bearer_auth(WS_TOKEN)
+        .header("content-type", "application/json")
+        .body(json!({"id":id,"command":{"setting":"ptz","action":action}}).to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let correlation = response.headers()["x-correlation-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let reply: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(reply["correlation_id"], correlation);
+    (status, reply)
 }
 
 async fn probe(client: &reqwest::Client, address: SocketAddr, path: &str) -> (StatusCode, Value) {

@@ -40,7 +40,7 @@ impl Snapshot {
             return false;
         }
         match self.topic.strip_prefix("state/") {
-            Some(kind) if kind != "settings" => {
+            Some(kind) if !matches!(kind, "settings" | "ptz") => {
                 filter.event(
                     kind,
                     self.payload["last"]["vendor_topic"].as_str().unwrap_or(""),
@@ -104,6 +104,11 @@ impl Hub {
             diagnostics,
             secrets,
         })
+    }
+
+    pub fn redacted(&self, mut value: Value) -> Value {
+        xml::redact(&mut value, &self.secrets);
+        value
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Update> {

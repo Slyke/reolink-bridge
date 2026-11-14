@@ -1,5 +1,8 @@
+mod snapshot;
+
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use rumqttc::{
     Transport,
@@ -17,7 +20,7 @@ use rumqttc::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
-    sync::{broadcast, mpsc, oneshot},
+    sync::{Semaphore, broadcast, mpsc, oneshot},
     time::{interval, sleep},
 };
 use tokio_util::sync::CancellationToken;
@@ -28,17 +31,43 @@ use crate::{
     config::{Filter, Mqtt, valid_id},
     diagnostics::Diagnostics,
     hub::{Hub, Update},
-    reolink::control::Control,
+    reolink::{control::Control, wire::Device},
 };
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Command {
     id: String,
-    command: Control,
+    command: CameraCommand,
 }
 
-pub fn options(config: &Mqtt, camera: &str, base: &str) -> MqttOptions {
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CameraCommand {
+    Snapshot(SnapshotCommand),
+    Control(Control),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotCommand {
+    setting: SnapshotSetting,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SnapshotSetting {
+    Snapshot,
+}
+
+pub struct CameraCommands {
+    pub control: ControlHandle,
+    pub device: Device,
+    pub snapshot_slot: Arc<Semaphore>,
+    pub snapshot_max_payload_bytes: usize,
+}
+
+pub fn options(config: &Mqtt, camera: &str, base: &str, transport: Transport) -> MqttOptions {
     let tls = config.url.scheme() == "mqtts";
     let host = config.url.host_str().unwrap().trim_matches(['[', ']']);
     let port = config.url.port().unwrap_or(if tls { 8883 } else { 1883 });
@@ -47,9 +76,7 @@ pub fn options(config: &Mqtt, camera: &str, base: &str) -> MqttOptions {
         .set_keep_alive(Duration::from_secs(15))
         .set_clean_start(true)
         .set_max_packet_size(Some(1024 * 1024));
-    if tls {
-        options.set_transport(Transport::tls_with_default_config());
-    }
+    options.set_transport(transport);
     if let (Some(user), Some(password)) = (&config.username, &config.password) {
         options.set_credentials(user, password);
     }
@@ -69,7 +96,7 @@ pub async fn run(
     base: String,
     id: String,
     hub: Arc<Hub>,
-    controls: Option<ControlHandle>,
+    services: Option<CameraCommands>,
     stop: CancellationToken,
 ) {
     let command_topic = format!("{base}/command/exec");
@@ -83,10 +110,11 @@ pub async fn run(
             let mut ready_on_ack = false;
             loop {
                 match connection.poll().await {
-                    Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                        ready_on_ack = controls.is_none();
+                    Ok(Event::Incoming(Packet::ConnAck(ack))) => {
+                        ready_on_ack = services.is_none();
                         if let Some(connected) = connected.take() {
-                            let _ = connected.send(());
+                            let _ = connected
+                                .send(ack.properties.and_then(|props| props.max_packet_size));
                         }
                     }
                     Ok(Event::Incoming(Packet::Publish(packet)))
@@ -144,7 +172,7 @@ pub async fn run(
             }
         };
         let publish = async {
-            if ready.await.is_ok() {
+            if let Ok(broker_limit) = ready.await {
                 diagnostics.log(
                     "mqtt::run",
                     "MQTT_CONNECTED",
@@ -152,7 +180,7 @@ pub async fn run(
                     None,
                     json!({"cameraId":id}),
                 );
-                if controls.is_some() {
+                if services.is_some() {
                     let subscription = SubscriptionFilter {
                         path: command_topic.clone(),
                         qos: QoS::AtLeastOnce,
@@ -171,7 +199,16 @@ pub async fn run(
                         return;
                     }
                 }
-                publish_session(&client, &base, &id, &hub, controls.as_ref(), receiver).await;
+                publish_session(
+                    &client,
+                    &base,
+                    &id,
+                    &hub,
+                    services.as_ref(),
+                    broker_limit,
+                    receiver,
+                )
+                .await;
             }
         };
         let error = tokio::select! {
@@ -203,7 +240,8 @@ async fn publish_session(
     base: &str,
     id: &str,
     hub: &Hub,
-    controls: Option<&ControlHandle>,
+    services: Option<&CameraCommands>,
+    broker_limit: Option<u32>,
     mut commands: mpsc::Receiver<Publish>,
 ) {
     let diagnostics = &hub.diagnostics;
@@ -218,6 +256,11 @@ async fn publish_session(
     let mut replies = FuturesUnordered::new();
     let event_topic = format!("{base}/events");
     let result_topic = format!("{base}/command/result");
+    // At most 5 fixed header bytes, 2 topic length bytes, 2 packet ID
+    // bytes and 1 byte for the empty MQTT v5 PUBLISH properties.
+    let payload_limit = broker_limit
+        .map(|limit| (limit as usize).saturating_sub(result_topic.len() + 10))
+        .unwrap_or(usize::MAX);
     loop {
         tokio::select! {
             _ = flush.tick(), if !dirty.is_empty() => {
@@ -248,15 +291,14 @@ async fn publish_session(
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
-            Some(packet) = commands.recv(), if controls.is_some() && replies.len() < 16 => {
-                if let Some(controller) = controls {
-                    replies.push(run_command(diagnostics, controller, packet));
+            Some(packet) = commands.recv(), if services.is_some() && replies.len() < 16 => {
+                if let Some(services) = services {
+                    replies.push(run_command(diagnostics, services, payload_limit, packet));
                 }
             }
-            Some(reply) = replies.next(), if !replies.is_empty() => {
-                if client.try_publish(&result_topic, QoS::AtLeastOnce, false, reply.to_string()).is_err() {
-                    let correlation = reply["correlation_id"].as_str().map(str::to_owned);
-                    diagnostics.error("mqtt::publish_session", "MQTT_RESULT_QUEUE_FULL", correlation,
+            Some((payload, correlation)) = replies.next(), if !replies.is_empty() => {
+                if client.try_publish(&result_topic, QoS::AtLeastOnce, false, payload).is_err() {
+                    diagnostics.error("mqtt::publish_session", "MQTT_RESULT_QUEUE_FULL", Some(correlation),
                         json!({"cameraId":id}), None);
                 }
             }
@@ -273,9 +315,10 @@ fn snapshot_topics(hub: &Hub, filter: &Filter) -> BTreeSet<String> {
 
 async fn run_command(
     diagnostics: &Diagnostics,
-    controller: &ControlHandle,
+    services: &CameraCommands,
+    payload_limit: usize,
     packet: Publish,
-) -> Value {
+) -> (Bytes, String) {
     let correlation = Uuid::new_v4().to_string();
     let request = if packet.payload.len() > 32 * 1024 {
         Err("MQTT_COMMAND_TOO_LARGE")
@@ -290,9 +333,44 @@ async fn run_command(
     };
     let mut id = None;
     let mut reply = match request {
-        Ok(request) => {
-            id = Some(request.id);
-            match controller.enqueue(request.command, id.clone(), correlation.clone()) {
+        Ok(Command {
+            id: request_id,
+            command:
+                CameraCommand::Snapshot(SnapshotCommand {
+                    setting: SnapshotSetting::Snapshot,
+                }),
+        }) => {
+            id = Some(request_id.clone());
+            let budget = payload_limit.min(services.snapshot_max_payload_bytes);
+            let (key, error) = match snapshot::capture(
+                &services.device,
+                &services.snapshot_slot,
+                budget,
+                request_id,
+                correlation.clone(),
+            )
+            .await
+            {
+                Ok(reply) => return (reply, correlation),
+                Err(failure) => failure,
+            };
+            diagnostics.error(
+                "mqtt::run_command",
+                key,
+                Some(correlation.clone()),
+                Value::Null,
+                Some(error),
+            )
+        }
+        Ok(Command {
+            id: request_id,
+            command: CameraCommand::Control(command),
+        }) => {
+            id = Some(request_id);
+            match services
+                .control
+                .enqueue(command, id.clone(), correlation.clone())
+            {
                 Ok(response) => response.await.unwrap_or_else(|_| {
                     diagnostics.error(
                         "mqtt::run_command",
@@ -320,16 +398,18 @@ async fn run_command(
         ),
     };
     reply["id"] = json!(id);
-    if reply["correlation_id"].is_null() {
-        reply["correlation_id"] = correlation.into();
-    }
-    reply
+    let correlation = reply["correlation_id"]
+        .as_str()
+        .map_or(correlation, str::to_owned);
+    reply["correlation_id"] = json!(correlation);
+    (reply.to_string().into(), correlation)
 }
 
 fn connection_cause(error: ConnectionError) -> anyhow::Error {
     match error {
         ConnectionError::Io(error) => error.into(),
         ConnectionError::Timeout(error) => error.into(),
+        ConnectionError::Tls(_) => anyhow::anyhow!("MQTT TLS authentication or handshake failed"),
         ConnectionError::ConnectionRefused(code) => {
             anyhow::anyhow!("broker refused connection ({code:?})")
         }

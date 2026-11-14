@@ -7,25 +7,31 @@ edition = "2024"
 aes = "0.8"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 bytes = "1"
 cfb-mode = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 digest_auth = "0.3"
 futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 json5 = "1.3.1"
 lz4_flex = { version = "0.13", default-features = false, features = ["std", "frame", "safe-decode", "safe-encode"] }
 md5 = "0.7"
+rcgen = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 retina = "0.4"
 roxmltree = "0.21"
 rumqttc = "0.25"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 subtle = "2"
 tempfile = "3"
+time = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "io-util", "sync", "process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 styleguide-logger = { path = "src/logger" }
@@ -33,4 +39,4 @@ url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-tokio-tungstenite = "0.29"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }

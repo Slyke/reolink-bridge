@@ -8,6 +8,7 @@ use tokio::time::timeout;
 
 use super::{
     events::spotlight_report,
+    ptz,
     wire::{Device, Session},
 };
 use crate::{model::boolean, xml};
@@ -37,6 +38,9 @@ pub enum Control {
         class: AiClass,
         sensitivity: Option<u8>,
         delay_seconds: Option<u8>,
+    },
+    Ptz {
+        action: ptz::Action,
     },
 }
 
@@ -95,6 +99,13 @@ impl AiClass {
 }
 
 impl Control {
+    pub fn ptz_action(&self) -> Option<&ptz::Action> {
+        match self {
+            Self::Ptz { action } => Some(action),
+            _ => None,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Spotlight {
@@ -137,6 +148,7 @@ impl Control {
                     "delay_seconds must be 0–8"
                 );
             }
+            Self::Ptz { action } => action.validate()?,
             Self::StatusLed { .. } | Self::IrLed { .. } => {}
         }
         Ok(())
@@ -368,6 +380,7 @@ async fn apply_connected(
             (Settings::Ai(*class), 343, edits)
         }
         Control::Spotlight { .. } => unreachable!(),
+        Control::Ptz { .. } => anyhow::bail!("PTZ uses the PTZ command worker"),
     };
     let raw = settings.read(session, channel).await?;
     let doc = xml::document(&raw)?;

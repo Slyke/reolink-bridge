@@ -1,6 +1,6 @@
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
 };
 
 use aes::{
@@ -22,6 +22,11 @@ pub struct Camera {
     pub led: AtomicBool,
     pub writes: AtomicUsize,
     pub webhook: Mutex<Option<String>>,
+    pub ptz: AtomicBool,
+    pub zoom: AtomicI32,
+    pub motions: Mutex<Vec<(String, Option<u32>)>>,
+    pub fail_next_stop: AtomicBool,
+    pub jpeg: Option<Vec<u8>>,
 }
 
 impl Camera {
@@ -87,12 +92,83 @@ impl Camera {
                 socket.write_u32_le(0).await?;
             }
             socket.write_all(&reply).await?;
+            if command == 109 && status == 200 {
+                for chunk in self.jpeg.as_deref().unwrap().chunks(64 * 1024) {
+                    let mut extension = format!(
+                        r#"<?xml version="1.0"?><Extension><binaryData>1</binaryData><encryptLen>{}</encryptLen></Extension>"#,
+                        chunk.len().min(16),
+                    ).into_bytes();
+                    let mut payload = chunk.to_vec();
+                    let encrypt_len = payload.len().min(16);
+                    cfb_mode::Encryptor::<Aes128>::new(key.into(), IV.into())
+                        .encrypt(&mut extension);
+                    cfb_mode::Encryptor::<Aes128>::new(key.into(), IV.into())
+                        .encrypt(&mut payload[..encrypt_len]);
+                    header[8..12]
+                        .copy_from_slice(&((extension.len() + payload.len()) as u32).to_le_bytes());
+                    socket.write_all(&header).await?;
+                    socket.write_u32_le(extension.len() as u32).await?;
+                    socket.write_all(&extension).await?;
+                    socket.write_all(&payload).await?;
+                }
+            }
         }
     }
 
     fn handle(&self, command: u32, body: &str) -> Result<(u16, String)> {
         let response = match command {
-            2 | 93 => String::new(),
+            2 | 31 | 93 => String::new(),
+            109 => {
+                let Some(jpeg) = &self.jpeg else {
+                    return Ok((405, String::new()));
+                };
+                let doc = roxmltree::Document::parse(body)?;
+                ensure!(field(&doc, "channelId") == Some("0"));
+                ensure!(field(&doc, "streamType") == Some("main"));
+                format!("<body><Snap><channelId>0</channelId><pictureSize>{}</pictureSize></Snap></body>", jpeg.len())
+            }
+            199 => {
+                let kind = if self.ptz.load(Ordering::SeqCst) { 2 } else { 0 };
+                let control = if kind == 2 { 64 } else { 0 };
+                let presets = if kind == 2 { 1 } else { 0 };
+                format!("<body><Support><item><chnID>0</chnID><ptzType>{kind}</ptzType><ptzControl>{control}</ptzControl><ptzPreset>{presets}</ptzPreset></item><item><chnID>1</chnID><ptzType>0</ptzType><ptzControl>0</ptzControl></item></Support></body>")
+            }
+            18 | 19 | 190 | 294 | 295 | 433 if !self.ptz.load(Ordering::SeqCst) => {
+                return Ok((405, String::new()));
+            }
+            18 => {
+                let doc = roxmltree::Document::parse(body)?;
+                ensure!(field(&doc, "channelId") == Some("0"));
+                let command = field(&doc, "command").unwrap();
+                let speed = field(&doc, "speed").and_then(|value| value.parse().ok());
+                self.motions.lock().unwrap().push((command.into(), speed));
+                if command == "Stop" && self.fail_next_stop.swap(false, Ordering::SeqCst) {
+                    return Ok((405, String::new()));
+                }
+                String::new()
+            }
+            19 => {
+                let doc = roxmltree::Document::parse(body)?;
+                ensure!(field(&doc, "channelId") == Some("0"));
+                ensure!(field(&doc, "command") == Some("toPos"));
+                let id = field(&doc, "id").unwrap().parse()?;
+                self.motions.lock().unwrap().push(("toPos".into(), Some(id)));
+                String::new()
+            }
+            190 => "<body><PtzPreset version=\"1.1\"><channelId>0</channelId><presetList><preset><id>1</id><name>Fixture entrance</name></preset><preset><id>2</id><name>Unused</name><enable>0</enable></preset></presetList></PtzPreset></body>".into(),
+            294 => {
+                let zoom = self.zoom.load(Ordering::SeqCst);
+                format!("<body><ZoomFocus><channelId>0</channelId><zoom><minPos>0</minPos><maxPos>27</maxPos><curPos>{zoom}</curPos></zoom></ZoomFocus></body>")
+            }
+            295 => {
+                let doc = roxmltree::Document::parse(body)?;
+                ensure!(field(&doc, "channelId") == Some("0"));
+                ensure!(field(&doc, "command") == Some("ZoomPos"));
+                let zoom = field(&doc, "movePos").unwrap().parse()?;
+                self.zoom.store(zoom, Ordering::SeqCst);
+                String::new()
+            }
+            433 => "<body><PtzCurPos><channelId>0</channelId><pPos>725</pPos><tPos>110</tPos></PtzCurPos></body>".into(),
             80 => "<body><VersionInfo><name>Test Camera</name><itemNo>CAM-001</itemNo></VersionInfo></body>".into(),
             208 => {
                 let state = if self.led.load(Ordering::SeqCst) { "open" } else { "close" };

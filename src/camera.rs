@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex as SyncMutex},
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
@@ -10,10 +14,10 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-    config::{Camera, EventTransport},
+    config::{Camera, EventTransport, PtzMode},
     hub::Hub,
     onvif::{Onvif, events::PushRoutes},
-    reolink::{self, control::Control, wire::Device},
+    reolink::{self, control::Control, ptz, wire::Device},
 };
 
 pub struct CameraTask {
@@ -29,7 +33,11 @@ pub struct CameraTask {
 }
 
 #[derive(Clone)]
-pub struct ControlHandle(mpsc::Sender<Command>);
+pub struct ControlHandle {
+    commands: mpsc::Sender<Command>,
+    stops: mpsc::Sender<Command>,
+    movement: Arc<SyncMutex<CancellationToken>>,
+}
 
 struct Command {
     control: Control,
@@ -37,6 +45,7 @@ struct Command {
     reply: oneshot::Sender<Value>,
     correlation_id: String,
     expires: Instant,
+    cancel_move: CancellationToken,
 }
 
 impl ControlHandle {
@@ -50,36 +59,64 @@ impl ControlHandle {
             .validate()
             .map_err(|error| ("CONTROL_VALIDATION_FAILED", error))?;
         let (reply, rx) = oneshot::channel();
+        let stop = control.ptz_action().is_some_and(ptz::Action::stop);
+        let mut movement = self.movement.lock().unwrap();
         let command = Command {
             control,
             replay_id,
             reply,
             correlation_id,
             expires: Instant::now() + Duration::from_secs(15),
+            cancel_move: movement.child_token(),
         };
-        self.0.try_send(command).map_err(|_| {
+        let sender = if stop { &self.stops } else { &self.commands };
+        sender.try_send(command).map_err(|_| {
             (
                 "CONTROL_QUEUE_UNAVAILABLE",
                 anyhow!("camera command queue unavailable"),
             )
         })?;
+        if stop {
+            // Stop also cancels older queued movements so they cannot start after it.
+            movement.cancel();
+            *movement = CancellationToken::new();
+        }
         Ok(rx)
     }
 }
 
 impl CameraTask {
     pub fn start(self) -> (ControlHandle, impl Future<Output = ()> + Send) {
-        let (tx, rx) = mpsc::channel(12);
+        let (commands, rx) = mpsc::channel(12);
+        let (stops, stop_rx) = mpsc::channel(4);
+        let controller = ControlHandle {
+            commands,
+            stops,
+            movement: Arc::new(SyncMutex::new(CancellationToken::new())),
+        };
         let task = async move {
             let settings_lock = Mutex::new(());
+            let capabilities = SyncMutex::new(ptz::Capabilities::new(
+                if self.baichuan.is_none() || self.config.ptz == PtzMode::Disabled {
+                    "disabled"
+                } else {
+                    "pending"
+                },
+            ));
+            self.hub.section(
+                &self.config.id,
+                "capabilities",
+                "ptz",
+                capabilities.lock().unwrap().snapshot(),
+            );
             tokio::join!(
                 self.events(),
-                self.discovery(&settings_lock),
-                self.controls(rx, &settings_lock),
+                self.discovery(&settings_lock, &capabilities),
+                self.controls(rx, stop_rx, &settings_lock, &capabilities),
                 self.metadata()
             );
         };
-        (ControlHandle(tx), task)
+        (controller, task)
     }
 
     async fn events(&self) {
@@ -146,7 +183,7 @@ impl CameraTask {
         }
     }
 
-    async fn discovery(&self, lock: &Mutex<()>) {
+    async fn discovery(&self, lock: &Mutex<()>, ptz: &SyncMutex<ptz::Capabilities>) {
         let mut refresh = interval(Duration::from_secs(120));
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -175,9 +212,15 @@ impl CameraTask {
             let baichuan = async {
                 if let Some(device) = &self.baichuan {
                     let _guard = lock.lock().await;
-                    if let Err(error) =
-                        reolink::discover(device, self.webhook.as_ref(), &self.config.id, &self.hub)
-                            .await
+                    if let Err(error) = reolink::discover(
+                        device,
+                        self.webhook.as_ref(),
+                        &self.config.id,
+                        &self.hub,
+                        self.config.ptz,
+                        ptz,
+                    )
+                    .await
                     {
                         self.hub.diagnostics.error(
                             "camera::discovery",
@@ -212,13 +255,22 @@ impl CameraTask {
         }
     }
 
-    async fn controls(&self, mut rx: mpsc::Receiver<Command>, lock: &Mutex<()>) {
+    async fn controls(
+        &self,
+        mut rx: mpsc::Receiver<Command>,
+        mut stops: mpsc::Receiver<Command>,
+        lock: &Mutex<()>,
+        capabilities: &SyncMutex<ptz::Capabilities>,
+    ) {
         let mut recent: VecDeque<(String, Control, Value)> = VecDeque::new();
         while let Some(request) = tokio::select! {
+            biased;
             _ = self.stop.cancelled() => None,
+            Some(command) = stops.recv() => Some(command),
             command = rx.recv() => command,
         } {
-            if let Some(id) = &request.replay_id
+            if !request.control.ptz_action().is_some_and(ptz::Action::stop)
+                && let Some(id) = &request.replay_id
                 && let Some((_, command, reply)) =
                     recent.iter().find(|(previous, _, _)| previous == id)
             {
@@ -233,6 +285,16 @@ impl CameraTask {
                         None,
                     )
                 };
+                let _ = request.reply.send(reply);
+                continue;
+            }
+            if let Some(action) = request.control.ptz_action() {
+                let reply = self.ptz_control(&request, capabilities, action).await;
+                if action.moves_camera()
+                    && let Some(id) = request.replay_id
+                {
+                    remember(&mut recent, id, request.control, reply.clone());
+                }
                 let _ = request.reply.send(reply);
                 continue;
             }
@@ -288,12 +350,59 @@ impl CameraTask {
                 ),
             };
             if let Some(id) = request.replay_id {
-                if recent.len() >= 128 {
-                    recent.pop_front();
-                }
-                recent.push_back((id, request.control, reply.clone()));
+                remember(&mut recent, id, request.control, reply.clone());
             }
             let _ = request.reply.send(reply);
+        }
+    }
+
+    async fn ptz_control(
+        &self,
+        request: &Command,
+        capabilities: &SyncMutex<ptz::Capabilities>,
+        action: &ptz::Action,
+    ) -> Value {
+        let outcome = async {
+            let device = self.baichuan.as_ref().ok_or_else(|| {
+                (
+                    "PTZ_TRANSPORT_DISABLED",
+                    anyhow!("Baichuan is disabled for this camera"),
+                )
+            })?;
+            // PTZ runs in the same per-camera command worker. Read-only discovery
+            // uses an independent session, so a slow probe cannot delay Stop.
+            if self.stop.is_cancelled() || Instant::now() > request.expires {
+                return Err((
+                    "PTZ_REQUEST_EXPIRED",
+                    anyhow!("PTZ command expired before execution"),
+                ));
+            }
+            if action.moves_camera() && request.cancel_move.is_cancelled() {
+                return Err((
+                    "PTZ_QUEUED_MOVE_CANCELLED",
+                    anyhow!("PTZ command was cancelled before execution"),
+                ));
+            }
+            let selected = capabilities.lock().unwrap().clone();
+            ptz::apply(device, &selected, action, &self.stop, &request.cancel_move).await
+        }
+        .await;
+        match outcome {
+            Ok(outcome) => {
+                if let Some(status) = outcome.status {
+                    self.hub
+                        .section(&self.config.id, "state/ptz", "position", status);
+                }
+                let result = self.hub.redacted(outcome.result);
+                json!({"ok": true, "verified": outcome.verified, "result": result})
+            }
+            Err((key, error)) => self.hub.diagnostics.error(
+                "camera::ptz_control",
+                key,
+                Some(request.correlation_id.clone()),
+                json!({"cameraId":self.config.id}),
+                Some(error),
+            ),
         }
     }
 
@@ -356,4 +465,16 @@ impl CameraTask {
             }
         }
     }
+}
+
+fn remember(
+    recent: &mut VecDeque<(String, Control, Value)>,
+    id: String,
+    command: Control,
+    reply: Value,
+) {
+    if recent.len() >= 128 {
+        recent.pop_front();
+    }
+    recent.push_back((id, command, reply));
 }

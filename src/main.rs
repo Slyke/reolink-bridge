@@ -7,10 +7,12 @@ mod model;
 mod mqtt;
 mod onvif;
 mod reolink;
+mod tls;
 mod xml;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{Arc, Mutex},
@@ -19,7 +21,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, task::JoinSet, time::timeout};
+use tokio::{sync::Semaphore, task::JoinSet, time::timeout};
 use tokio_util::sync::CancellationToken;
 
 use camera::CameraTask;
@@ -143,10 +145,43 @@ async fn run(
         .iter()
         .map(|camera| camera.id.clone())
         .collect();
-    let ws_token = config
-        .websocket
+    let auth_token = config
+        .http
         .token
-        .context("missing validated WebSocket token")?;
+        .as_ref()
+        .context("missing validated HTTP bearer token")?;
+    let ws_path = &config
+        .http
+        .websocket
+        .as_ref()
+        .context("missing WebSocket options")?
+        .path;
+    let local_tls_dir = path
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "local-only"))
+        .unwrap_or_else(|| Path::new("local-only"))
+        .join("https");
+    let tls_name = config
+        .http
+        .advertise_base_url
+        .as_ref()
+        .and_then(|url| url.host_str())
+        .map(|name| name.trim_matches(['[', ']']).to_owned())
+        .or_else(|| {
+            (!config.http.listen.ip().is_unspecified()).then(|| config.http.listen.ip().to_string())
+        });
+    let https = tls::server(config.http.tls.as_ref(), tls_name, &local_tls_dir)
+        .context("could not configure HTTPS")?;
+    let mqtt_transport = if config.mqtt.url.scheme() == "mqtts" {
+        let ca_file = config
+            .mqtt
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.ca_file.as_deref());
+        tls::mqtt_transport(ca_file).context("could not configure MQTT TLS")?
+    } else {
+        rumqttc::Transport::tcp()
+    };
     let stop = CancellationToken::new();
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -157,7 +192,7 @@ async fn run(
 
     let push = PushRoutes::default();
     let mut native = BTreeMap::new();
-    let mut secrets = vec![ws_token.clone()];
+    let mut secrets = vec![auth_token.clone()];
     secrets.extend(config.mqtt.password.clone());
     let mut devices = Vec::new();
     for mut camera in config.cameras {
@@ -226,9 +261,8 @@ async fn run(
         devices.push((camera, onvif, baichuan, webhook, cgi_webhook));
     }
 
-    let listener = TcpListener::bind(config.http.listen)
-        .await
-        .context("could not bind HTTP listener")?;
+    let listener = TcpListener::bind(config.http.listen).context("could not bind HTTP listener")?;
+    listener.set_nonblocking(true)?;
     let kubernetes = [
         "K8S_POD_NAME",
         "K8S_DEPLOYMENT",
@@ -250,6 +284,8 @@ async fn run(
         "service": diagnostics::SERVICE, "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH, "pid": std::process::id(),
         "port": listener.local_addr()?.port(),
+        "https": https.config.is_some(), "generatedCertificate": https.generated,
+        "mqttTls": config.mqtt.url.scheme() == "mqtts",
     });
     if !kubernetes.is_empty() && !diagnostics.kubernetes_enabled() {
         boot["kubernetes"] = json!(kubernetes);
@@ -267,10 +303,11 @@ async fn run(
     let hub = hub::Hub::new(&ids, callbacks, secrets, diagnostics.clone());
     let mut controls = BTreeMap::new();
     let mut workers = JoinSet::new();
+    let snapshot_slot = Arc::new(Semaphore::new(1));
     for (camera, onvif, baichuan, webhook, cgi_webhook) in devices {
         let id = camera.id.clone();
         let base = format!("{}/{id}", config.mqtt.base_topic);
-        let can_control = baichuan.is_some();
+        let control_device = baichuan.clone();
         let (controller, worker) = CameraTask {
             config: camera,
             onvif,
@@ -284,16 +321,22 @@ async fn run(
         }
         .start();
         workers.spawn(worker);
-        if can_control {
+        let services = control_device.map(|device| {
             controls.insert(id.clone(), controller.clone());
-        }
-        let options = mqtt::options(&config.mqtt, &id, &base);
+            mqtt::CameraCommands {
+                control: controller,
+                device,
+                snapshot_slot: snapshot_slot.clone(),
+                snapshot_max_payload_bytes: config.mqtt.snapshot_max_payload_bytes,
+            }
+        });
+        let options = mqtt::options(&config.mqtt, &id, &base, mqtt_transport.clone());
         workers.spawn(mqtt::run(
             options,
             base,
             id,
             hub.clone(),
-            can_control.then_some(controller),
+            services,
             stop.clone(),
         ));
     }
@@ -304,34 +347,55 @@ async fn run(
         native,
         controls,
         camera_ids: ids,
-        ws_token,
+        auth_token: auth_token.clone(),
         stop: stop.clone(),
     });
-    let router = http::router(app, &config.websocket.path);
-    let server_stop = stop.clone();
-    let server = axum::serve(listener, router)
-        .with_graceful_shutdown(async move { server_stop.cancelled().await });
-    let mut server = std::pin::pin!(std::future::IntoFuture::into_future(server));
-    let result = tokio::select! {
-        _ = shutdown_signal() => Ok(()),
-        result = &mut server => result.context("HTTP server failed"),
-        _ = workers.join_next() => {
-            Err(anyhow::anyhow!("a bridge worker exited unexpectedly"))
-        }
-    };
-    stop.cancel();
-    if timeout(Duration::from_secs(15), async {
-        while let Some(result) = workers.join_next().await {
-            if result.is_err() {
-                diagnostics.error(
-                    "main::shutdown",
-                    "SERVICE_WORKER_SHUTDOWN_FAILED",
-                    None,
-                    Value::Null,
-                    None,
-                );
+    let router = http::router(app, ws_path);
+    let handle = axum_server::Handle::new();
+    let server = async {
+        match https.config {
+            Some(tls) => {
+                axum_server::from_tcp_rustls(listener, tls)?
+                    .handle(handle.clone())
+                    .serve(router.into_make_service())
+                    .await
+            }
+            None => {
+                axum_server::from_tcp(listener)?
+                    .handle(handle.clone())
+                    .serve(router.into_make_service())
+                    .await
             }
         }
+    };
+    let mut server = std::pin::pin!(server);
+    let (result, server_exited) = tokio::select! {
+        _ = shutdown_signal() => (Ok(()), false),
+        result = &mut server => (result.context("HTTP server failed"), true),
+        _ = workers.join_next() => (Err(anyhow::anyhow!("a bridge worker exited unexpectedly")), false),
+    };
+    stop.cancel();
+    handle.graceful_shutdown(Some(Duration::from_secs(4)));
+    if timeout(Duration::from_secs(15), async {
+        let finish_workers = async {
+            while let Some(result) = workers.join_next().await {
+                if result.is_err() {
+                    diagnostics.error(
+                        "main::shutdown",
+                        "SERVICE_WORKER_SHUTDOWN_FAILED",
+                        None,
+                        Value::Null,
+                        None,
+                    );
+                }
+            }
+        };
+        let finish_server = async {
+            if !server_exited {
+                let _ = (&mut server).await;
+            }
+        };
+        tokio::join!(finish_workers, finish_server);
     })
     .await
     .is_err()

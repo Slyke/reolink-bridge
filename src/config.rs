@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, io::Write, net::SocketAddr, path::Path};
+use std::{
+    collections::BTreeSet,
+    io::Write,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -11,7 +16,7 @@ use url::Url;
 pub struct Config {
     pub mqtt: Mqtt,
     pub http: Http,
-    pub websocket: WebSocket,
+    websocket: Option<WebSocket>,
     pub cameras: Vec<Camera>,
     #[serde(default)]
     pub callbacks: Vec<Callback>,
@@ -28,6 +33,22 @@ pub struct Mqtt {
     pub username: Option<String>,
     pub password: Option<String>,
     password_env: Option<String>,
+    pub tls: Option<MqttTls>,
+    #[serde(default = "default_snapshot_payload_bytes")]
+    pub snapshot_max_payload_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MqttTls {
+    pub ca_file: Option<PathBuf>,
+}
+
+pub const MIN_SNAPSHOT_PAYLOAD_BYTES: usize = 4096;
+pub const MAX_SNAPSHOT_PAYLOAD_BYTES: usize = 24 * 1024 * 1024;
+
+fn default_snapshot_payload_bytes() -> usize {
+    1_000_000
 }
 
 fn client_id() -> String {
@@ -39,14 +60,31 @@ fn client_id() -> String {
 pub struct Http {
     pub listen: SocketAddr,
     pub advertise_base_url: Option<Url>,
+    pub token: Option<String>,
+    pub websocket: Option<WebSocket>,
+    pub tls: Option<HttpTls>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HttpTls {
+    pub cert_file: Option<PathBuf>,
+    pub key_file: Option<PathBuf>,
+    #[serde(default)]
+    pub server_names: Vec<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WebSocket {
+    #[serde(default = "websocket_path")]
     pub path: String,
     pub token: Option<String>,
     token_env: Option<String>,
+}
+
+fn websocket_path() -> String {
+    "/ws".into()
 }
 
 #[derive(Clone, Deserialize)]
@@ -68,6 +106,19 @@ pub struct Camera {
     #[serde(default)]
     pub coordinates: Coordinates,
     pub native_webhook: Option<NativeWebhook>,
+    #[serde(default)]
+    pub ptz: PtzMode,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PtzMode {
+    #[default]
+    Auto,
+    Disabled,
+    PanTilt,
+    PanTiltZoom,
+    Zoom,
 }
 
 fn onvif_port() -> Option<u16> {
@@ -222,6 +273,11 @@ pub fn parse(mut document: Value, environment: &impl Fn(&str) -> Option<String>)
             && config.mqtt.base_topic.split('/').all(valid_id),
         "invalid MQTT baseTopic or clientId"
     );
+    ensure!(
+        (MIN_SNAPSHOT_PAYLOAD_BYTES..=MAX_SNAPSHOT_PAYLOAD_BYTES)
+            .contains(&config.mqtt.snapshot_max_payload_bytes),
+        "mqtt.snapshotMaxPayloadBytes must be {MIN_SNAPSHOT_PAYLOAD_BYTES}–{MAX_SNAPSHOT_PAYLOAD_BYTES}"
+    );
     let mqtt_password = resolve_secret(
         config.mqtt.password.take(),
         config.mqtt.password_env.take(),
@@ -239,32 +295,40 @@ pub fn parse(mut document: Value, environment: &impl Fn(&str) -> Option<String>)
         "MQTT authentication requires a username and password"
     );
     config.mqtt.password = mqtt_password;
-    let token = required_secret(
-        config.websocket.token.take(),
-        config.websocket.token_env.take(),
-        &raw["websocket"]["token"],
-        "websocket.token",
-        environment,
-    )?;
     ensure!(
-        token.bytes().all(|byte| byte.is_ascii_graphic()),
-        "WebSocket token must be printable ASCII without spaces"
+        config.mqtt.tls.is_none() || config.mqtt.url.scheme() == "mqtts",
+        "mqtt.tls requires an mqtts URL"
     );
-    config.websocket.token = Some(token);
+    config
+        .http
+        .configure_auth(config.websocket.take(), &raw, environment)?;
+    if let Some(tls) = &config.http.tls {
+        ensure!(
+            tls.cert_file.is_some() == tls.key_file.is_some(),
+            "HTTPS requires both certFile and keyFile"
+        );
+        ensure!(
+            tls.cert_file.is_none() || tls.server_names.is_empty(),
+            "serverNames applies only to generated HTTPS certificates"
+        );
+        ensure!(
+            tls.server_names.len() <= 32
+                && tls.server_names.iter().all(|name| {
+                    !name.is_empty()
+                        && name.len() <= 253
+                        && name
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || b".:-".contains(&c))
+                }),
+            "invalid HTTPS certificate names"
+        );
+    }
     if let Some(url) = &config.http.advertise_base_url {
         ensure!(
             safe_url(url, &["http", "https"]) && url.query().is_none(),
             "invalid advertised HTTP URL"
         );
     }
-    let path = &config.websocket.path;
-    ensure!(
-        path.starts_with('/')
-            && path[1..].split('/').all(valid_id)
-            && !path.starts_with("/ingest/")
-            && !matches!(path.as_str(), "/livez" | "/readyz"),
-        "invalid or reserved WebSocket path"
-    );
     ensure!(!config.cameras.is_empty(), "configure at least one camera");
     let mut ids = BTreeSet::new();
     for (index, camera) in config.cameras.iter_mut().enumerate() {
@@ -288,6 +352,11 @@ pub fn parse(mut document: Value, environment: &impl Fn(&str) -> Option<String>)
         ensure!(
             camera.onvif_port != Some(0) && camera.baichuan_port != Some(0),
             "invalid camera port"
+        );
+        ensure!(
+            matches!(camera.ptz, PtzMode::Auto | PtzMode::Disabled)
+                || camera.baichuan_port.is_some(),
+            "a PTZ override requires baichuanPort"
         );
         let host =
             url::Host::parse(&camera.host).map_err(|_| anyhow::anyhow!("invalid camera host"))?;
@@ -363,6 +432,72 @@ pub fn parse(mut document: Value, environment: &impl Fn(&str) -> Option<String>)
     }
     validate_callbacks(&config.callbacks, &ids)?;
     Ok(config)
+}
+
+impl Http {
+    fn configure_auth(
+        &mut self,
+        legacy: Option<WebSocket>,
+        raw: &Value,
+        environment: &impl Fn(&str) -> Option<String>,
+    ) -> Result<()> {
+        ensure!(
+            legacy.is_none() || self.websocket.is_none(),
+            "configure WebSocket under http.websocket or at the top level"
+        );
+        let legacy_path = legacy.is_some();
+        let mut ws = self
+            .websocket
+            .take()
+            .or(legacy)
+            .unwrap_or_else(|| WebSocket {
+                path: websocket_path(),
+                token: None,
+                token_env: None,
+            });
+        let ws_raw = if legacy_path {
+            &raw["websocket"]
+        } else {
+            &raw["http"]["websocket"]
+        };
+        let path = &ws.path;
+        ensure!(
+            path.starts_with('/')
+                && path[1..].split('/').all(valid_id)
+                && !path.starts_with("/ingest/")
+                && !path.starts_with("/api/")
+                && !matches!(path.as_str(), "/livez" | "/readyz"),
+            "invalid or reserved WebSocket path"
+        );
+        ensure!(
+            raw["http"]["token"].is_null() || (ws_raw["token"].is_null() && ws.token_env.is_none()),
+            "configure a single bearer token for HTTP and WebSocket"
+        );
+        let token = if !raw["http"]["token"].is_null() {
+            required_secret(
+                self.token.take(),
+                None,
+                &raw["http"]["token"],
+                "http.token",
+                environment,
+            )?
+        } else {
+            required_secret(
+                ws.token.take(),
+                ws.token_env.take(),
+                &ws_raw["token"],
+                "http.token",
+                environment,
+            )?
+        };
+        ensure!(
+            token.bytes().all(|byte| byte.is_ascii_graphic()),
+            "HTTP bearer token must be printable ASCII without spaces"
+        );
+        self.token = Some(token);
+        self.websocket = Some(ws);
+        Ok(())
+    }
 }
 
 fn required_secret(
