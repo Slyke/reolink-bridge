@@ -1,0 +1,5 @@
+/target/
+/local-only/
+/bridge.local.json5
+.env
+.env.*

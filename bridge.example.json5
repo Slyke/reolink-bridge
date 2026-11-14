@@ -1,0 +1,39 @@
+
+{
+  mqtt: {
+    url: "mqtt://mqtt.example.net:1883",
+    baseTopic: "cameras",
+    clientId: "reolink-bridge",
+    // username: "camera-bridge",
+    // password: "${CAMERA_BRIDGE_MQTT_PASSWORD}",
+  },
+  http: {
+    listen: "0.0.0.0:8080",
+    advertiseBaseUrl: "http://bridge.example.net:8080",
+  },
+  websocket: {
+    path: "/ws",
+    token: "${CAMERA_BRIDGE_WS_TOKEN}",
+  },
+  cameras: [{
+    id: "front-door",
+    host: "camera.example.net",
+    onvifPort: 8000,
+    baichuanPort: 9000,
+    username: "admin",
+    password: "${CAMERA_PASSWORD}",
+    channel: 0,
+    eventTransport: "auto",
+    coordinates: { allowVideoStream: false },
+    // nativeWebhook: { protocol: "ha_cfg", token: "${CAMERA_WEBHOOK_TOKEN}" },
+  }],
+  logging: {
+    sinks: {
+      console: { enabled: true, format: "json", levels: ["info", "warn", "error"] },
+      // file: { enabled: true, format: "json", path: "./local-only/bridge.log.jsonl" },
+    },
+  },
+  callbacks: [
+    // { id: "automation", url: "http://automation.example.net/camera-events", cameras: ["front-door"], events: ["person", "vehicle", "pet"] },
+  ],
+}
