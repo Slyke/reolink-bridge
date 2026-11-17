@@ -1,6 +1,7 @@
 mod credentials;
 mod media;
 mod preview;
+mod recordings;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -74,6 +75,7 @@ pub struct Api {
     active: BTreeSet<String>,
     devices: BTreeMap<String, Device>,
     previews: preview::Previews,
+    recordings: recordings::Recordings,
     hub: Option<Arc<Hub>>,
     media_slots: Arc<Semaphore>,
     settings_slots: Semaphore,
@@ -194,7 +196,7 @@ impl Api {
             "invalid API camera scope"
         );
         let active = cameras.iter().map(|cam| cam.id.clone()).collect();
-        let devices = cameras
+        let devices: BTreeMap<String, Device> = cameras
             .iter()
             .filter_map(|cam| {
                 Some((
@@ -210,7 +212,9 @@ impl Api {
             })
             .collect();
         let previews = preview::prepare(&config.previews, &devices, snapshot_slot, stop.clone())?;
+        let recordings = recordings::Recordings::new(devices.keys().cloned());
         Ok(Self {
+            recordings,
             config,
             http_token: http_token.to_owned(),
             vault: vault.map(Mutex::new),
@@ -229,7 +233,17 @@ impl Api {
     pub fn attach(mut self, hub: Arc<Hub>, workers: &mut JoinSet<()>) -> Arc<Self> {
         self.hub = Some(hub);
         preview::start(&self.previews, workers);
-        Arc::new(self)
+        let api = Arc::new(self);
+        let cleaning = api.clone();
+        workers.spawn(async move {
+            loop {
+                tokio::select! {
+                    _=cleaning.stop.cancelled()=>return,
+                    _=tokio::time::sleep(Duration::from_secs(60))=>cleaning.recordings.clean().await,
+                }
+            }
+        });
+        api
     }
 
     fn allows(&self, id: &str) -> bool {
@@ -305,6 +319,12 @@ pub fn router(api: Arc<Api>) -> Router {
     Router::new()
         .route("/api/contract", get(contract))
         .route("/api/inventory", get(inventory))
+        .route("/api/cameras/{id}/storage", get(recordings::storage))
+        .route("/api/cameras/{id}/recordings", get(recordings::list))
+        .route(
+            "/api/cameras/{id}/recordings/{recording}/video",
+            get(recordings::video),
+        )
         .route("/api/cameras/{id}/settings/{group}", get(settings))
         .route("/api/cameras/{id}/media/{stream}", get(media::get))
         .route("/api/cameras/{id}/preview", get(preview::get))
@@ -356,8 +376,9 @@ async fn contract(
         .map(|(id, profile)| (id.clone(), json!(profile.streams)))
         .collect();
     Json(json!({"version":1,"media":!profiles.is_empty(),"mediaCameras":profiles,
+       "recordingsCameras":api.devices.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
        "previewCameras":api.previews.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
-       "enrollment":api.vault.is_some(),"inventory":true,"callbacks":api.callback_allowed(primary, None),"settings":["leds","spotlight","motion","ai"],"alerts":["motion"],
+       "enrollment":api.vault.is_some(),"inventory":true,"callbacks":api.callback_allowed(primary, None),"settings":["leds","spotlight","motion","ai","image"],"alerts":["motion"],
        "correlation_id":correlation.0})).into_response()
 }
 
@@ -502,6 +523,7 @@ async fn settings(
         "leds" => vec![Settings::Leds],
         "spotlight" => vec![Settings::Spotlight],
         "motion" => vec![Settings::Motion],
+        "image" => vec![Settings::Image],
         "ai" => [
             AiClass::Person,
             AiClass::Vehicle,

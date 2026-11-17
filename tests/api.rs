@@ -516,3 +516,143 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 2);
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires local Mosquitto and FFmpeg"]
+async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()> {
+    let encoded = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:size=160x120:rate=8",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "libx264",
+            "-threads",
+            "1",
+            "-x264-params",
+            "keyint=1",
+            "-f",
+            "h264",
+            "pipe:1",
+        ])
+        .output()
+        .await?;
+    ensure!(encoded.status.success(), "synthetic camera encoder");
+    let mut recording = Vec::new();
+    for index in 0..16u32 {
+        recording.extend(b"00dcH264");
+        recording.extend((encoded.stdout.len() as u32).to_le_bytes());
+        recording.extend(0u32.to_le_bytes());
+        recording.extend((index * 125_000).to_le_bytes());
+        recording.extend(0u32.to_le_bytes());
+        recording.extend(&encoded.stdout);
+        recording.extend(std::iter::repeat_n(
+            0,
+            encoded.stdout.len().next_multiple_of(8) - encoded.stdout.len(),
+        ));
+    }
+    let camera = Arc::new(baichuan::Camera {
+        recording: Some(recording),
+        ..Default::default()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let bc = listener.local_addr()?.port();
+    tokio::spawn(camera.clone().serve(listener));
+    let directory = tempfile::tempdir()?;
+    let broker = free_port()?;
+    let mqtt_config = directory.path().join("mqtt.conf");
+    std::fs::write(
+        &mqtt_config,
+        format!("listener {broker} 127.0.0.1\nallow_anonymous true\n"),
+    )?;
+    let _mqtt = Command::new("mosquitto")
+        .arg(&mqtt_config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let port = free_port()?;
+    let origin = format!("http://127.0.0.1:{port}");
+    let config = directory.path().join("bridge.json5");
+    std::fs::write(&config,json!({
+        "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"},
+        "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
+        "cameras":[{"id":"fixture","host":"127.0.0.1","baichuanPort":bc,"onvifPort":null,"username":"admin","password":baichuan::PASSWORD,"eventTransport":"baichuan"}],
+        "api":{"serviceToken":SERVICE,"cameraIds":["fixture"],"commands":true}
+    }).to_string())?;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let _bridge = start(&config, &client, &origin).await?;
+    let storage = format!("{origin}/api/cameras/fixture/storage");
+    assert_eq!(response(&client, &storage, "wrong", None).await.0, 401);
+    let card = response(&client, &storage, SERVICE, None).await;
+    assert_eq!(card.0, 200, "{card:?}");
+    assert_eq!(card.1["cards"][0]["totalBytes"], 63_500_000_000u64);
+    assert_eq!(card.1["cards"][0]["usedBytes"], 40_400_000_000u64);
+    assert_eq!(card.1["cameraTime"], "2026-11-17T12:30:00");
+    let search = format!("{origin}/api/cameras/fixture/recordings?date=2026-11-17&stream=sub");
+    let clips = response(&client, &search, SERVICE, None).await;
+    assert_eq!(clips.0, 200, "{clips:?}");
+    assert_eq!(clips.1["recordings"].as_array().unwrap().len(), 1);
+    let id = clips.1["recordings"][0]["id"].as_str().unwrap();
+    let video = format!("{origin}/api/cameras/fixture/recordings/{id}/video");
+    let result = client.get(&video).bearer_auth(SERVICE).send().await?;
+    ensure!(
+        result.status().is_success(),
+        "recording media returned {}",
+        result.status()
+    );
+    let data = result.bytes().await?;
+    assert!(data.windows(4).any(|w| w == b"ftyp"));
+    let partial = client
+        .get(&video)
+        .bearer_auth(SERVICE)
+        .header("range", "bytes=0-31")
+        .send()
+        .await?;
+    assert_eq!(partial.status(), 206);
+    assert_eq!(partial.bytes().await?, data[..32]);
+    assert_eq!(camera.recording_downloads.load(Ordering::SeqCst), 1);
+    let until = Instant::now() + Duration::from_secs(8);
+    loop {
+        if response(
+            &client,
+            &format!("{origin}/api/cameras/fixture/settings/image"),
+            SERVICE,
+            None,
+        )
+        .await
+        .0 == 200
+        {
+            break;
+        }
+        ensure!(Instant::now() < until, "orientation discovery incomplete");
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(camera.writes.load(Ordering::SeqCst), 0);
+    for action in ["hflip", "vflip", "clockwise", "counterclockwise"] {
+        let changed = response(
+            &client,
+            &format!("{origin}/api/cameras/fixture/command/exec"),
+            SERVICE,
+            Some(json!({
+                "id":Uuid::new_v4(),"command":{"setting":"image_orientation","action":action}
+            })),
+        )
+        .await;
+        assert_eq!(changed.1["ok"], true, "{changed:?}");
+        assert_eq!(changed.1["verified"], true, "{changed:?}");
+    }
+    assert!(camera.mirror.load(Ordering::SeqCst));
+    assert!(camera.flip.load(Ordering::SeqCst));
+    assert_eq!(camera.rotation.load(Ordering::SeqCst), 0);
+    assert_eq!(camera.writes.load(Ordering::SeqCst), 4);
+    Ok(())
+}

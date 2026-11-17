@@ -39,6 +39,9 @@ pub enum Control {
         sensitivity: Option<u8>,
         delay_seconds: Option<u8>,
     },
+    ImageOrientation {
+        action: super::orientation::Action,
+    },
     Ptz {
         action: ptz::Action,
     },
@@ -149,7 +152,7 @@ impl Control {
                 );
             }
             Self::Ptz { action } => action.validate()?,
-            Self::StatusLed { .. } | Self::IrLed { .. } => {}
+            Self::StatusLed { .. } | Self::IrLed { .. } | Self::ImageOrientation { .. } => {}
         }
         Ok(())
     }
@@ -161,6 +164,7 @@ pub enum Settings {
     Spotlight,
     Motion,
     Ai(AiClass),
+    Image,
 }
 
 impl Settings {
@@ -169,6 +173,7 @@ impl Settings {
             Self::Leds => "leds",
             Self::Spotlight => "spotlight",
             Self::Motion => "motion_detection",
+            Self::Image => "image",
             Self::Ai(class) => class.topic(),
         }
     }
@@ -178,6 +183,7 @@ impl Settings {
             Self::Leds => (208, String::new()),
             Self::Spotlight => (289, String::new()),
             Self::Motion => (46, String::new()),
+            Self::Image => (26, String::new()),
             Self::Ai(class) => (
                 342,
                 format!(
@@ -194,6 +200,7 @@ impl Settings {
             Self::Leds => ("LedState", "channelId"),
             Self::Spotlight => ("FloodlightTask", "channel"),
             Self::Motion => ("MD", "channelId"),
+            Self::Image => ("VideoInput", "channelId"),
             Self::Ai(_) => ("AiDetectCfg", "chn"),
         };
         let node = xml::child(doc.root_element(), tag)
@@ -234,6 +241,7 @@ impl Settings {
                 "sensitivity": xml::child(node, "sensInfoNew").and_then(|n| xml::value(n, "sensitivityDefault"))
                     .and_then(|s| s.parse::<u8>().ok()).filter(|n| (1..=50).contains(n)).map(|n| 51 - n),
             }),
+            Self::Image => super::orientation::status(node).0,
             Self::Ai(_) => json!({
                 "sensitivity": num("sensitivity"),
                 "delay_seconds": get("stayTime").and_then(|s| s.parse::<f64>().ok()),
@@ -244,6 +252,9 @@ impl Settings {
     }
 
     pub async fn inspect(self, session: &mut Session, channel: u8) -> Option<(Value, Value)> {
+        if matches!(self, Self::Image) {
+            return super::orientation::inspect(session, channel).await;
+        }
         let raw = self.read(session, channel).await.ok()?;
         let doc = xml::document(&raw).ok()?;
         let node = self.root(&doc, channel).ok()?;
@@ -260,6 +271,7 @@ impl Settings {
             Self::Motion => {
                 json!({"enabled": supported("enabled"), "sensitivity": supported("sensitivity")})
             }
+            Self::Image => super::orientation::status(node).1,
             Self::Ai(_) => {
                 json!({"sensitivity": supported("sensitivity"), "delay_seconds": supported("delay_seconds")})
             }
@@ -281,6 +293,9 @@ async fn apply_connected(
     channel: u8,
     command: &Control,
 ) -> Result<(&'static str, Value, bool)> {
+    if let Control::ImageOrientation { action } = command {
+        return super::orientation::apply(session, channel, *action).await;
+    }
     if let Control::Spotlight {
         enabled,
         duration_seconds,
@@ -379,7 +394,7 @@ async fn apply_connected(
             }
             (Settings::Ai(*class), 343, edits)
         }
-        Control::Spotlight { .. } => unreachable!(),
+        Control::Spotlight { .. } | Control::ImageOrientation { .. } => unreachable!(),
         Control::Ptz { .. } => anyhow::bail!("PTZ uses the PTZ command worker"),
     };
     let raw = settings.read(session, channel).await?;

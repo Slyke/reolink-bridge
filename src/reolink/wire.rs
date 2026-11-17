@@ -44,8 +44,8 @@ pub struct Session {
 
 pub struct Packet {
     pub command: u32,
-    sequence: u32,
-    status: u16,
+    pub(super) sequence: u32,
+    pub(super) status: u16,
     offset: usize,
     body: Bytes,
 }
@@ -108,6 +108,13 @@ impl Session {
             )
             .await?;
         self.decode(&reply)
+    }
+
+    pub async fn recording_start(&mut self, channel: u8, body: &str) -> Result<Packet> {
+        let extension =
+            format!(r#"<Extension version="1.1"><channelId>{channel}</channelId></Extension>"#);
+        self.exchange(143, channel + 1, &extension, body, false)
+            .await
     }
 
     pub async fn user_list(&mut self, username: &str) -> Result<String> {
@@ -354,6 +361,19 @@ impl Session {
 }
 
 impl Packet {
+    pub fn payload_finished(&self, session: &Session) -> bool {
+        self.body.is_empty()
+            || (self.offset == self.body.len()
+                && self.offset > 0
+                && session
+                    .decode_xml(&self.body, self.sequence as u8)
+                    .ok()
+                    .and_then(|raw| {
+                        let doc = xml::document(&raw).ok()?;
+                        xml::value(doc.root_element(), "binaryData").map(|_| true)
+                    })
+                    .unwrap_or(false))
+    }
     fn take(buffer: &mut BytesMut) -> Result<Option<Self>> {
         if buffer.len() < 20 {
             return Ok(None);

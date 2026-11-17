@@ -47,8 +47,8 @@ pub async fn run(device: &Device, id: &str, hub: &Hub, stop: &CancellationToken)
             while let Some((consumed, sample)) = media_sample(&buffer)? {
                 match sample {
                     Media::Info(width, height) => video_dimensions = Some((width, height)),
-                    Media::Audio => {}
-                    Media::Video { iframe, ticks, extra } => {
+                    Media::Audio { .. } => {}
+                    Media::Video { iframe, ticks, extra, .. } => {
                         let overlay = Overlay::decode(extra, iframe);
                         if !saw_frame || (!saw_overlay && overlay.is_some()) {
                             saw_frame = true;
@@ -93,17 +93,22 @@ pub async fn run(device: &Device, id: &str, hub: &Hub, stop: &CancellationToken)
     result
 }
 
-enum Media<'a> {
+pub(super) enum Media<'a> {
     Info(u32, u32),
     Video {
         iframe: bool,
         ticks: u32,
         extra: &'a [u8],
+        codec: &'a [u8],
+        data: &'a [u8],
     },
-    Audio,
+    Audio {
+        aac: bool,
+        data: &'a [u8],
+    },
 }
 
-fn media_sample(data: &[u8]) -> Result<Option<(usize, Media<'_>)>> {
+pub(super) fn media_sample(data: &[u8]) -> Result<Option<(usize, Media<'_>)>> {
     if data.len() < 8 {
         return Ok(None);
     }
@@ -132,6 +137,8 @@ fn media_sample(data: &[u8]) -> Result<Option<(usize, Media<'_>)>> {
                         iframe: magic <= 0x63643039,
                         ticks: le_u32(data, 16),
                         extra: &data[24..24 + extra],
+                        codec: &data[4..8],
+                        data: &data[24 + extra..24 + extra + payload],
                     },
                 )));
             }
@@ -144,7 +151,13 @@ fn media_sample(data: &[u8]) -> Result<Option<(usize, Media<'_>)>> {
             );
             let end = 8 + usize::from(length).next_multiple_of(8);
             if data.len() >= end {
-                return Ok(Some((end, Media::Audio)));
+                return Ok(Some((
+                    end,
+                    Media::Audio {
+                        aac: le_u32(data, 0) == 0x62773530,
+                        data: &data[8..8 + usize::from(length)],
+                    },
+                )));
             }
         }
         _ => bail!("unrecognized Baichuan media frame"),

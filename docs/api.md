@@ -34,8 +34,11 @@ Replace the documentation address with a private IPv4 target from the installati
 | POST `/cameras/{id}/command/exec` | HTTP or scoped service token with `commands` | Typed command. [Camera controls](./controls.md) |
 | GET/POST `/callbacks` | Callback access | List or add callback delivery rules. |
 | PUT/DELETE `/callbacks/{id}` | Callback access | Update or delete a rule. Use the same ID in the URL and the update body. |
-| GET `/cameras/{id}/settings/{group}` | HTTP or scoped service token | Fresh allowlisted setting values for `leds`, `spotlight`, `motion`, or `ai`, without raw vendor XML. Writes use the existing typed command interface. |
+| GET `/cameras/{id}/settings/{group}` | HTTP or scoped service token | Fresh allowlisted setting values for `leds`, `spotlight`, `motion`, or `ai` and `image`, without raw vendor XML. Writes use the existing typed command interface. |
 | GET/HEAD `/cameras/{id}/preview` | HTTP or scoped service token | Latest cached JPEG or its headers. Supports `If-None-Match` and returns `304` when the image is unchanged. |
+| GET `/cameras/{id}/storage` | HTTP or scoped service token | Card capacity, used/free bytes, readiness, and the camera's local clock. |
+| GET `/cameras/{id}/recordings?date=YYYY-MM-DD&stream=sub` | HTTP or scoped service token | Search a camera-local day. The stream can be `main` or `sub`. Returns opaque recording IDs. |
+| GET `/cameras/{id}/recordings/{recordingId}/video` | HTTP or scoped service token | Browser-playable MP4 with HTTP byte ranges for seeking. Search first to obtain the recording ID. |
 | GET `/cameras/{id}/media/{stream}` | HTTP or scoped service token | Bounded multipart MJPEG stream from configured H.264 RTSP/TCP. FFmpeg is required in the private bridge environment. The RTSP client owns credentials; FFmpeg receives elementary video bytes. |
 | GET `/enrollment-targets` | admin | Allowlisted target names. |
 | POST `/enrollments` | admin | Reserve and begin a UUID operation with target, separate `uid` and/or `serial`, `method` (`initialize` or `import`), and `confirmation: true`. First-password flow requires a UID. |
@@ -69,3 +72,17 @@ The password protocol is gated to the verified Lumus E430 revision and firmware.
 `restart-required` means the bridge verified a stored credential. Restart the private bridge to start the new workers or switch existing ones to the verified credential. Do not add a duplicate static camera entry for a vault-managed camera. Read inventory after the restart for the active camera IDs. MQTT clients also need broker ACLs for the new camera topics.
 
 After interruption use the existing enrollment status and resume, or rotation reconciliation, to test credentials without resending a password write. If the bridge reports `recovery-required`, use the printed ID and the bridge vault on the host to check current and staged credentials in a private maintenance session. Stop the bridge before restoring or repairing its vault, verify successful authentication to the same printed identifier, and restart it only after the credential reference is consistent. Avoid resetting or repeating a password change until you know which credential works.
+
+## SD-card recordings
+
+Storage and file searches use read-only Baichuan operations. The API reports storage quantities in bytes and recording times in the camera's local wall clock. Each search returns a maximum of 4096 entries and reports truncation.
+
+Video reads use Baichuan recording downloads. FFmpeg converts the camera's video and available AAC audio into a seekable H.264/AAC MP4. The private temporary cache expires after ten minutes, with a two-GiB cache budget and two concurrent downloads. A camera has one active download at a time. Individual transfers accept up to 512 MiB of native camera data and 768 MiB of converted MP4, with a 120-second preparation deadline. Camera credentials and native recording file paths stay inside the bridge.
+
+## Image orientation
+
+The `image_orientation` typed setting accepts `action: "hflip"`, `"vflip"`, `"clockwise"`, or `"counterclockwise"`. Each update reads current image settings, changes the supported orientation field, preserves other image settings, and verifies readback.
+
+The `image` capability reports horizontal/vertical flipping independently. Clockwise and counterclockwise controls require the camera to report quarter-turn support. Availability depends on model and firmware. These operations change the camera's saved image settings.
+
+Protocol references are maintained by [reolink-aio](https://github.com/starkillerOG/reolink_aio/blob/main/reolink_aio/baichuan/baichuan.py) and [nodelink-js](https://github.com/apocaliss92/nodelink-js/blob/main/documentation/baichuan-api/recordings.md).

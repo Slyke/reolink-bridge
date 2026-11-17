@@ -103,10 +103,10 @@ async fn session(
             if line.trim().is_empty() {
                 break;
             }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("cseq") {
-                    sequence = value.trim().into();
-                }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("cseq")
+            {
+                sequence = value.trim().into();
             }
         }
         let body = match method.as_str() {

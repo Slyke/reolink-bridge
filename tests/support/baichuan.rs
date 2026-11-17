@@ -20,6 +20,11 @@ const IV: &[u8; 16] = b"0123456789abcdef";
 #[derive(Default)]
 pub struct Camera {
     pub led: AtomicBool,
+    pub mirror: AtomicBool,
+    pub flip: AtomicBool,
+    pub rotation: AtomicI32,
+    pub recording: Option<Vec<u8>>,
+    pub recording_downloads: AtomicUsize,
     pub writes: AtomicUsize,
     pub webhook: Mutex<Option<String>>,
     pub ptz: AtomicBool,
@@ -123,6 +128,18 @@ impl Camera {
                 socket.write_u32_le(0).await?;
             }
             socket.write_all(&reply).await?;
+            if command == 143 && status == 200 {
+                self.recording_downloads.fetch_add(1, Ordering::SeqCst);
+                for chunk in self.recording.as_deref().unwrap().chunks(16 * 1024) {
+                    header[8..12].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+                    socket.write_all(&header).await?;
+                    socket.write_u32_le(0).await?;
+                    socket.write_all(chunk).await?;
+                }
+                header[8..12].copy_from_slice(&0u32.to_le_bytes());
+                socket.write_all(&header).await?;
+                socket.write_u32_le(0).await?;
+            }
             if command == 109 && status == 200 {
                 self.snapshot_requests
                     .lock()
@@ -153,7 +170,31 @@ impl Camera {
 
     fn handle(&self, command: u32, body: &str) -> Result<(u16, String)> {
         let response = match command {
-            2 | 31 | 93 => String::new(),
+            2 | 16 | 31 | 93 | 144 => String::new(),
+            102=>"<body><HddInfoList><HddInfo><number>0</number><storageType>2</storageType><mount>1</mount><format>1</format><capacityG>63</capacityG><capacityM>500</capacityM><remainSizeG>23</remainSizeG><remainSizeM>100</remainSizeM></HddInfo></HddInfoList></body>".into(),
+            104=>"<body><SystemGeneral><year>2026</year><month>11</month><day>17</day><hour>12</hour><minute>30</minute><second>00</second></SystemGeneral></body>".into(),
+            14=> {
+                ensure!(body.contains("<streamType>subStream</streamType>") || body.contains("<streamType>mainStream</streamType>"));
+                "<body><FileInfoList><FileInfo><handle>42</handle></FileInfo></FileInfoList></body>".into()
+            }
+            15=>"<body><FileInfoList><bFinished>1</bFinished><FileInfo><name>RecS01_20261117_120000_120002_AAA.mp4</name><size>18000</size><type>md</type></FileInfo></FileInfoList></body>".into(),
+            143=> {
+                if self.recording.is_none() {return Ok((405,String::new()))}
+                ensure!(body.contains("<streamType>subStream</streamType>"));
+                "<body><FileInfoList/></body>".into()
+            }
+            26=>format!("<body><VideoInput><channelId>0</channelId><bright>128</bright></VideoInput><InputAdvanceCfg><Mirror><enable>{}</enable></Mirror><Flip><enable>{}</enable></Flip><rotationRange><angle>0</angle><angle>90</angle><angle>180</angle><angle>270</angle></rotationRange><rotation>{}</rotation><untouched>19</untouched></InputAdvanceCfg></body>",
+                u8::from(self.mirror.load(Ordering::SeqCst)),u8::from(self.flip.load(Ordering::SeqCst)),self.rotation.load(Ordering::SeqCst)),
+            25=>{
+                let doc=roxmltree::Document::parse(body)?;
+                ensure!(field(&doc,"untouched")==Some("19") && field(&doc,"bright")==Some("128"));
+                let value=|tag|doc.descendants().find(|n|n.has_tag_name(tag)).and_then(|n|n.descendants().find(|n|n.has_tag_name("enable"))).and_then(|n|n.text());
+                self.mirror.store(value("Mirror")==Some("1"),Ordering::SeqCst);
+                self.flip.store(value("Flip")==Some("1"),Ordering::SeqCst);
+                self.rotation.store(field(&doc,"rotation").unwrap().parse()?,Ordering::SeqCst);
+                self.writes.fetch_add(1,Ordering::SeqCst);
+                String::new()
+            }
             109 => {
                 let Some(jpeg) = self.jpeg.as_ref().filter(|_| !self.reject_snapshots.load(Ordering::SeqCst)) else {
                     return Ok((405, String::new()));

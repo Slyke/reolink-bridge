@@ -46,3 +46,9 @@ docker run --rm \
 ```
 
 Set `http.listen` to `0.0.0.0:8080` for this port mapping. Check `/livez` and `/readyz` over HTTP or HTTPS as configured. [Runtime metadata and logging](./configuration.md#logging) · [TLS options](./tls.md)
+
+## Recording playback temporary files
+
+The bridge recording API prepares seekable MP4 files in its private temporary directory. Give the runtime user a writable `/tmp`, including when `readOnlyRootFilesystem` is enabled.
+
+For Kubernetes, mount a disk-backed `emptyDir` at `/tmp` and give user/group `10001` write access, for example with `fsGroup: 10001`. The temporary cache is reconstructed after pod replacement. Retain the existing certificate volume independently.

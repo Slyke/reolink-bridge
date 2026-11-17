@@ -145,3 +145,13 @@ Put each command object below in the same envelope as a PTZ command.
 | `{"setting":"ai_detection","class":"person","sensitivity":70,"delay_seconds":2}` | Send sensitivity 0–100, delay 0–8 seconds, or both. Classes are `person`, `vehicle`, `pet`, `face`, and `package` where supported. |
 
 Setting replies contain `state` with readback. Readbacks keep useful `vendor` fields and update `state/settings`. If a write was acknowledged but the value could not be confirmed, the reply can contain `verified: false` and a warning.
+
+## Image orientation
+
+Read `GET /api/cameras/{id}/settings/image` for current orientation. Use the existing typed command endpoint with a fresh request ID to change it.
+
+~~~json
+{"id":"orientation-1","command":{"setting":"image_orientation","action":"hflip"}}
+~~~
+
+Actions are `hflip`, `vflip`, `clockwise` and `counterclockwise`. The bridge reads and verifies the camera setting around each write and preserves unrelated image fields. Rotation is available when the camera reports support for 90-degree steps. [HTTP API](./api.md#image-orientation)

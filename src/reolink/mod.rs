@@ -2,7 +2,10 @@ pub mod cgi;
 pub mod control;
 pub mod events;
 pub mod metadata;
+pub mod orientation;
 pub mod ptz;
+pub mod recording_media;
+pub mod recordings;
 pub mod wire;
 
 use std::sync::Mutex;
@@ -63,7 +66,12 @@ pub async fn discover(
     }
     let (ai_types, ai_configuration) = events::ai_types(&mut session, channel).await;
     let mut controls = Map::new();
-    let mut settings = vec![Settings::Leds, Settings::Spotlight, Settings::Motion];
+    let mut settings = vec![
+        Settings::Leds,
+        Settings::Spotlight,
+        Settings::Motion,
+        Settings::Image,
+    ];
     settings.extend(
         ai_types
             .iter()
