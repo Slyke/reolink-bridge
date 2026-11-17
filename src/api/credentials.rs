@@ -164,10 +164,10 @@ pub struct Vault {
 impl Vault {
     pub fn open(path: &Path) -> Result<Self> {
         let dir =
-            fs::symlink_metadata(path).context("prepare a private WUI credential directory")?;
+            fs::symlink_metadata(path).context("prepare a private API credential directory")?;
         ensure!(
             dir.is_dir() && dir.permissions().mode() & 0o077 == 0,
-            "WUI credential directory must have mode 0700"
+            "API credential directory must have mode 0700"
         );
         let lock = OpenOptions::new()
             .read(true)
@@ -177,16 +177,16 @@ impl Vault {
             .mode(0o600)
             .open(path.join("vault.lock"))?;
         lock.try_lock()
-            .map_err(|_| anyhow::anyhow!("WUI credential directory already in use"))?;
+            .map_err(|_| anyhow::anyhow!("API credential directory already in use"))?;
         let file = path.join("vault.json");
         let data = if file.exists() {
             let meta = fs::symlink_metadata(&file)?;
             ensure!(
                 meta.is_file() && meta.permissions().mode() & 0o077 == 0 && meta.len() <= 1_000_000,
-                "invalid WUI vault file"
+                "invalid API vault file"
             );
             serde_json::from_slice(&fs::read(&file)?)
-                .map_err(|_| anyhow::anyhow!("invalid WUI vault data"))?
+                .map_err(|_| anyhow::anyhow!("invalid API vault data"))?
         } else {
             Data::default()
         };
@@ -204,7 +204,7 @@ impl Vault {
         temp.flush()?;
         temp.as_file().sync_all()?;
         temp.persist(&self.file)
-            .map_err(|_| anyhow::anyhow!("could not save WUI vault"))?;
+            .map_err(|_| anyhow::anyhow!("could not save API vault"))?;
         // Update memory immediately after rename. A sync failure must never authorize a write.
         self.data = data;
         File::open(directory)?.sync_all()?;
@@ -217,7 +217,7 @@ impl Vault {
             if let Some(camera) = cameras.iter_mut().find(|camera| camera.id == device.id) {
                 ensure!(
                     device.matches(camera),
-                    "WUI vault camera binding differs from configured device"
+                    "API vault camera binding differs from configured device"
                 );
                 camera.password = Some(device.password.clone());
             } else if device.enrolled && known.insert(device.id.clone()) {
@@ -382,7 +382,7 @@ impl Vault {
             .command(
                 59,
                 Some(0),
-                &payload.replace("{{WUI_PASSWORD}}", &replacement.password),
+                &payload.replace("{{API_PASSWORD}}", &replacement.password),
             )
             .await;
         drop(session);
@@ -455,7 +455,7 @@ impl Vault {
             .command(
                 59,
                 Some(0),
-                &payload.replace("{{WUI_PASSWORD}}", &next.password),
+                &payload.replace("{{API_PASSWORD}}", &next.password),
             )
             .await;
         drop(session);
@@ -579,7 +579,7 @@ async fn change_payload(session: &mut Session, username: &str, factory: bool) ->
             }
         }
         output.push_str(if target {
-            "<userSetState>modify</userSetState><password>{{WUI_PASSWORD}}</password>"
+            "<userSetState>modify</userSetState><password>{{API_PASSWORD}}</password>"
         } else {
             "<userSetState>none</userSetState>"
         });

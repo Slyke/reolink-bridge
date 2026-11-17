@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -45,10 +45,8 @@ pub struct App {
     pub push: PushRoutes,
     pub native: BTreeMap<String, NativeRoute>,
     pub controls: BTreeMap<String, ControlHandle>,
-    pub camera_ids: BTreeSet<String>,
-    pub auth_token: String,
     pub stop: CancellationToken,
-    pub wui: Option<Arc<crate::wui::Wui>>,
+    pub api: Arc<crate::api::Api>,
 }
 
 pub struct NativeRoute {
@@ -74,12 +72,9 @@ pub fn router(app: Arc<App>, ws_path: &str) -> Router {
         .route(ws_path, get(upgrade))
         .layer(DefaultBodyLimit::max(xml::BODY_LIMIT))
         .with_state(app.clone());
-    let routes = if let Some(wui) = &app.wui {
-        routes.merge(crate::wui::router(wui.clone()))
-    } else {
-        routes
-    };
-    routes.layer(middleware::from_fn(correlate))
+    routes
+        .merge(crate::api::router(app.api.clone()))
+        .layer(middleware::from_fn(correlate))
 }
 
 const CORRELATION_HEADER: &str = "x-correlation-id";
@@ -284,12 +279,7 @@ async fn execute_camera(
         caller: "http::execute_camera",
         correlation: correlation.0,
     };
-    if !authorized(&headers, &app.auth_token)
-        && !app
-            .wui
-            .as_ref()
-            .is_some_and(|wui| wui.command_access(&headers, &camera_id))
-    {
+    if !app.api.command_access(&headers, &camera_id) {
         return errors.http(StatusCode::UNAUTHORIZED, "HTTP_CONTROL_AUTH_REQUIRED");
     }
     let Json(request) = match request {
@@ -300,7 +290,7 @@ async fn execute_camera(
         return errors.http(StatusCode::BAD_REQUEST, "HTTP_CONTROL_ID_INVALID");
     }
     let Some(handle) = app.controls.get(&camera_id) else {
-        let (status, key) = if app.camera_ids.contains(&camera_id) {
+        let (status, key) = if app.api.registered.contains(&camera_id) {
             (StatusCode::UNPROCESSABLE_ENTITY, "HTTP_CONTROL_DISABLED")
         } else {
             (StatusCode::NOT_FOUND, "HTTP_CONTROL_CAMERA_UNKNOWN")
@@ -361,13 +351,8 @@ async fn upgrade(
         caller: "http::upgrade",
         correlation: correlation.0,
     };
-    let legacy = authorized(&headers, &app.auth_token);
-    if !legacy
-        && !app
-            .wui
-            .as_ref()
-            .is_some_and(|wui| wui.session_access(&headers))
-    {
+    let primary = app.api.primary(&headers);
+    if !primary && !app.api.service(&headers) {
         return errors.http(StatusCode::UNAUTHORIZED, "WEBSOCKET_AUTH_REQUIRED");
     }
     let upgrade = match upgrade {
@@ -377,7 +362,7 @@ async fn upgrade(
     upgrade
         .max_frame_size(32 * 1024)
         .max_message_size(32 * 1024)
-        .on_upgrade(move |socket| websocket(socket, app, headers, legacy))
+        .on_upgrade(move |socket| websocket(socket, app, headers, primary))
         .into_response()
 }
 
@@ -412,7 +397,7 @@ enum Operation {
     },
 }
 
-async fn websocket(mut socket: WebSocket, app: Arc<App>, headers: HeaderMap, legacy: bool) {
+async fn websocket(mut socket: WebSocket, app: Arc<App>, headers: HeaderMap, primary: bool) {
     let mut updates = app.hub.subscribe();
     let mut filter = None;
     let mut replies = FuturesUnordered::new();
@@ -422,7 +407,7 @@ async fn websocket(mut socket: WebSocket, app: Arc<App>, headers: HeaderMap, leg
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Text(message))) => {
-                        let Some(reply) = handle(&app, &message, &mut filter, &mut updates, &mut replies, &headers, legacy).await else {
+                        let Some(reply) = handle(&app, &message, &mut filter, &mut updates, &mut replies, &headers, primary).await else {
                             continue;
                         };
                         reply
@@ -476,7 +461,7 @@ async fn handle<'a>(
     updates: &mut broadcast::Receiver<Update>,
     replies: &mut PendingReplies<'a>,
     headers: &HeaderMap,
-    legacy: bool,
+    primary: bool,
 ) -> Option<Value> {
     let correlation = Uuid::new_v4().to_string();
     let errors = RequestErrors {
@@ -497,31 +482,32 @@ async fn handle<'a>(
             return Some(reply);
         }
     };
-    let wui = if legacy { None } else { app.wui.as_deref() };
+    let scoped = (!primary).then_some(app.api.as_ref());
     let mut operation = request.operation;
-    if let Some(wui) = wui {
+    if let Some(api) = scoped {
         let permitted = match &mut operation {
-            Operation::Subscribe { filter } => wui
+            Operation::Subscribe { filter } => api
                 .event_filter(filter.clone())
                 .map(|scope| *filter = scope)
                 .is_some(),
-            Operation::Snapshot => wui.event_filter(Filter::default()).is_some(),
+            Operation::Snapshot => api.event_filter(Filter::default()).is_some(),
             Operation::CallbacksList | Operation::CallbacksRemove { .. } => {
-                wui.callback_allowed(None)
+                api.callback_allowed(false, None)
             }
             Operation::CallbacksAdd { callback } | Operation::CallbacksUpdate { callback } => {
-                wui.callback_allowed(Some(&callback.url))
+                api.callback_allowed(false, Some(&callback.url))
             }
-            Operation::Control { camera_id, .. } => wui.command_access(headers, camera_id),
+            Operation::Control { camera_id, .. } => api.command_access(headers, camera_id),
         };
         if !permitted {
-            let mut reply = errors.reply("WUI_SCOPE_DENIED", None);
+            let mut reply = errors.reply("API_SCOPE_DENIED", None);
             complete_ws_reply(&mut reply, request.id, correlation);
             return Some(reply);
         }
     }
     let mut reply = match operation {
-        Operation::Subscribe { filter: requested } => match requested.validate(&app.camera_ids) {
+        Operation::Subscribe { filter: requested } => match requested.validate(&app.api.registered)
+        {
             Ok(()) => {
                 *updates = app.hub.subscribe();
                 let snapshots = snapshots(&app.hub, &requested);
@@ -531,20 +517,30 @@ async fn handle<'a>(
             Err(error) => errors.reply("WEBSOCKET_FILTER_INVALID", Some(error)),
         },
         Operation::Snapshot => {
-            let default = wui
-                .and_then(|wui| wui.event_filter(Filter::default()))
+            let default = scoped
+                .and_then(|api| api.event_filter(Filter::default()))
                 .unwrap_or_default();
             json!({"ok":true,"snapshots":snapshots(&app.hub, filter.as_ref().unwrap_or(&default))})
         }
         Operation::CallbacksList => json!({"ok":true,"callbacks":app.hub.callbacks.list()}),
         Operation::CallbacksAdd { callback } => {
-            edit(app, CallbackEdit::Add(callback), correlation.clone()).await
+            edit_callbacks(&app.hub, CallbackEdit::Add(callback), correlation.clone()).await
         }
         Operation::CallbacksUpdate { callback } => {
-            edit(app, CallbackEdit::Update(callback), correlation.clone()).await
+            edit_callbacks(
+                &app.hub,
+                CallbackEdit::Update(callback),
+                correlation.clone(),
+            )
+            .await
         }
         Operation::CallbacksRemove { callback_id } => {
-            edit(app, CallbackEdit::Remove(callback_id), correlation.clone()).await
+            edit_callbacks(
+                &app.hub,
+                CallbackEdit::Remove(callback_id),
+                correlation.clone(),
+            )
+            .await
         }
         Operation::Control { camera_id, command } => {
             if let Some(controller) = app.controls.get(&camera_id) {
@@ -570,7 +566,7 @@ async fn handle<'a>(
                         Err((key, error)) => errors.reply(key, Some(error)),
                     }
                 }
-            } else if app.camera_ids.contains(&camera_id) {
+            } else if app.api.registered.contains(&camera_id) {
                 errors.reply("WEBSOCKET_CONTROL_DISABLED", None)
             } else {
                 errors.reply("WEBSOCKET_CAMERA_UNKNOWN", None)
@@ -595,14 +591,14 @@ fn snapshots(hub: &Hub, filter: &Filter) -> Vec<Value> {
         .collect()
 }
 
-async fn edit(app: &App, edit: CallbackEdit, correlation: String) -> Value {
-    let callbacks = app.hub.callbacks.clone();
+pub(crate) async fn edit_callbacks(hub: &Hub, edit: CallbackEdit, correlation: String) -> Value {
+    let callbacks = hub.callbacks.clone();
     let request_id = correlation.clone();
     match tokio::task::spawn_blocking(move || callbacks.edit(edit, request_id)).await {
         Ok(reply) => reply,
-        Err(_) => app.hub.diagnostics.error(
-            "http::edit",
-            "WEBSOCKET_CALLBACK_TASK_FAILED",
+        Err(_) => hub.diagnostics.error(
+            "http::edit_callbacks",
+            "CALLBACK_TASK_FAILED",
             Some(correlation),
             Value::Null,
             None,

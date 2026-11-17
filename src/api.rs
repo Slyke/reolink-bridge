@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Result, ensure};
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -29,9 +29,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    config::{Camera, valid_id},
-    http::{CorrelationId, authorized},
-    hub::Hub,
+    config::{Callback, Camera, valid_id},
+    http::{CorrelationId, authorized, edit_callbacks},
+    hub::{CallbackEdit, Hub},
     reolink::{
         control::{AiClass, Settings},
         wire::Device,
@@ -41,13 +41,13 @@ use credentials::{
     Credential, EnrollmentMethod, EnrollmentRequest, Identifiers, Status, Target, Vault,
 };
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
-    pub service_token: String,
+    pub service_token: Option<String>,
     pub admin_token: Option<String>,
     pub storage_directory: Option<PathBuf>,
-    // Omission permits all cameras on this dedicated bridge. An explicit list limits scope.
+    // An explicit list limits the scoped service token and credential operations.
     pub camera_ids: Option<BTreeSet<String>>,
     #[serde(default)]
     pub commands: bool,
@@ -65,8 +65,9 @@ pub struct Config {
     previews: preview::Config,
 }
 
-pub struct Wui {
+pub struct Api {
     pub config: Config,
+    http_token: String,
     vault: Option<Mutex<Vault>>,
     configured: BTreeSet<String>,
     pub registered: BTreeSet<String>,
@@ -79,11 +80,11 @@ pub struct Wui {
     stop: CancellationToken,
 }
 
-impl Wui {
+impl Api {
     pub fn prepare(
         config: Config,
         cameras: &mut Vec<Camera>,
-        legacy: &str,
+        http_token: &str,
         snapshot_slot: Arc<Semaphore>,
         stop: CancellationToken,
     ) -> Result<Self> {
@@ -91,23 +92,26 @@ impl Wui {
             (24..=256).contains(&token.len()) && token.bytes().all(|b| (33..=126).contains(&b))
         };
         ensure!(
-            safe(&config.service_token) && config.service_token != legacy,
-            "invalid or reused WUI service token"
+            config
+                .service_token
+                .as_ref()
+                .is_none_or(|token| safe(token) && token != http_token),
+            "invalid or reused API service token"
         );
         ensure!(
             config.admin_token.as_ref().is_none_or(|token| safe(token)
-                && token != legacy
-                && token != &config.service_token),
-            "invalid or reused WUI admin token"
+                && token != http_token
+                && Some(token) != config.service_token.as_ref()),
+            "invalid or reused API admin token"
         );
         ensure!(
             config.admin_token.is_some() == config.storage_directory.is_some(),
-            "WUI admin requires a private vault"
+            "API admin requires a private vault"
         );
         ensure!(
             (config.targets.is_empty() && config.rotation_ids.is_empty())
                 || config.admin_token.is_some(),
-            "WUI credential management requires an admin token"
+            "API credential management requires an admin token"
         );
         let configured: BTreeSet<_> = cameras.iter().map(|cam| cam.id.clone()).collect();
         let mut addresses = BTreeSet::new();
@@ -129,7 +133,7 @@ impl Wui {
                             .as_ref()
                             .is_none_or(|value| !value.is_empty() && value.len() <= 256)
                 }),
-            "invalid WUI enrollment target"
+            "invalid API enrollment target"
         );
         ensure!(
             config
@@ -139,16 +143,16 @@ impl Wui {
                     && url.host().is_some()
                     && url.username().is_empty()
                     && url.password().is_none()
-                    && url.fragment().is_none())
-                && (config.callback_destinations.is_empty() || config.camera_ids.is_none()),
-            "WUI callbacks require an explicit destination policy and a bridge-wide token"
+                    && url.fragment().is_none()
+                    && url.port() != Some(0)),
+            "invalid API callback destination"
         );
         ensure!(
             config
                 .rotation_ids
                 .iter()
                 .all(|(camera, id)| configured.contains(camera) && id.valid()),
-            "invalid WUI rotation binding"
+            "invalid API rotation binding"
         );
         ensure!(
             config
@@ -158,19 +162,15 @@ impl Wui {
                     |(id, profile)| (configured.contains(id) || target_ids.contains(id))
                         && profile.valid()
                 ),
-            "invalid WUI media profile"
+            "invalid API media profile"
         );
 
         ensure!(
             config.previews.cameras.iter().all(|(id, profile)| {
                 (configured.contains(id) || target_ids.contains(id))
-                    && config
-                        .camera_ids
-                        .as_ref()
-                        .is_none_or(|scope| scope.contains(id))
                     && (500..=2_147_483_647).contains(&profile.interval_ms)
             }),
-            "invalid WUI preview profile"
+            "invalid API preview profile"
         );
 
         let vault = config
@@ -191,7 +191,7 @@ impl Wui {
                     && cameras
                         .iter()
                         .all(|id| configured.contains(id) || target_ids.contains(id))),
-            "invalid WUI camera scope"
+            "invalid API camera scope"
         );
         let active = cameras.iter().map(|cam| cam.id.clone()).collect();
         let devices = cameras
@@ -212,6 +212,7 @@ impl Wui {
         let previews = preview::prepare(&config.previews, &devices, snapshot_slot, stop.clone())?;
         Ok(Self {
             config,
+            http_token: http_token.to_owned(),
             vault: vault.map(Mutex::new),
             configured,
             registered,
@@ -238,8 +239,19 @@ impl Wui {
             .is_none_or(|ids| ids.contains(id))
     }
 
-    fn service(&self, headers: &HeaderMap) -> bool {
-        authorized(headers, &self.config.service_token)
+    pub fn primary(&self, headers: &HeaderMap) -> bool {
+        authorized(headers, &self.http_token)
+    }
+
+    pub fn service(&self, headers: &HeaderMap) -> bool {
+        self.config
+            .service_token
+            .as_ref()
+            .is_some_and(|token| authorized(headers, token))
+    }
+
+    fn read_access(&self, headers: &HeaderMap, camera: &str) -> bool {
+        self.primary(headers) || (self.service(headers) && self.allows(camera))
     }
     fn admin(&self, headers: &HeaderMap) -> bool {
         self.config
@@ -252,10 +264,8 @@ impl Wui {
     }
 
     pub fn command_access(&self, headers: &HeaderMap, camera: &str) -> bool {
-        self.service(headers) && self.config.commands && self.allows(camera)
-    }
-    pub fn session_access(&self, headers: &HeaderMap) -> bool {
-        self.service(headers)
+        self.primary(headers)
+            || (self.config.commands && self.service(headers) && self.allows(camera))
     }
 
     pub fn event_filter(&self, mut filter: crate::config::Filter) -> Option<crate::config::Filter> {
@@ -277,33 +287,42 @@ impl Wui {
         Some(filter)
     }
 
-    pub fn callback_allowed(&self, destination: Option<&Url>) -> bool {
-        !self.config.callback_destinations.is_empty()
+    pub fn callback_allowed(&self, primary: bool, destination: Option<&Url>) -> bool {
+        (primary || self.config.camera_ids.is_none())
+            && !self.config.callback_destinations.is_empty()
             && destination.is_none_or(|url| self.config.callback_destinations.contains(url))
     }
 }
 
-pub fn router(wui: Arc<Wui>) -> Router {
-    Router::new()
-        .route("/api/wui/v1/contract", get(contract))
-        .route("/api/wui/v1/inventory", get(inventory))
-        .route("/api/wui/v1/cameras/{id}/settings/{group}", get(settings))
-        .route("/api/wui/v1/cameras/{id}/media/{stream}", get(media::get))
-        .route("/api/wui/v1/cameras/{id}/preview", get(preview::get))
-        .route("/api/wui/v1/enrollment-targets", get(targets))
-        .route("/api/wui/v1/enrollments", post(enroll))
-        .route("/api/wui/v1/enrollments/{id}", get(enrollment_status))
-        .route("/api/wui/v1/enrollments/{id}/resume", post(resume))
+pub fn router(api: Arc<Api>) -> Router {
+    let callbacks = Router::new()
+        .route("/api/callbacks", get(callbacks).post(add_callback))
         .route(
-            "/api/wui/v1/cameras/{id}/rotation",
+            "/api/callbacks/{id}",
+            axum::routing::put(update_callback).delete(remove_callback),
+        )
+        .layer(DefaultBodyLimit::max(32 * 1024));
+    Router::new()
+        .route("/api/contract", get(contract))
+        .route("/api/inventory", get(inventory))
+        .route("/api/cameras/{id}/settings/{group}", get(settings))
+        .route("/api/cameras/{id}/media/{stream}", get(media::get))
+        .route("/api/cameras/{id}/preview", get(preview::get))
+        .route("/api/enrollment-targets", get(targets))
+        .route("/api/enrollments", post(enroll))
+        .route("/api/enrollments/{id}", get(enrollment_status))
+        .route("/api/enrollments/{id}/resume", post(resume))
+        .route(
+            "/api/cameras/{id}/rotation",
             get(rotation_status).post(rotate),
         )
         .route(
-            "/api/wui/v1/cameras/{id}/rotation/reconcile",
+            "/api/cameras/{id}/rotation/reconcile",
             post(reconcile_rotation),
         )
         .layer(DefaultBodyLimit::max(4096))
-        .with_state(wui)
+        .merge(callbacks)
+        .with_state(api)
 }
 
 fn error(status: StatusCode, key: &'static str, correlation: &CorrelationId) -> Response {
@@ -319,52 +338,163 @@ fn progress(status: Status, id: Option<String>, correlation: &CorrelationId) -> 
 }
 
 async fn contract(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !wui.service(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_SCOPE_DENIED", &correlation);
+    let primary = api.primary(&headers);
+    if !primary && !api.service(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    let profiles: Map<String, Value> = wui
+    let profiles: Map<String, Value> = api
         .config
         .media
         .iter()
         .filter(|(id, _)| {
-            wui.active.contains(*id) && wui.devices.contains_key(*id) && wui.allows(id)
+            api.active.contains(*id) && api.devices.contains_key(*id) && (primary || api.allows(id))
         })
         .map(|(id, profile)| (id.clone(), json!(profile.streams)))
         .collect();
     Json(json!({"version":1,"media":!profiles.is_empty(),"mediaCameras":profiles,
-       "previewCameras":wui.previews.keys().collect::<Vec<_>>(),
-       "enrollment":wui.vault.is_some(),"inventory":true,"settings":["leds","spotlight","motion","ai"],"alerts":["motion"],
+       "previewCameras":api.previews.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
+       "enrollment":api.vault.is_some(),"inventory":true,"callbacks":api.callback_allowed(primary, None),"settings":["leds","spotlight","motion","ai"],"alerts":["motion"],
        "correlation_id":correlation.0})).into_response()
 }
 
 async fn inventory(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !wui.service(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_SCOPE_DENIED", &correlation);
+    let primary = api.primary(&headers);
+    if !primary && !api.service(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    Json(json!({"cameras":wui.registered.iter().filter(|id| wui.allows(id)).map(|id| json!({"id":id,"active":wui.active.contains(id)})).collect::<Vec<_>>(), "correlation_id":correlation.0})).into_response()
+    Json(json!({"cameras":api.registered.iter().filter(|id| primary || api.allows(id)).map(|id| json!({"id":id,"active":api.active.contains(id)})).collect::<Vec<_>>(), "correlation_id":correlation.0})).into_response()
+}
+
+async fn callbacks(
+    State(api): State<Arc<Api>>,
+    headers: HeaderMap,
+    Extension(correlation): Extension<CorrelationId>,
+) -> Response {
+    let primary = api.primary(&headers);
+    if !primary && !api.service(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
+    }
+    if !api.callback_allowed(primary, None) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "CALLBACK_DESTINATION_DENIED",
+            &correlation,
+        );
+    }
+    Json(json!({
+        "ok": true,
+        "callbacks": api.hub().callbacks.list(),
+        "correlation_id": correlation.0
+    }))
+    .into_response()
+}
+
+async fn add_callback(
+    State(api): State<Arc<Api>>,
+    headers: HeaderMap,
+    Extension(correlation): Extension<CorrelationId>,
+    body: Result<Json<Callback>, JsonRejection>,
+) -> Response {
+    let Ok(Json(callback)) = body else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "CALLBACK_CONFIG_INVALID",
+            &correlation,
+        );
+    };
+    change_callback(&api, &headers, &correlation, CallbackEdit::Add(callback)).await
+}
+
+async fn update_callback(
+    State(api): State<Arc<Api>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Extension(correlation): Extension<CorrelationId>,
+    body: Result<Json<Callback>, JsonRejection>,
+) -> Response {
+    let Ok(Json(callback)) = body else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "CALLBACK_CONFIG_INVALID",
+            &correlation,
+        );
+    };
+    if callback.id != id {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "CALLBACK_CONFIG_INVALID",
+            &correlation,
+        );
+    }
+    change_callback(&api, &headers, &correlation, CallbackEdit::Update(callback)).await
+}
+
+async fn remove_callback(
+    State(api): State<Arc<Api>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Extension(correlation): Extension<CorrelationId>,
+) -> Response {
+    change_callback(&api, &headers, &correlation, CallbackEdit::Remove(id)).await
+}
+
+async fn change_callback(
+    api: &Api,
+    headers: &HeaderMap,
+    correlation: &CorrelationId,
+    edit: CallbackEdit,
+) -> Response {
+    let primary = api.primary(headers);
+    if !primary && !api.service(headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", correlation);
+    }
+    let destination = match &edit {
+        CallbackEdit::Add(callback) | CallbackEdit::Update(callback) => Some(&callback.url),
+        CallbackEdit::Remove(_) => None,
+    };
+    if !api.callback_allowed(primary, destination) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "CALLBACK_DESTINATION_DENIED",
+            correlation,
+        );
+    }
+    let mut reply = edit_callbacks(api.hub(), edit, correlation.0.clone()).await;
+    reply["correlation_id"] = json!(correlation.0);
+    let status = if reply["ok"] == true {
+        StatusCode::OK
+    } else {
+        match reply["errorKey"].as_str() {
+            Some("CALLBACK_CONFIG_INVALID") => StatusCode::UNPROCESSABLE_ENTITY,
+            Some("CALLBACK_UPDATE_MISSING" | "CALLBACK_REMOVE_MISSING") => StatusCode::NOT_FOUND,
+            Some("CALLBACK_CONFIG_CHANGED") => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    };
+    (status, Json(reply)).into_response()
 }
 
 async fn settings(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     Path((id, group)): Path<(String, String)>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !wui.service(&headers) || !wui.allows(&id) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_SCOPE_DENIED", &correlation);
+    if !api.read_access(&headers, &id) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    let Some(device) = wui.devices.get(&id) else {
+    let Some(device) = api.devices.get(&id) else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_SETTING_UNSUPPORTED",
+            "API_SETTING_UNSUPPORTED",
             &correlation,
         );
     };
@@ -385,12 +515,12 @@ async fn settings(
         _ => {
             return error(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "WUI_SETTING_UNSUPPORTED",
+                "API_SETTING_UNSUPPORTED",
                 &correlation,
             );
         }
     };
-    let capabilities = wui.hub().snapshot(&id, "capabilities");
+    let capabilities = api.hub().snapshot(&id, "capabilities");
     let groups: Vec<_> = groups
         .into_iter()
         .filter(|group| {
@@ -402,14 +532,14 @@ async fn settings(
     if groups.is_empty() {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_SETTING_UNSUPPORTED",
+            "API_SETTING_UNSUPPORTED",
             &correlation,
         );
     }
-    let Ok(_permit) = wui.settings_slots.try_acquire() else {
+    let Ok(_permit) = api.settings_slots.try_acquire() else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "WUI_READ_BUSY",
+            "API_READ_BUSY",
             &correlation,
         );
     };
@@ -434,83 +564,83 @@ async fn settings(
         }
         _ => error(
             StatusCode::BAD_GATEWAY,
-            "WUI_SETTING_READ_FAILED",
+            "API_SETTING_READ_FAILED",
             &correlation,
         ),
     }
 }
 
 async fn targets(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !wui.admin(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_ADMIN_REQUIRED", &correlation);
+    if !api.admin(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
     }
-    Json(json!({"targets":wui.config.targets.keys().collect::<Vec<_>>(),"correlation_id":correlation.0})).into_response()
+    Json(json!({"targets":api.config.targets.keys().collect::<Vec<_>>(),"correlation_id":correlation.0})).into_response()
 }
 
 async fn enroll(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
     Json(body): Json<EnrollmentRequest>,
 ) -> Response {
-    if !wui.admin(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_ADMIN_REQUIRED", &correlation);
+    if !api.admin(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
     }
-    let Some(vault) = &wui.vault else {
+    let Some(vault) = &api.vault else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_ENROLLMENT_DISABLED",
+            "API_ENROLLMENT_DISABLED",
             &correlation,
         );
     };
     let Ok(mut vault) = vault.try_lock() else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "WUI_VAULT_BUSY",
+            "API_VAULT_BUSY",
             &correlation,
         );
     };
     let id = body.id;
     if vault
-        .start(body, &wui.config.targets, &wui.configured)
+        .start(body, &api.config.targets, &api.configured)
         .is_err()
     {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_ENROLLMENT_INVALID",
+            "API_ENROLLMENT_INVALID",
             &correlation,
         );
     }
-    finish_enrollment(&wui, &mut vault, id, false, &correlation).await
+    finish_enrollment(&api, &mut vault, id, false, &correlation).await
 }
 async fn enrollment_status(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !wui.admin(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_ADMIN_REQUIRED", &correlation);
+    if !api.admin(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
     }
-    let Some(vault) = &wui.vault else {
+    let Some(vault) = &api.vault else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_ENROLLMENT_DISABLED",
+            "API_ENROLLMENT_DISABLED",
             &correlation,
         );
     };
     let Ok(vault) = vault.try_lock() else {
         return progress(Status::InProgress, None, &correlation);
     };
-    match vault.progress(id, &wui.active) {
+    match vault.progress(id, &api.active) {
         Some((state, camera)) => progress(state, camera, &correlation),
         None => error(
             StatusCode::NOT_FOUND,
-            "WUI_ENROLLMENT_UNKNOWN",
+            "API_ENROLLMENT_UNKNOWN",
             &correlation,
         ),
     }
@@ -522,31 +652,31 @@ struct Resume {
 }
 
 async fn resume(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
     Json(body): Json<Resume>,
 ) -> Response {
-    if !wui.admin(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_ADMIN_REQUIRED", &correlation);
+    if !api.admin(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
     }
-    let Some(vault) = &wui.vault else {
+    let Some(vault) = &api.vault else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_ENROLLMENT_DISABLED",
+            "API_ENROLLMENT_DISABLED",
             &correlation,
         );
     };
     let Ok(mut vault) = vault.try_lock() else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "WUI_VAULT_BUSY",
+            "API_VAULT_BUSY",
             &correlation,
         );
     };
     finish_enrollment(
-        &wui,
+        &api,
         &mut vault,
         id,
         body.method == Some(EnrollmentMethod::Import),
@@ -555,30 +685,30 @@ async fn resume(
     .await
 }
 async fn finish_enrollment(
-    wui: &Wui,
+    api: &Api,
     vault: &mut Vault,
     id: Uuid,
     import: bool,
     correlation: &CorrelationId,
 ) -> Response {
-    if vault.progress(id, &wui.active).is_none() {
-        return error(StatusCode::NOT_FOUND, "WUI_ENROLLMENT_UNKNOWN", correlation);
+    if vault.progress(id, &api.active).is_none() {
+        return error(StatusCode::NOT_FOUND, "API_ENROLLMENT_UNKNOWN", correlation);
     }
     if !matches!(
         timeout(
             Duration::from_secs(53),
-            vault.resume(id, &wui.config.targets, import)
+            vault.resume(id, &api.config.targets, import)
         )
         .await,
         Ok(Ok(()))
     ) {
         return error(
             StatusCode::BAD_GATEWAY,
-            "WUI_ENROLLMENT_INTERRUPTED",
+            "API_ENROLLMENT_INTERRUPTED",
             correlation,
         );
     }
-    let (status, camera) = vault.progress(id, &wui.active).unwrap();
+    let (status, camera) = vault.progress(id, &api.active).unwrap();
     progress(status, camera, correlation)
 }
 
@@ -590,18 +720,18 @@ struct Rotate {
 }
 
 async fn rotation_status(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !wui.admin(&headers) || !wui.allows(&id) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_ADMIN_REQUIRED", &correlation);
+    if !api.admin(&headers) || !api.allows(&id) {
+        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
     }
-    let Some(vault) = &wui.vault else {
+    let Some(vault) = &api.vault else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_ROTATION_DISABLED",
+            "API_ROTATION_DISABLED",
             &correlation,
         );
     };
@@ -609,48 +739,48 @@ async fn rotation_status(
         return progress(Status::InProgress, None, &correlation);
     };
     progress(
-        vault.rotation_progress(&id, &wui.devices),
+        vault.rotation_progress(&id, &api.devices),
         None,
         &correlation,
     )
 }
 
 async fn rotate(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
     Json(body): Json<Rotate>,
 ) -> Response {
-    if !wui.admin(&headers) || !wui.allows(&id) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_ADMIN_REQUIRED", &correlation);
+    if !api.admin(&headers) || !api.allows(&id) {
+        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
     }
     if !body.confirmation || body.id.get_version_num() != 4 {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_CONFIRM_REQUIRED",
+            "API_CONFIRM_REQUIRED",
             &correlation,
         );
     }
-    let Some(vault) = &wui.vault else {
+    let Some(vault) = &api.vault else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_ROTATION_DISABLED",
+            "API_ROTATION_DISABLED",
             &correlation,
         );
     };
     let Ok(mut vault) = vault.try_lock() else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "WUI_VAULT_BUSY",
+            "API_VAULT_BUSY",
             &correlation,
         );
     };
-    if vault.rotation_progress(&id, &wui.devices) == Status::RestartRequired {
+    if vault.rotation_progress(&id, &api.devices) == Status::RestartRequired {
         return progress(Status::RestartRequired, None, &correlation);
     }
     let old = vault.credential(&id).or_else(|| {
-        let device = wui.devices.get(&id)?;
+        let device = api.devices.get(&id)?;
         Some(Credential {
             id: id.clone(),
             host: device.host.clone(),
@@ -658,14 +788,14 @@ async fn rotate(
             channel: device.channel,
             username: device.username.clone(),
             password: device.password.clone(),
-            identifiers: wui.config.rotation_ids.get(&id)?.clone(),
+            identifiers: api.config.rotation_ids.get(&id)?.clone(),
             enrolled: false,
         })
     });
     let Some(old) = old else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_ROTATION_UNSUPPORTED",
+            "API_ROTATION_UNSUPPORTED",
             &correlation,
         );
     };
@@ -673,51 +803,51 @@ async fn rotate(
         timeout(Duration::from_secs(53), vault.rotate(&id, body.id, old)).await,
         Ok(Ok(()))
     ) {
-        let status = vault.rotation_progress(&id, &wui.devices);
+        let status = vault.rotation_progress(&id, &api.devices);
         if matches!(status, Status::InProgress | Status::RecoveryRequired) {
             return progress(status, None, &correlation);
         }
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_ROTATION_UNSUPPORTED",
+            "API_ROTATION_UNSUPPORTED",
             &correlation,
         );
     }
     progress(
-        vault.rotation_progress(&id, &wui.devices),
+        vault.rotation_progress(&id, &api.devices),
         None,
         &correlation,
     )
 }
 
 async fn reconcile_rotation(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
     Json(body): Json<Rotate>,
 ) -> Response {
-    if !wui.admin(&headers) || !wui.allows(&id) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_ADMIN_REQUIRED", &correlation);
+    if !api.admin(&headers) || !api.allows(&id) {
+        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
     }
     if !body.confirmation || body.id.get_version_num() != 4 {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_CONFIRM_REQUIRED",
+            "API_CONFIRM_REQUIRED",
             &correlation,
         );
     }
-    let Some(vault) = &wui.vault else {
+    let Some(vault) = &api.vault else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_ROTATION_DISABLED",
+            "API_ROTATION_DISABLED",
             &correlation,
         );
     };
     let Ok(mut vault) = vault.try_lock() else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "WUI_VAULT_BUSY",
+            "API_VAULT_BUSY",
             &correlation,
         );
     };
@@ -727,12 +857,12 @@ async fn reconcile_rotation(
     ) {
         return error(
             StatusCode::BAD_GATEWAY,
-            "WUI_ROTATION_RECONCILE_FAILED",
+            "API_ROTATION_RECONCILE_FAILED",
             &correlation,
         );
     }
     progress(
-        vault.rotation_progress(&id, &wui.devices),
+        vault.rotation_progress(&id, &api.devices),
         None,
         &correlation,
     )

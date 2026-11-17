@@ -30,9 +30,9 @@ use tokio_tungstenite::{
 };
 use uuid::Uuid;
 
-const SERVICE: &str = "wui-test-service-token-for-scoped-tests";
-const ADMIN: &str = "wui-test-admin-token-for-scoped-tests";
-const LEGACY: &str = "wui-test-legacy-token-for-scoped-tests";
+const SERVICE: &str = "api-test-service-token-for-scoped-tests";
+const ADMIN: &str = "api-test-admin-token-for-scoped-tests";
+const PRIMARY: &str = "api-test-legacy-token-for-scoped-tests";
 const UID: &str = "952700FIXTURE0001";
 
 fn free_port() -> Result<u16> {
@@ -109,8 +109,8 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
         .spawn()?;
     let port = free_port()?;
     let origin = format!("http://127.0.0.1:{port}");
-    let contract = format!("{origin}/api/wui/v1/contract");
-    let preview = format!("{origin}/api/wui/v1/cameras/fixture/preview");
+    let contract = format!("{origin}/api/contract");
+    let preview = format!("{origin}/api/cameras/fixture/preview");
     let config = directory.path().join("bridge.json5");
     let valkey = std::env::var("BRIDGE_TEST_VALKEY_URL").ok();
     let cache = match &valkey {
@@ -121,10 +121,10 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
     };
     std::fs::write(&config, json!({
         "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"},
-        "http":{"listen":format!("127.0.0.1:{port}"),"token":LEGACY},
+        "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
         "cameras":[{"id":"fixture","host":"127.0.0.1","username":"admin","password":baichuan::PASSWORD,
             "onvifPort":null,"baichuanPort":baichuan,"eventTransport":"baichuan"}],
-        "wui":{"serviceToken":SERVICE,"cameraIds":["fixture"],
+        "api":{"serviceToken":SERVICE,"cameraIds":["fixture"],
             "previews":{"cache":cache,"cameras":{"fixture":{"intervalMs":500}}}}
     }).to_string())?;
     let client = Client::builder()
@@ -153,11 +153,11 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
     assert_eq!(
         client
             .get(&preview)
-            .bearer_auth(LEGACY)
+            .bearer_auth(PRIMARY)
             .send()
             .await?
             .status(),
-        401
+        200
     );
     let frame = client
         .get(&preview)
@@ -278,11 +278,12 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
     let config = directory.path().join("bridge.json5");
     let body = json!({
       "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"},
-      "http":{"listen":format!("127.0.0.1:{port}"),"token":LEGACY},
+      "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
       "cameras":[],
-      "wui":{
+      "api":{
         "serviceToken":SERVICE,"adminToken":ADMIN,"storageDirectory":vault,"cameraIds":["new","imported"],"commands":true,"events":true,
         "media": {"new":{"port":rtsp_port,"streams":["main"]}},
+        "callbackDestinations": ["http://127.0.0.1:9/events"],
         "targets":{
           "factory":{"host":"127.0.0.1","port":address.port(),"cameraId":"new"},
           "import":{"host":"127.0.0.1","port":second.port(),"cameraId":"imported","importPassword":baichuan::PASSWORD}
@@ -295,11 +296,11 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
         .timeout(Duration::from_secs(10))
         .build()?;
     let mut bridge = start(&config, &client, &origin).await?;
-    let base = format!("{origin}/api/wui/v1");
+    let base = format!("{origin}/api");
     let url = |path: &str| format!("{base}{path}");
     assert_eq!(
-        response(&client, &url("/contract"), LEGACY, None).await.0,
-        401
+        response(&client, &url("/contract"), PRIMARY, None).await.0,
+        200
     );
     assert_eq!(
         response(&client, &url("/contract"), ADMIN, None).await.0,
@@ -315,6 +316,63 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
             .0,
         401
     );
+
+    let callback =
+        json!({"id":"receiver","url":"http://127.0.0.1:9/events","events":["fixture-only"]});
+    assert_eq!(
+        response(&client, &url("/contract"), SERVICE, None).await.1["callbacks"],
+        false
+    );
+    assert_eq!(
+        response(&client, &url("/contract"), PRIMARY, None).await.1["callbacks"],
+        true
+    );
+    let denied = response(&client, &url("/callbacks"), SERVICE, Some(callback.clone())).await;
+    assert_eq!(denied.0, 403);
+    assert_eq!(denied.1["errorKey"], "CALLBACK_DESTINATION_DENIED");
+    let mut other_destination = callback.clone();
+    other_destination["url"] = json!("http://127.0.0.1:9/unlisted");
+    assert_eq!(
+        response(
+            &client,
+            &url("/callbacks"),
+            PRIMARY,
+            Some(other_destination)
+        )
+        .await
+        .0,
+        403
+    );
+    let added = response(&client, &url("/callbacks"), PRIMARY, Some(callback.clone())).await;
+    assert_eq!(added.1["ok"], true, "{added:?}");
+    let mut updated = callback;
+    updated["events"] = json!(["another-fixture-event"]);
+    let updates = client
+        .put(url("/callbacks/receiver"))
+        .bearer_auth(PRIMARY)
+        .header("content-type", "application/json")
+        .body(updated.to_string())
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let updates: Value = serde_json::from_str(&updates)?;
+    assert_eq!(updates["callbacks"][0]["events"], updated["events"]);
+    assert_eq!(
+        response(&client, &url("/callbacks"), PRIMARY, None).await.1["callbacks"][0]["id"],
+        "receiver"
+    );
+    let removed = client
+        .delete(url("/callbacks/receiver"))
+        .bearer_auth(PRIMARY)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let removed: Value = serde_json::from_str(&removed)?;
+    assert_eq!(removed["callbacks"], json!([]));
 
     let rejected = json!({"id":Uuid::new_v4(),"target":"factory","method":"initialize","uid":UID,"confirmation":false});
     assert_eq!(
@@ -398,7 +456,7 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
     .await?;
     let reply: Value = serde_json::from_str(ws.next().await.unwrap()?.to_text()?)?;
     assert_eq!(reply["ok"], false);
-    assert_eq!(reply["errorKey"], "WUI_SCOPE_DENIED");
+    assert_eq!(reply["errorKey"], "API_SCOPE_DENIED");
     ws.close(None).await?;
 
     let video = client
@@ -413,7 +471,7 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
     );
     assert_eq!(
         video.headers()["content-type"],
-        "multipart/x-mixed-replace; boundary=wui"
+        "multipart/x-mixed-replace; boundary=reolink-frame"
     );
     let mut video = video;
     let mut received = Vec::new();
@@ -421,7 +479,7 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
         let chunk = video.chunk().await?.context("fixture media ended")?;
         received.extend_from_slice(&chunk);
     }
-    assert!(received.starts_with(b"--wui"));
+    assert!(received.starts_with(b"--reolink-frame"));
     assert!(received.windows(3).any(|part| part == b"\xff\xd8\xff"));
     drop(video);
 

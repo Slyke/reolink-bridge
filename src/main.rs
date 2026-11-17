@@ -1,3 +1,4 @@
+mod api;
 mod camera;
 mod config;
 mod diagnostics;
@@ -8,7 +9,6 @@ mod mqtt;
 mod onvif;
 mod reolink;
 mod tls;
-mod wui;
 mod xml;
 
 use std::{
@@ -148,19 +148,13 @@ async fn run(
         .as_ref()
         .context("missing validated HTTP bearer token")?;
     let snapshot_slot = Arc::new(Semaphore::new(1));
-    let wui = config
-        .wui
-        .take()
-        .map(|options| {
-            wui::Wui::prepare(
-                options,
-                &mut config.cameras,
-                auth_token,
-                snapshot_slot.clone(),
-                stop.clone(),
-            )
-        })
-        .transpose()?;
+    let api = api::Api::prepare(
+        config.api.take().unwrap_or_default(),
+        &mut config.cameras,
+        auth_token,
+        snapshot_slot.clone(),
+        stop.clone(),
+    )?;
     let ids: BTreeSet<_> = config
         .cameras
         .iter()
@@ -209,10 +203,8 @@ async fn run(
     let mut native = BTreeMap::new();
     let mut secrets = vec![auth_token.clone()];
     secrets.extend(config.mqtt.password.clone());
-    if let Some(wui) = &wui {
-        secrets.push(wui.config.service_token.clone());
-        secrets.extend(wui.config.admin_token.clone());
-    }
+    secrets.extend(api.config.service_token.clone());
+    secrets.extend(api.config.admin_token.clone());
     let mut devices = Vec::new();
     for mut camera in config.cameras {
         let password = camera
@@ -344,15 +336,12 @@ async fn run(
         ));
     }
 
-    let known = wui.as_ref().map_or(ids, |wui| wui.registered.clone());
     let app = Arc::new(http::App {
-        wui: wui.map(|wui| wui.attach(hub.clone(), &mut workers)),
+        api: api.attach(hub.clone(), &mut workers),
         hub,
         push,
         native,
         controls,
-        camera_ids: known,
-        auth_token: auth_token.clone(),
         stop: stop.clone(),
     });
     let router = http::router(app, ws_path);

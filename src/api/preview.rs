@@ -21,7 +21,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use super::{Wui, error};
+use super::{Api, error};
 use crate::{http::CorrelationId, reolink::wire::Device};
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(35);
@@ -315,20 +315,20 @@ pub(super) struct PreviewQuery {
 }
 
 pub(super) async fn get(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     Path(id): Path<String>,
     Query(query): Query<PreviewQuery>,
     method: Method,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !wui.service(&headers) || !wui.allows(&id) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_SCOPE_DENIED", &correlation);
+    if !api.read_access(&headers, &id) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    let Some(preview) = wui.previews.get(&id) else {
+    let Some(preview) = api.previews.get(&id) else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_MEDIA_UNSUPPORTED",
+            "API_MEDIA_UNSUPPORTED",
             &correlation,
         );
     };
@@ -341,7 +341,7 @@ pub(super) async fn get(
     let Some(frame) = frame else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "WUI_PREVIEW_UNAVAILABLE",
+            "API_PREVIEW_UNAVAILABLE",
             &correlation,
         );
     };

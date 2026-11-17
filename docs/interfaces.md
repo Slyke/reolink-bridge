@@ -45,6 +45,8 @@ Subsequent updates use `{"op":"event","event":{...}}` and `{"op":"snapshot","sna
 
 ## Manage downstream callbacks
 
+Use the [HTTP API](./api.md#authorization-and-enrollment) to manage callbacks with an approved receiver, or use the WebSocket commands below.
+
 Each callback receives an HTTP(S) POST with `Content-Type: application/json` and the same event object sent on MQTT. Match by normalized type or exact vendor topic. Omit filters or send empty arrays to match all. Each destination has a bounded queue and a five-second delivery timeout. The receiver should return a 2xx response. Delivery is best effort.
 
 List, add, edit, and remove callbacks through WebSocket.

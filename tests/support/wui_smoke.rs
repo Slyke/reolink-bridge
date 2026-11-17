@@ -31,11 +31,9 @@ pub async fn run(directory: &Path, bridge: &str, broker: u16, client: &Client) -
         "publicOrigin":origin,"listen":{"port":port},"auth":{"mode":"local"},
         "database":{"driver":"sqlite","path":directory.join("wui.sqlite")},
         "bridges":[{
-            "label":"Test bridge","id":"fixture","cameraIds":["new"],"commands":"http","events":"ws","capture":"mqtt",
-            "http":{"url":bridge,"token":super::SERVICE},
-            "ws":{"url":format!("{}/ws",bridge.replacen("http:","ws:",1)),"token":super::SERVICE},
-            "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"},
-            "extensions":{"url":bridge,"token":super::SERVICE,"adminToken":super::ADMIN,"relay":true}
+            "label":"Test bridge","id":"fixture","commands":"http","events":"mqtt","capture":"mqtt",
+            "http":{"url":bridge,"token":super::SERVICE,"adminToken":super::ADMIN},
+            "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"}
         }]
     }).to_string())?;
     let bootstrap = Command::new(&node)

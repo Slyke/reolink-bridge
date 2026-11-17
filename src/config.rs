@@ -20,7 +20,8 @@ pub struct Config {
     pub cameras: Vec<Camera>,
     #[serde(default)]
     pub callbacks: Vec<Callback>,
-    pub wui: Option<crate::wui::Config>,
+    #[serde(alias = "wui")]
+    pub api: Option<crate::api::Config>,
 }
 
 #[derive(Deserialize)]
@@ -331,7 +332,7 @@ pub fn parse(mut document: Value, environment: &impl Fn(&str) -> Option<String>)
         );
     }
     ensure!(
-        !config.cameras.is_empty() || config.wui.is_some(),
+        !config.cameras.is_empty() || config.api.is_some(),
         "configure at least one camera"
     );
     let mut ids = BTreeSet::new();

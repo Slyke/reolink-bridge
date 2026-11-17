@@ -236,6 +236,27 @@ async fn local_broker_http_websocket_and_camera_controls() {
     assert_eq!(reply["ok"], true, "{reply}");
     let consumer = fixture.consumer.lock().unwrap().clone().unwrap();
     let http = reqwest::Client::new();
+    let inventory_url = format!("http://{address}/api/inventory");
+    assert_eq!(
+        http.get(&inventory_url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let inventory = http
+        .get(inventory_url)
+        .bearer_auth(WS_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let inventory: Value = serde_json::from_str(&inventory).unwrap();
+    assert_eq!(
+        inventory["cameras"],
+        json!([{"id":"fixed","active":true},{"id":"lab","active":true}])
+    );
     let (status, live) = probe(&http, address, "/livez").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(live["ok"], true);

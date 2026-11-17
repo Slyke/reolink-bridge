@@ -30,6 +30,11 @@
     coordinates: { allowVideoStream: false },
     // nativeWebhook: { protocol: "ha_cfg", token: "${CAMERA_WEBHOOK_TOKEN}" },
   }],
+  // Enable background previews or the HTTP video relay for selected cameras.
+  // api: {
+  //   previews: { cameras: { "front-door": { intervalMs: 5000 } } },
+  //   media: { "front-door": { port: 554, streams: ["sub"] } },
+  // },
   logging: {
     sinks: {
       console: { enabled: true, format: "json", levels: ["info", "warn", "error"] },

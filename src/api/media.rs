@@ -24,7 +24,7 @@ use tokio::{
 };
 use url::Url;
 
-use super::{Wui, error};
+use super::{Api, error};
 use crate::{http::CorrelationId, reolink::wire::Device};
 
 #[derive(Deserialize)]
@@ -77,15 +77,15 @@ impl Relay {
 }
 
 pub async fn get(
-    State(wui): State<Arc<Wui>>,
+    State(api): State<Arc<Api>>,
     Path((id, stream)): Path<(String, String)>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !wui.service(&headers) || !wui.allows(&id) {
-        return error(StatusCode::UNAUTHORIZED, "WUI_SCOPE_DENIED", &correlation);
+    if !api.read_access(&headers, &id) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    let Some(profile) = wui
+    let Some(profile) = api
         .config
         .media
         .get(&id)
@@ -93,40 +93,40 @@ pub async fn get(
     else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_MEDIA_UNSUPPORTED",
+            "API_MEDIA_UNSUPPORTED",
             &correlation,
         );
     };
-    let Some(device) = wui.devices.get(&id) else {
+    let Some(device) = api.devices.get(&id) else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "WUI_MEDIA_UNSUPPORTED",
+            "API_MEDIA_UNSUPPORTED",
             &correlation,
         );
     };
-    let Ok(slot) = wui.media_slots.clone().try_acquire_owned() else {
+    let Ok(slot) = api.media_slots.clone().try_acquire_owned() else {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
-            "WUI_MEDIA_BUSY",
+            "API_MEDIA_BUSY",
             &correlation,
         );
     };
     let Ok(Ok(mut relay)) = timeout(
         Duration::from_secs(12),
-        start(device, profile, &stream, slot, wui.stop.clone()),
+        start(device, profile, &stream, slot, api.stop.clone()),
     )
     .await
     else {
         return error(
             StatusCode::BAD_GATEWAY,
-            "WUI_MEDIA_START_FAILED",
+            "API_MEDIA_START_FAILED",
             &correlation,
         );
     };
     let Ok(Some(first)) = relay.sample().await else {
         return error(
             StatusCode::BAD_GATEWAY,
-            "WUI_MEDIA_START_FAILED",
+            "API_MEDIA_START_FAILED",
             &correlation,
         );
     };
@@ -143,7 +143,10 @@ pub async fn get(
     ));
     (
         [
-            ("content-type", "multipart/x-mixed-replace; boundary=wui"),
+            (
+                "content-type",
+                "multipart/x-mixed-replace; boundary=reolink-frame",
+            ),
             ("cache-control", "private, no-store"),
             ("x-accel-buffering", "no"),
             ("x-content-type-options", "nosniff"),
@@ -224,7 +227,7 @@ async fn start(
             "-f",
             "mpjpeg",
             "-boundary_tag",
-            "wui",
+            "reolink-frame",
             "-flush_packets",
             "1",
             "pipe:1",
