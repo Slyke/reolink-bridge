@@ -25,6 +25,8 @@ use tokio_tungstenite::{
 };
 
 const TOKEN: &str = "fixture-server-token";
+const VERSION: &str = "v0.1.0-test";
+const BUILD_HASH: &str = "123456789abc";
 
 #[tokio::test]
 #[ignore = "requires Mosquitto on PATH"]
@@ -167,8 +169,10 @@ async fn authenticates_https_wss_and_mqtt_tls() {
 }
 
 fn bridge(config: &std::path::Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_reolink-mqtt-bridge"))
+    Command::new(env!("CARGO_BIN_EXE_reolink-bridge"))
         .arg(config)
+        .env("APP_VERSION", VERSION)
+        .env("APP_BUILD_HASH", BUILD_HASH)
         .env("FIXTURE_TOKEN", TOKEN)
         .env("FIXTURE_CAMERA_PASSWORD", baichuan::PASSWORD)
         .kill_on_drop(true)
@@ -191,15 +195,18 @@ async fn check_readiness(client: &reqwest::Client, addr: SocketAddr, mqtt: bool)
     .await
     .expect("bridge did not report the expected TLS connection state");
     assert_eq!(response["ok"], mqtt);
-    assert!(
-        client
-            .get(format!("https://{addr}/livez"))
-            .send()
-            .await
-            .unwrap()
-            .status()
-            .is_success()
-    );
+    assert_eq!(response["version"], VERSION);
+    assert_eq!(response["buildHash"], BUILD_HASH);
+    let live = client
+        .get(format!("https://{addr}/livez"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let live: Value = serde_json::from_str(&live.text().await.unwrap()).unwrap();
+    assert_eq!(live["version"], VERSION);
+    assert_eq!(live["buildHash"], BUILD_HASH);
 }
 
 fn free_address() -> SocketAddr {

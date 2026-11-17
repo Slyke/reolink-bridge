@@ -27,6 +27,13 @@ pub struct Camera {
     pub motions: Mutex<Vec<(String, Option<u32>)>>,
     pub fail_next_stop: AtomicBool,
     pub jpeg: Option<Vec<u8>>,
+    pub snapshot_requests: Mutex<Vec<tokio::time::Instant>>,
+    pub snapshot_delay: std::time::Duration,
+    pub reject_snapshots: AtomicBool,
+    pub password: Mutex<Option<String>>,
+    pub credential_writes: AtomicUsize,
+    pub block_after_write: AtomicBool,
+    pub block_login: AtomicBool,
 }
 
 impl Camera {
@@ -41,7 +48,13 @@ impl Camera {
     }
 
     async fn session(&self, mut socket: TcpStream) -> Result<()> {
-        let hash = format!("{:X}", md5::compute(format!("{NONCE}-{PASSWORD}")));
+        let password = self
+            .password
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| PASSWORD.into());
+        let hash = format!("{:X}", md5::compute(format!("{NONCE}-{password}")));
         let key: &[u8; 16] = hash.as_bytes()[..16].try_into()?;
         let mut logged_in = false;
         loop {
@@ -65,14 +78,32 @@ impl Camera {
                 )
             } else if command == 1 {
                 xor(&mut body, header[12]);
-                let expected = format!("{:X}", md5::compute(format!("{PASSWORD}{NONCE}")));
-                ensure!(std::str::from_utf8(&body)?.contains(&expected[..31]));
+                let expected = format!("{:X}", md5::compute(format!("{password}{NONCE}")));
+                ensure!(
+                    !self.block_login.load(Ordering::SeqCst)
+                        && std::str::from_utf8(&body)?.contains(&expected[..31])
+                );
                 logged_in = true;
                 (200, String::new())
             } else {
                 ensure!(logged_in);
                 cfb_mode::Decryptor::<Aes128>::new(key.into(), IV.into())
                     .decrypt(&mut body[offset..]);
+                if command == 59 {
+                    let raw = roxmltree::Document::parse(std::str::from_utf8(&body[offset..])?)?;
+                    ensure!(
+                        field(&raw, "userName") == Some("admin")
+                            && field(&raw, "userSetState") == Some("modify")
+                    );
+                    *self.password.lock().unwrap() =
+                        Some(field(&raw, "password").unwrap().to_owned());
+                    self.credential_writes.fetch_add(1, Ordering::SeqCst);
+                    if self.block_after_write.swap(false, Ordering::SeqCst) {
+                        self.block_login.store(true, Ordering::SeqCst);
+                    }
+                    // The device can apply the write and close the connection without replying.
+                    return Ok(());
+                }
                 self.handle(command, std::str::from_utf8(&body[offset..])?)?
             };
             header[16..18].copy_from_slice(&status.to_le_bytes());
@@ -93,6 +124,11 @@ impl Camera {
             }
             socket.write_all(&reply).await?;
             if command == 109 && status == 200 {
+                self.snapshot_requests
+                    .lock()
+                    .unwrap()
+                    .push(tokio::time::Instant::now());
+                tokio::time::sleep(self.snapshot_delay).await;
                 for chunk in self.jpeg.as_deref().unwrap().chunks(64 * 1024) {
                     let mut extension = format!(
                         r#"<?xml version="1.0"?><Extension><binaryData>1</binaryData><encryptLen>{}</encryptLen></Extension>"#,
@@ -119,7 +155,7 @@ impl Camera {
         let response = match command {
             2 | 31 | 93 => String::new(),
             109 => {
-                let Some(jpeg) = &self.jpeg else {
+                let Some(jpeg) = self.jpeg.as_ref().filter(|_| !self.reject_snapshots.load(Ordering::SeqCst)) else {
                     return Ok((405, String::new()));
                 };
                 let doc = roxmltree::Document::parse(body)?;
@@ -169,7 +205,9 @@ impl Camera {
                 String::new()
             }
             433 => "<body><PtzCurPos><channelId>0</channelId><pPos>725</pPos><tPos>110</tPos></PtzCurPos></body>".into(),
-            80 => "<body><VersionInfo><name>Test Camera</name><itemNo>CAM-001</itemNo></VersionInfo></body>".into(),
+            58 => r#"<body><UserList><User><userName>admin</userName><userLevel>1</userLevel><userId>1</userId><loginState>1</loginState></User></UserList></body>"#.into(),
+            80 => "<body><VersionInfo><name>Test Camera</name><itemNo>CAM-001</itemNo><hardwareVersion>IPC_NT1NO24MP</hardwareVersion><firmwareVersion>v3.1.0.6198_2604102075</firmwareVersion><serialNumber>FIXTURE-SERIAL</serialNumber></VersionInfo></body>".into(),
+            114 => "<body><Uid><uid>952700FIXTURE0001</uid></Uid></body>".into(),
             208 => {
                 let state = if self.led.load(Ordering::SeqCst) { "open" } else { "close" };
                 format!("<body><LedState><channelId>0</channelId><state>auto</state><lightState>{state}</lightState><untouched>19</untouched></LedState></body>")

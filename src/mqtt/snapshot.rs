@@ -33,16 +33,10 @@ pub async fn capture(
         .clone()
         .try_acquire_owned()
         .map_err(|error| ("SNAPSHOT_CAPTURE_BUSY", error.into()))?;
-    let mut session = device
-        .connect()
+    let (jpeg, captured_at) = device
+        .capture_jpeg()
         .await
         .map_err(|error| ("SNAPSHOT_CAPTURE_FAILED", error))?;
-    let jpeg = session
-        .snapshot_jpeg(device.channel)
-        .await
-        .map_err(|error| ("SNAPSHOT_CAPTURE_FAILED", error))?;
-    let captured_at = Utc::now();
-    session.logout().await;
 
     tokio::task::spawn_blocking(move || {
         let _permit = permit;

@@ -20,6 +20,7 @@ pub struct Config {
     pub cameras: Vec<Camera>,
     #[serde(default)]
     pub callbacks: Vec<Callback>,
+    pub wui: Option<crate::wui::Config>,
 }
 
 #[derive(Deserialize)]
@@ -329,7 +330,10 @@ pub fn parse(mut document: Value, environment: &impl Fn(&str) -> Option<String>)
             "invalid advertised HTTP URL"
         );
     }
-    ensure!(!config.cameras.is_empty(), "configure at least one camera");
+    ensure!(
+        !config.cameras.is_empty() || config.wui.is_some(),
+        "configure at least one camera"
+    );
     let mut ids = BTreeSet::new();
     for (index, camera) in config.cameras.iter_mut().enumerate() {
         ensure!(

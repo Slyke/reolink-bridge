@@ -95,7 +95,7 @@ curl --fail-with-body \
 {
   "ok": true,
   "probe": "readiness",
-  "service": "reolink-mqtt-bridge",
+  "service": "reolink-bridge",
   "version": "0.1.0",
   "buildHash": "0123456789ab",
   "correlation_id": "1dbde7cd-7d1f-40d8-a530-45c2bcc98d1a",

@@ -1,4 +1,4 @@
-# Reolink MQTT Bridge
+# Reolink Bridge
 
 A local Rust service for powered Reolink Wi-Fi and PoE cameras. It publishes camera events, capabilities, rules, and state to MQTT 5. Control supported lights, LEDs, detection settings, and PTZ over MQTT, HTTP, or WebSocket. It uses LAN camera interfaces and works during internet outages while the cameras and broker remain reachable.
 
@@ -20,6 +20,10 @@ Edit `./local-only/bridge.json5` with your camera and broker settings. Enable ON
 `mqtt.baseTopic` puts each camera's topics under `<baseTopic>/<camera_id>/`. Subscribe to `cameras/front-door/#` for the example camera. Send commands to `cameras/front-door/command/exec` and watch `cameras/front-door/command/result`.
 
 `http` configures a shared listener for the API, WebSocket, camera notifications, and health probes. Enable `http.tls` for HTTPS and WSS with a mounted or locally generated certificate. Use `mqtts://` for MQTT TLS. See the [configuration and payload examples](./docs/README.md).
+
+## Container
+
+Use [the Docker build and publish example](./docs/deployment.md) from this repository's root. Mount the runtime config and any certificates under `/app/local-only`.
 
 ## Verify
 

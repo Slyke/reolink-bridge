@@ -8,6 +8,7 @@ mod mqtt;
 mod onvif;
 mod reolink;
 mod tls;
+mod wui;
 mod xml;
 
 use std::{
@@ -138,18 +139,33 @@ async fn run(
     path: PathBuf,
     raw: String,
     document: Value,
-    config: config::Config,
+    mut config: config::Config,
 ) -> Result<()> {
-    let ids: BTreeSet<_> = config
-        .cameras
-        .iter()
-        .map(|camera| camera.id.clone())
-        .collect();
+    let stop = CancellationToken::new();
     let auth_token = config
         .http
         .token
         .as_ref()
         .context("missing validated HTTP bearer token")?;
+    let snapshot_slot = Arc::new(Semaphore::new(1));
+    let wui = config
+        .wui
+        .take()
+        .map(|options| {
+            wui::Wui::prepare(
+                options,
+                &mut config.cameras,
+                auth_token,
+                snapshot_slot.clone(),
+                stop.clone(),
+            )
+        })
+        .transpose()?;
+    let ids: BTreeSet<_> = config
+        .cameras
+        .iter()
+        .map(|camera| camera.id.clone())
+        .collect();
     let ws_path = &config
         .http
         .websocket
@@ -182,7 +198,6 @@ async fn run(
     } else {
         rumqttc::Transport::tcp()
     };
-    let stop = CancellationToken::new();
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -194,6 +209,10 @@ async fn run(
     let mut native = BTreeMap::new();
     let mut secrets = vec![auth_token.clone()];
     secrets.extend(config.mqtt.password.clone());
+    if let Some(wui) = &wui {
+        secrets.push(wui.config.service_token.clone());
+        secrets.extend(wui.config.admin_token.clone());
+    }
     let mut devices = Vec::new();
     for mut camera in config.cameras {
         let password = camera
@@ -263,32 +282,17 @@ async fn run(
 
     let listener = TcpListener::bind(config.http.listen).context("could not bind HTTP listener")?;
     listener.set_nonblocking(true)?;
-    let kubernetes = [
-        "K8S_POD_NAME",
-        "K8S_DEPLOYMENT",
-        "K8S_NAMESPACE",
-        "K8S_POD_IP",
-        "K8S_POD_IPS",
-        "K8S_NODE_NAME",
-    ]
-    .into_iter()
-    .filter_map(|key| {
-        std::env::var(key)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(|value| (key, value))
-    })
-    .collect::<BTreeMap<_, _>>();
+    let build = diagnostics::build_info();
     let mut boot = json!({
-        "version": diagnostics::VERSION, "buildHash": diagnostics::BUILD_HASH,
+        "version": build.version, "buildHash": build.hash,
         "service": diagnostics::SERVICE, "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH, "pid": std::process::id(),
         "port": listener.local_addr()?.port(),
         "https": https.config.is_some(), "generatedCertificate": https.generated,
         "mqttTls": config.mqtt.url.scheme() == "mqtts",
     });
-    if !kubernetes.is_empty() && !diagnostics.kubernetes_enabled() {
-        boot["kubernetes"] = json!(kubernetes);
+    if let Some(runtime) = diagnostics.startup_runtime() {
+        boot["runtime"] = runtime.clone();
     }
     diagnostics.log("main::run", "SERVICE_BOOT_DIAGNOSTICS", "info", None, boot);
 
@@ -303,7 +307,6 @@ async fn run(
     let hub = hub::Hub::new(&ids, callbacks, secrets, diagnostics.clone());
     let mut controls = BTreeMap::new();
     let mut workers = JoinSet::new();
-    let snapshot_slot = Arc::new(Semaphore::new(1));
     for (camera, onvif, baichuan, webhook, cgi_webhook) in devices {
         let id = camera.id.clone();
         let base = format!("{}/{id}", config.mqtt.base_topic);
@@ -341,12 +344,14 @@ async fn run(
         ));
     }
 
+    let known = wui.as_ref().map_or(ids, |wui| wui.registered.clone());
     let app = Arc::new(http::App {
+        wui: wui.map(|wui| wui.attach(hub.clone(), &mut workers)),
         hub,
         push,
         native,
         controls,
-        camera_ids: ids,
+        camera_ids: known,
         auth_token: auth_token.clone(),
         stop: stop.clone(),
     });
@@ -372,7 +377,7 @@ async fn run(
     let (result, server_exited) = tokio::select! {
         _ = shutdown_signal() => (Ok(()), false),
         result = &mut server => (result.context("HTTP server failed"), true),
-        _ = workers.join_next() => (Err(anyhow::anyhow!("a bridge worker exited unexpectedly")), false),
+        _ = workers.join_next(), if !workers.is_empty() => (Err(anyhow::anyhow!("a bridge worker exited unexpectedly")), false),
     };
     stop.cancel();
     handle.graceful_shutdown(Some(Duration::from_secs(4)));

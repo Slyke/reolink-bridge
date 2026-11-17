@@ -6,6 +6,7 @@ use aes::{
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::{Buf, Bytes, BytesMut};
+use chrono::{DateTime, Utc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -50,6 +51,14 @@ pub struct Packet {
 }
 
 impl Device {
+    pub async fn capture_jpeg(&self) -> Result<(Vec<u8>, DateTime<Utc>)> {
+        let mut session = self.connect().await?;
+        let jpeg = session.snapshot_jpeg(self.channel).await?;
+        let captured_at = Utc::now();
+        session.logout().await;
+        Ok((jpeg, captured_at))
+    }
+
     pub async fn connect(&self) -> Result<Session> {
         let socket = timeout(
             TIMEOUT,
@@ -98,6 +107,15 @@ impl Session {
                 false,
             )
             .await?;
+        self.decode(&reply)
+    }
+
+    pub async fn user_list(&mut self, username: &str) -> Result<String> {
+        let extension = format!(
+            r#"<Extension version="1.1"><userName>{}</userName></Extension>"#,
+            xml::escape(username)
+        );
+        let reply = self.exchange(58, 250, &extension, "", false).await?;
         self.decode(&reply)
     }
 

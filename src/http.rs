@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::{
     camera::ControlHandle,
     config::{Callback, Filter, valid_id},
-    diagnostics::{BUILD_HASH, Diagnostics, SERVICE, VERSION},
+    diagnostics::{Diagnostics, SERVICE, build_info},
     hub::{CallbackEdit, Hub, Update},
     onvif::events::{PushRoutes, parse_notify},
     reolink::{
@@ -48,6 +48,7 @@ pub struct App {
     pub camera_ids: BTreeSet<String>,
     pub auth_token: String,
     pub stop: CancellationToken,
+    pub wui: Option<Arc<crate::wui::Wui>>,
 }
 
 pub struct NativeRoute {
@@ -61,7 +62,7 @@ pub enum NativeParser {
 }
 
 pub fn router(app: Arc<App>, ws_path: &str) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/livez", get(liveness))
         .route("/readyz", get(readiness))
         .route("/ingest/onvif/{id}/{key}", post(notify))
@@ -72,14 +73,19 @@ pub fn router(app: Arc<App>, ws_path: &str) -> Router {
         )
         .route(ws_path, get(upgrade))
         .layer(DefaultBodyLimit::max(xml::BODY_LIMIT))
-        .layer(middleware::from_fn(correlate))
-        .with_state(app)
+        .with_state(app.clone());
+    let routes = if let Some(wui) = &app.wui {
+        routes.merge(crate::wui::router(wui.clone()))
+    } else {
+        routes
+    };
+    routes.layer(middleware::from_fn(correlate))
 }
 
 const CORRELATION_HEADER: &str = "x-correlation-id";
 
 #[derive(Clone)]
-struct CorrelationId(String);
+pub(crate) struct CorrelationId(pub(crate) String);
 
 async fn correlate(mut request: HttpRequest, next: Next) -> Response {
     let id = request
@@ -120,9 +126,10 @@ async fn readiness(
 }
 
 fn probe(name: &str, ok: bool, id: CorrelationId) -> Value {
+    let build = build_info();
     json!({
         "ok": ok, "probe":name, "service":SERVICE,
-        "version":VERSION, "buildHash":BUILD_HASH, "correlation_id": id.0,
+        "version":build.version, "buildHash":build.hash, "correlation_id": id.0,
     })
 }
 
@@ -248,7 +255,7 @@ fn constant_match(value: &str, expected: &str) -> bool {
     bool::from(value.as_bytes().ct_eq(expected.as_bytes()))
 }
 
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
+pub(crate) fn authorized(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -277,7 +284,12 @@ async fn execute_camera(
         caller: "http::execute_camera",
         correlation: correlation.0,
     };
-    if !authorized(&headers, &app.auth_token) {
+    if !authorized(&headers, &app.auth_token)
+        && !app
+            .wui
+            .as_ref()
+            .is_some_and(|wui| wui.command_access(&headers, &camera_id))
+    {
         return errors.http(StatusCode::UNAUTHORIZED, "HTTP_CONTROL_AUTH_REQUIRED");
     }
     let Json(request) = match request {
@@ -349,7 +361,13 @@ async fn upgrade(
         caller: "http::upgrade",
         correlation: correlation.0,
     };
-    if !authorized(&headers, &app.auth_token) {
+    let legacy = authorized(&headers, &app.auth_token);
+    if !legacy
+        && !app
+            .wui
+            .as_ref()
+            .is_some_and(|wui| wui.session_access(&headers))
+    {
         return errors.http(StatusCode::UNAUTHORIZED, "WEBSOCKET_AUTH_REQUIRED");
     }
     let upgrade = match upgrade {
@@ -359,7 +377,7 @@ async fn upgrade(
     upgrade
         .max_frame_size(32 * 1024)
         .max_message_size(32 * 1024)
-        .on_upgrade(move |socket| websocket(socket, app))
+        .on_upgrade(move |socket| websocket(socket, app, headers, legacy))
         .into_response()
 }
 
@@ -394,7 +412,7 @@ enum Operation {
     },
 }
 
-async fn websocket(mut socket: WebSocket, app: Arc<App>) {
+async fn websocket(mut socket: WebSocket, app: Arc<App>, headers: HeaderMap, legacy: bool) {
     let mut updates = app.hub.subscribe();
     let mut filter = None;
     let mut replies = FuturesUnordered::new();
@@ -404,7 +422,7 @@ async fn websocket(mut socket: WebSocket, app: Arc<App>) {
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Text(message))) => {
-                        let Some(reply) = handle(&app, &message, &mut filter, &mut updates, &mut replies).await else {
+                        let Some(reply) = handle(&app, &message, &mut filter, &mut updates, &mut replies, &headers, legacy).await else {
                             continue;
                         };
                         reply
@@ -457,6 +475,8 @@ async fn handle<'a>(
     filter: &mut Option<Filter>,
     updates: &mut broadcast::Receiver<Update>,
     replies: &mut PendingReplies<'a>,
+    headers: &HeaderMap,
+    legacy: bool,
 ) -> Option<Value> {
     let correlation = Uuid::new_v4().to_string();
     let errors = RequestErrors {
@@ -477,7 +497,30 @@ async fn handle<'a>(
             return Some(reply);
         }
     };
-    let mut reply = match request.operation {
+    let wui = if legacy { None } else { app.wui.as_deref() };
+    let mut operation = request.operation;
+    if let Some(wui) = wui {
+        let permitted = match &mut operation {
+            Operation::Subscribe { filter } => wui
+                .event_filter(filter.clone())
+                .map(|scope| *filter = scope)
+                .is_some(),
+            Operation::Snapshot => wui.event_filter(Filter::default()).is_some(),
+            Operation::CallbacksList | Operation::CallbacksRemove { .. } => {
+                wui.callback_allowed(None)
+            }
+            Operation::CallbacksAdd { callback } | Operation::CallbacksUpdate { callback } => {
+                wui.callback_allowed(Some(&callback.url))
+            }
+            Operation::Control { camera_id, .. } => wui.command_access(headers, camera_id),
+        };
+        if !permitted {
+            let mut reply = errors.reply("WUI_SCOPE_DENIED", None);
+            complete_ws_reply(&mut reply, request.id, correlation);
+            return Some(reply);
+        }
+    }
+    let mut reply = match operation {
         Operation::Subscribe { filter: requested } => match requested.validate(&app.camera_ids) {
             Ok(()) => {
                 *updates = app.hub.subscribe();
@@ -488,7 +531,10 @@ async fn handle<'a>(
             Err(error) => errors.reply("WEBSOCKET_FILTER_INVALID", Some(error)),
         },
         Operation::Snapshot => {
-            json!({"ok":true,"snapshots":snapshots(&app.hub, filter.as_ref().unwrap_or(&Filter::default()))})
+            let default = wui
+                .and_then(|wui| wui.event_filter(Filter::default()))
+                .unwrap_or_default();
+            json!({"ok":true,"snapshots":snapshots(&app.hub, filter.as_ref().unwrap_or(&default))})
         }
         Operation::CallbacksList => json!({"ok":true,"callbacks":app.hub.callbacks.list()}),
         Operation::CallbacksAdd { callback } => {

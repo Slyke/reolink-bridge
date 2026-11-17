@@ -1,0 +1,16 @@
+**
+!Cargo.toml
+!Cargo.lock
+!en-US.json
+!errors.json5
+!dockerfiles/
+!dockerfiles/reolink-bridge.Dockerfile
+!src/
+!src/**
+
+**/.git
+**/.env
+**/.env.*
+**/.build.env
+**/local-only
+**/target

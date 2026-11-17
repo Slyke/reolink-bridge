@@ -111,4 +111,8 @@ logging: {
 },
 ```
 
-Startup logs include the Cargo version and the build's Git hash. Set `BUILD_HASH` at compile time when building from a source archive. Console, file, HTTP, and syslog sinks use the shared logger's configuration. [StyleGuide Rust logger](https://github.com/Slyke/StyleGuide/blob/77d9a18c8a38e017640728a3e1bc33fad64326b7/logging/rust/README.md)
+Set `LOG_RUNTIME_ENABLED=true` or add `runtime: { enabled: true }` under `logging` to attach a `runtime` object to each log entry. Supply the values your deployment exposes through `RUNTIME_NAME`, `RUNTIME_DEPLOYMENT`, `RUNTIME_NAMESPACE`, `RUNTIME_IP`, `RUNTIME_IPS`, and `RUNTIME_NODE`. These map to `name`, `deployment`, `namespace`, `ip`, `ips`, and `node`. With per-entry enrichment disabled, startup includes the available values once under `context.runtime`.
+
+Explicit JSON5 logging settings take precedence over environment variables. The runtime names take precedence over their legacy aliases within each source. [Bundled Rust logger](../src/logger/README.md)
+
+Startup logs and health probes use `APP_VERSION` and `APP_BUILD_HASH`. For local runs without these values, the bridge uses the Cargo package version and `unknown`. [Docker build and publish example](./deployment.md)

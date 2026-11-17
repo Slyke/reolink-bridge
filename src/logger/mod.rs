@@ -28,7 +28,7 @@ struct Inner {
     config: LoggingConfig,
     codes: ErrorCodeMap,
     sinks: sinks::Sinks,
-    kubernetes: Option<serde_json::Value>,
+    runtime: Option<serde_json::Value>,
 }
 
 impl Logger {
@@ -37,21 +37,8 @@ impl Logger {
         config.validate()?;
         error_codes::validate_error_codes(&codes)?;
         let sinks = sinks::Sinks::new(&config)?;
-        let kubernetes = if config.kubernetes.enabled {
-            let mut metadata = serde_json::to_value(&config.kubernetes)
-                .map_err(|_| config::invalid("Invalid Kubernetes metadata"))?;
-            if let Some(object) = metadata.as_object_mut() {
-                object.retain(|key, value| {
-                    key != "enabled" && !value.is_null() && value.as_str() != Some("")
-                });
-                if object.is_empty() {
-                    None
-                } else {
-                    Some(metadata)
-                }
-            } else {
-                None
-            }
+        let runtime = if config.runtime.enabled {
+            config.runtime.metadata()?
         } else {
             None
         };
@@ -60,7 +47,7 @@ impl Logger {
                 config,
                 codes,
                 sinks,
-                kubernetes,
+                runtime,
             }),
         })
     }
@@ -113,7 +100,7 @@ impl Logger {
                 .as_ref()
                 .and_then(|error| error.error_code.clone()),
             error: options.error,
-            kubernetes: self.inner.kubernetes.clone(),
+            runtime: self.inner.runtime.clone(),
         };
         let text = format_text(&config.log_text_format, &entry);
         let json = match serde_json::to_string(&entry) {

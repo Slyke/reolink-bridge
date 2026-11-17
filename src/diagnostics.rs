@@ -15,9 +15,27 @@ use styleguide_logger::{
 use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
 
-pub const SERVICE: &str = "reolink-mqtt-bridge";
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const BUILD_HASH: &str = env!("REOLINK_MQTT_BUILD_HASH");
+pub const SERVICE: &str = "reolink-bridge";
+pub struct BuildInfo {
+    pub version: String,
+    pub hash: String,
+}
+
+pub fn build_info() -> &'static BuildInfo {
+    static BUILD: LazyLock<BuildInfo> = LazyLock::new(|| {
+        let value = |name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        BuildInfo {
+            version: value("APP_VERSION").unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
+            hash: value("APP_BUILD_HASH").unwrap_or_else(|| "unknown".into()),
+        }
+    });
+    &BUILD
+}
 
 const CATALOG: &str = include_str!("../errors.json5");
 
@@ -26,7 +44,7 @@ static TEXT: LazyLock<BTreeMap<String, String>> = LazyLock::new(|| {
 });
 
 pub fn text(key: &str) -> &'static str {
-    TEXT.get(&format!("reolink-mqtt-{key}"))
+    TEXT.get(&format!("reolink-bridge-{key}"))
         .map_or("Unexpected bridge error.", String::as_str)
 }
 
@@ -34,7 +52,7 @@ pub fn text(key: &str) -> &'static str {
 pub struct Diagnostics {
     tx: mpsc::Sender<Record>,
     codes: Arc<ErrorCodeMap>,
-    kubernetes_enabled: bool,
+    startup_runtime: Option<Value>,
     queue_full_reported: Arc<AtomicBool>,
 }
 
@@ -87,7 +105,11 @@ impl Diagnostics {
                     ..Default::default()
                 });
         }
-        let kubernetes_enabled = config.kubernetes.enabled;
+        let startup_runtime = if config.runtime.enabled {
+            None
+        } else {
+            config.runtime.metadata()?
+        };
         let logger = Logger::new(config, codes.clone())?;
         let (tx, mut rx) = mpsc::channel(128);
         let task = tokio::spawn(async move {
@@ -103,15 +125,15 @@ impl Diagnostics {
             Self {
                 tx,
                 codes: Arc::new(codes),
-                kubernetes_enabled,
+                startup_runtime,
                 queue_full_reported: Arc::new(AtomicBool::new(false)),
             },
             task,
         ))
     }
 
-    pub fn kubernetes_enabled(&self) -> bool {
-        self.kubernetes_enabled
+    pub fn startup_runtime(&self) -> Option<&Value> {
+        self.startup_runtime.as_ref()
     }
 
     pub fn log(

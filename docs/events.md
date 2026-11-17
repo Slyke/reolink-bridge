@@ -153,4 +153,6 @@ With `coordinates.allowVideoStream` enabled on a supported camera, `type: "objec
 
 For `normalized_top_left`, multiply horizontal and vertical values by the corresponding reference frame dimensions. `pixels_top_left` already uses pixels. Check the reference frame and timestamps before aligning boxes to video. On a frame that clears all tracked objects, `objects` may be omitted.
 
+For an exact overlay, use video and metadata from the same stream and preserve the camera’s frame clock in the media relay. ONVIF metadata can supply frame UTC, which can be compared with video capture time when the video RTP clock is mapped to UTC by RTCP sender reports. Baichuan object events carry the substream’s `vendor.frame_microseconds` counter. The bridge’s JPEG preview timestamp records when the image arrived at the bridge. Match capture times and reference frames within the same camera stream.
+
 The bridge sends the same normalized event JSON to downstream callbacks and in WebSocket event messages. See [WebSocket and callbacks](./interfaces.md).

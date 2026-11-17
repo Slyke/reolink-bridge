@@ -205,8 +205,10 @@ async fn local_broker_http_websocket_and_camera_controls() {
             {"id":"good","url":callback_url,"cameras":["lab"],"events":["person"]}
         ]
     }).to_string()).unwrap();
-    let mut bridge = Command::new(env!("CARGO_BIN_EXE_reolink-mqtt-bridge"))
+    let mut bridge = Command::new(env!("CARGO_BIN_EXE_reolink-bridge"))
         .arg(&path)
+        .env_remove("APP_VERSION")
+        .env_remove("APP_BUILD_HASH")
         .env("FIXTURE_WS", WS_TOKEN)
         .env("FIXTURE_PASSWORD", baichuan::PASSWORD)
         .env("FIXTURE_NATIVE", WEBHOOK_TOKEN)
@@ -237,9 +239,9 @@ async fn local_broker_http_websocket_and_camera_controls() {
     let (status, live) = probe(&http, address, "/livez").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(live["ok"], true);
-    assert_eq!(live["service"], "reolink-mqtt-bridge");
+    assert_eq!(live["service"], "reolink-bridge");
     assert_eq!(live["version"], env!("CARGO_PKG_VERSION"));
-    assert!(live["buildHash"].as_str().is_some());
+    assert_eq!(live["buildHash"], "unknown");
     assert!(live.get("checks").is_none());
     let (status, waiting) = probe(&http, address, "/readyz").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);

@@ -5,6 +5,7 @@
 - [Camera controls](./controls.md) for PTZ, lights, LEDs, motion and AI settings, and the MQTT, HTTP, and WebSocket command envelopes.
 - [WebSocket, callbacks, and health probes](./interfaces.md) for subscriptions, callback management, and correlation IDs.
 - [MQTT snapshots](./snapshots.md) for Base64 PNG captures and saving the image to a file.
+- [Docker deployment](./deployment.md) for build arguments, image tags, and a runtime example.
 - [TLS](./tls.md) for MQTT broker trust and HTTPS/WSS with generated or mounted certificates.
 
 Examples use `front-door` as the camera ID and `cameras` as the MQTT base topic. Replace the example hostnames with the addresses your clients and cameras can reach.
