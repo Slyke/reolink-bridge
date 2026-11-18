@@ -664,11 +664,13 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     let port = free_port()?;
     let origin = format!("http://127.0.0.1:{port}");
     let config = directory.path().join("bridge.json5");
+    let workspace = directory.path().join("recording-workspace");
+    std::fs::create_dir(&workspace)?;
     std::fs::write(&config,json!({
         "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"},
         "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
         "cameras":[{"id":"fixture","host":"127.0.0.1","baichuanPort":bc,"onvifPort":null,"username":"admin","password":baichuan::PASSWORD,"eventTransport":"baichuan"}],
-        "api":{"serviceToken":SERVICE,"cameraIds":["fixture"],"commands":true}
+        "api":{"serviceToken":SERVICE,"cameraIds":["fixture"],"commands":true,"recordings":{"temporaryDirectory":workspace}}
     }).to_string())?;
     let client = Client::builder()
         .no_proxy()
@@ -705,6 +707,41 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     assert_eq!(partial.status(), 206);
     assert_eq!(partial.bytes().await?, data[..32]);
     assert_eq!(camera.recording_downloads.load(Ordering::SeqCst), 1);
+    assert!(
+        std::fs::read_dir(&workspace)?.any(|entry| entry.is_ok_and(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("reolink-recording-")))
+    );
+    let archived = directory.path().join("archived-workspace");
+    std::fs::rename(&workspace, &archived)?;
+    let contract = response(&client, &format!("{origin}/api/contract"), SERVICE, None)
+        .await
+        .1;
+    assert_eq!(contract["storageCameras"], json!(["fixture"]));
+    assert_eq!(contract["recordingsCameras"], json!([]));
+    assert_eq!(
+        response(&client, &storage, SERVICE, None).await.1["playbackAvailable"],
+        false
+    );
+    assert_eq!(
+        client
+            .get(&video)
+            .bearer_auth(SERVICE)
+            .send()
+            .await?
+            .status(),
+        422
+    );
+    assert_eq!(camera.recording_downloads.load(Ordering::SeqCst), 1);
+    std::fs::rename(&archived, &workspace)?;
+    assert_eq!(
+        response(&client, &format!("{origin}/api/contract"), SERVICE, None)
+            .await
+            .1["recordingsCameras"],
+        json!(["fixture"])
+    );
+
     let until = Instant::now() + Duration::from_secs(8);
     loop {
         if response(

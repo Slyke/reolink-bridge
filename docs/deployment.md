@@ -49,6 +49,6 @@ Set `http.listen` to `0.0.0.0:8080` for this port mapping. Check `/livez` and `/
 
 ## Recording playback temporary files
 
-The bridge recording API prepares seekable MP4 files in its private temporary directory. Give the runtime user a writable `/tmp`, including when `readOnlyRootFilesystem` is enabled.
+Set `api.recordings.temporaryDirectory` to the recording workspace. It defaults to `/tmp`. Set the value to `null` to disable recorded-video playback. The runtime user needs write access to the selected directory. Missing or unwritable storage disables recorded-video playback. Card statistics and file searches are exposed through their read endpoints.
 
-For Kubernetes, mount a disk-backed `emptyDir` at `/tmp` and give user/group `10001` write access, for example with `fsGroup: 10001`. The temporary cache is reconstructed after pod replacement. Retain the existing certificate volume independently.
+For Kubernetes, mount a disk-backed `emptyDir` at the configured path and give user/group `10001` write access, for example with `fsGroup: 10001`. The temporary cache is reconstructed after pod replacement. Retain the existing certificate volume independently.

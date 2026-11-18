@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, io::Write, path::PathBuf, process::Stdio, sync::Arc, time::Duration,
+};
 
 use anyhow::{Result, anyhow, ensure};
 use axum::{
@@ -32,7 +34,25 @@ use crate::{
 
 const TTL: Duration = Duration::from_secs(600);
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct Config {
+    #[serde(default = "temporary_directory")]
+    temporary_directory: Option<PathBuf>,
+}
+fn temporary_directory() -> Option<PathBuf> {
+    Some(PathBuf::from("/tmp"))
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            temporary_directory: temporary_directory(),
+        }
+    }
+}
+
 pub(super) struct Recordings {
+    directory: Option<PathBuf>,
     entries: Mutex<BTreeMap<String, Entry>>,
     cameras: BTreeMap<String, Mutex<()>>,
     slots: Semaphore,
@@ -49,12 +69,26 @@ struct Media {
 }
 
 impl Recordings {
-    pub(super) fn new(ids: impl Iterator<Item = String>) -> Self {
+    pub(super) fn new(config: &Config, ids: impl Iterator<Item = String>) -> Self {
         Self {
+            directory: config.temporary_directory.clone(),
             entries: Mutex::default(),
             cameras: ids.map(|id| (id, Mutex::new(()))).collect(),
             slots: Semaphore::new(2),
         }
+    }
+    pub(super) fn available(&self) -> bool {
+        let Some(directory) = &self.directory else {
+            return false;
+        };
+        if directory.as_os_str().is_empty() {
+            return false;
+        }
+        tempfile::Builder::new()
+            .prefix(".reolink-recording-check-")
+            .tempfile_in(directory)
+            .and_then(|mut file| file.write_all(b"recording workspace check"))
+            .is_ok()
     }
     pub(super) async fn clean(&self) {
         self.entries
@@ -114,7 +148,13 @@ impl Recordings {
             entry.clip.clone()
         };
         let _slot = self.slots.try_acquire()?;
-        let directory = tempfile::tempdir()?;
+        let parent = self
+            .directory
+            .as_ref()
+            .ok_or_else(|| anyhow!("recording playback disabled"))?;
+        let directory = tempfile::Builder::new()
+            .prefix("reolink-recording-")
+            .tempdir_in(parent)?;
         let input = directory.path().join("camera.ts");
         let path = directory.path().join("playback.mp4");
         let work = async {
@@ -241,7 +281,7 @@ pub(super) async fn storage(
     })
     .await;
     match result {
-        Ok(Ok((cards,clock)))=>Json(json!({"cards":cards,"cameraTime":clock,"refreshedAt":Utc::now(),"streams":["main","sub"],"correlation_id":correlation.0})).into_response(),
+        Ok(Ok((cards,clock)))=>Json(json!({"cards":cards,"playbackAvailable":api.recordings.available(),"cameraTime":clock,"refreshedAt":Utc::now(),"streams":["main","sub"],"correlation_id":correlation.0})).into_response(),
         _=>error(StatusCode::UNPROCESSABLE_ENTITY,"API_SETTING_READ_FAILED",&correlation),
     }
 }
@@ -322,6 +362,13 @@ pub(super) async fn video(
     let Some(device) = api.devices.get(&camera) else {
         return error(StatusCode::NOT_FOUND, "API_MEDIA_UNSUPPORTED", &correlation);
     };
+    if !api.recordings.available() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "API_MEDIA_UNSUPPORTED",
+            &correlation,
+        );
+    }
     {
         let entries = api.recordings.entries.lock().await;
         if !entries
@@ -430,6 +477,30 @@ fn byte_range(header: Option<&str>, size: u64) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn playback_requires_a_writable_configured_directory() {
+        let defaults: Config = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(defaults.temporary_directory, Some(PathBuf::from("/tmp")));
+        let directory = tempfile::tempdir().unwrap();
+        let config: Config =
+            serde_json::from_value(json!({"temporaryDirectory":directory.path()})).unwrap();
+        let recordings = Recordings::new(&config, std::iter::empty());
+        assert!(recordings.available());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        let disabled: Config = serde_json::from_value(json!({"temporaryDirectory":null})).unwrap();
+        assert!(!Recordings::new(&disabled, std::iter::empty()).available());
+        let missing: Config =
+            serde_json::from_value(json!({"temporaryDirectory":directory.path().join("missing")}))
+                .unwrap();
+        assert!(!Recordings::new(&missing, std::iter::empty()).available());
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"test").unwrap();
+        let invalid: Config = serde_json::from_value(json!({"temporaryDirectory":file})).unwrap();
+        assert!(!Recordings::new(&invalid, std::iter::empty()).available());
+        let empty: Config = serde_json::from_value(json!({"temporaryDirectory":""})).unwrap();
+        assert!(!Recordings::new(&empty, std::iter::empty()).available());
+    }
+
     #[test]
     fn ranges_follow_http_video_requests() {
         assert_eq!(byte_range(None, 100), Some((0, 99)));

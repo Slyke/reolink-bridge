@@ -19,6 +19,7 @@ api: {
   media: {
     entrance: { port: 554, streams: ["main", "sub"] },
   },
+  recordings: { temporaryDirectory: "/tmp" }, // null disables recorded-video playback
   previews: {
     cameras: { entrance: { intervalMs: 5000 } },
   },
@@ -82,6 +83,10 @@ The password protocol is gated to the verified Lumus E430 revision and firmware.
 After interruption use the existing enrollment status and resume, or rotation reconciliation, to test credentials without resending a password write. If the bridge reports `recovery-required`, use the printed ID and the bridge vault on the host to check current and staged credentials in a private maintenance session. Stop the bridge before restoring or repairing its vault, verify successful authentication to the same printed identifier, and restart it only after the credential reference is consistent. Avoid resetting or repeating a password change until you know which credential works.
 
 ## SD-card recordings
+
+Configure `api.recordings.temporaryDirectory` to select the existing directory used for recording downloads and conversion. The default is `/tmp`. Set it to `null` to disable video playback. The bridge probes the directory for write access before advertising or serving recorded video. Missing, invalid, and unwritable directories disable playback without stopping the bridge.
+
+The contract reports native devices in `storageCameras`. It includes them in `recordingsCameras` when the temporary directory is usable. The storage response includes `playbackAvailable`, so clients can disable playback independently of card statistics and file searches. A video request made while the directory is unavailable returns HTTP 422 before any camera download.
 
 Storage and file searches use read-only Baichuan operations. The API reports storage quantities in bytes and recording times in the camera's local wall clock. Each search returns a maximum of 4096 entries and reports truncation.
 

@@ -64,6 +64,8 @@ pub struct Config {
     media: BTreeMap<String, media::Profile>,
     #[serde(default)]
     previews: preview::Config,
+    #[serde(default)]
+    recordings: recordings::Config,
 }
 
 pub struct Api {
@@ -212,7 +214,7 @@ impl Api {
             })
             .collect();
         let previews = preview::prepare(&config.previews, &devices, snapshot_slot, stop.clone())?;
-        let recordings = recordings::Recordings::new(devices.keys().cloned());
+        let recordings = recordings::Recordings::new(&config.recordings, devices.keys().cloned());
         Ok(Self {
             recordings,
             config,
@@ -375,8 +377,10 @@ async fn contract(
         })
         .map(|(id, profile)| (id.clone(), json!(profile.streams)))
         .collect();
+    let recordings_available = api.recordings.available();
     Json(json!({"version":1,"eventStream":primary || api.config.events,"media":!profiles.is_empty(),"mediaCameras":profiles,
-       "recordingsCameras":api.devices.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
+       "storageCameras":api.devices.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
+       "recordingsCameras":api.devices.keys().filter(|id| recordings_available && (primary || api.allows(id))).collect::<Vec<_>>(),
        "previewCameras":api.previews.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
        "enrollment":api.vault.is_some(),"inventory":true,"callbacks":api.callback_allowed(primary, None),"settings":["leds","spotlight","motion","ai","image"],"alerts":["motion"],
        "correlation_id":correlation.0})).into_response()
