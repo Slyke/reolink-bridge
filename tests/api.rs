@@ -656,6 +656,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         format!("listener {broker} 127.0.0.1\nallow_anonymous true\n"),
     )?;
     let _mqtt = Command::new("mosquitto")
+        .arg("-c")
         .arg(&mqtt_config)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -690,6 +691,25 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     assert_eq!(clips.1["recordings"].as_array().unwrap().len(), 1);
     let id = clips.1["recordings"][0]["id"].as_str().unwrap();
     let video = format!("{origin}/api/cameras/fixture/recordings/{id}/video");
+    let preview = format!("{origin}/api/cameras/fixture/recordings/{id}/preview");
+    assert_eq!(
+        client
+            .get(&preview)
+            .bearer_auth("wrong")
+            .send()
+            .await?
+            .status(),
+        401
+    );
+    for _ in 0..2 {
+        let response = client.get(&preview).bearer_auth(SERVICE).send().await?;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "image/jpeg");
+        let jpeg = response.bytes().await?;
+        assert!(jpeg.starts_with(&[0xff, 0xd8]) && jpeg.ends_with(&[0xff, 0xd9]));
+    }
+    assert_eq!(camera.recording_previews.load(Ordering::SeqCst), 1);
+    assert_eq!(camera.recording_downloads.load(Ordering::SeqCst), 0);
     let result = client.get(&video).bearer_auth(SERVICE).send().await?;
     ensure!(
         result.status().is_success(),
@@ -742,6 +762,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         json!(["fixture"])
     );
 
+    camera.recording_end_status.store(331, Ordering::SeqCst);
     sleep(Duration::from_millis(2100)).await;
     let expired = client
         .get(&video)
@@ -799,7 +820,9 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     let _limited_bridge = start(&config, &client, &origin).await?;
     assert_eq!(response(&client, &search, SERVICE, None).await.0, 200);
     let oversized = client.get(&video).bearer_auth(SERVICE).send().await?;
-    assert_eq!(oversized.status(), 502);
+    assert_eq!(oversized.status(), 413);
+    let details: Value = serde_json::from_str(&oversized.text().await?)?;
+    assert_eq!(details["stage"], "cache-limit");
     assert_eq!(camera.recording_downloads.load(Ordering::SeqCst), 3);
     assert_eq!(std::fs::read_dir(&limited_workspace)?.count(), 0);
     assert_eq!(camera.writes.load(Ordering::SeqCst), 4);

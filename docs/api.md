@@ -43,6 +43,7 @@ Replace the documentation address with a private IPv4 target from the installati
 | GET `/cameras/{id}/storage` | HTTP or scoped service token | Card capacity, used/free bytes, readiness, and the camera's local clock. |
 | GET `/cameras/{id}/recordings?date=YYYY-MM-DD&stream=sub` | HTTP or scoped service token | Search a camera-local day. The stream can be `main` or `sub`. Returns opaque recording IDs. |
 | GET `/cameras/{id}/recordings/{recordingId}/video` | HTTP or scoped service token | Browser-playable MP4 with HTTP byte ranges for seeking. Search first to obtain the recording ID. |
+| GET `/cameras/{id}/recordings/{recordingId}/preview` | HTTP or scoped service token | JPEG preview read from the start of a recording. Search first to obtain the ID. Does not require a writable recording workspace. |
 | GET `/cameras/{id}/media/{stream}` | HTTP or scoped service token | Bounded multipart MJPEG stream from configured H.264 RTSP/TCP. FFmpeg is required in the private bridge environment. The RTSP client owns credentials; FFmpeg receives elementary video bytes. |
 | GET `/enrollment-targets` | admin | Allowlisted target names. |
 | POST `/enrollments` | admin | Reserve and begin a UUID operation with target, separate `uid` and/or `serial`, `method` (`initialize` or `import`), and `confirmation: true`. First-password flow requires a UID. |
@@ -98,6 +99,10 @@ Video reads use Baichuan recording downloads. FFmpeg converts the camera's video
 Each playback request, including a byte-range request, renews that clip's idle lifetime. Recording searches do not extend video-cache lifetime. Expired clips are removed on the next cache operation or periodic cleanup, which runs every 60 seconds or the configured lifetime, whichever is shorter. Size pressure evicts the least recently played cached clips. A converted clip larger than the configured budget fails playback and is discarded. In-progress responses retain their files until they finish. Recording-search IDs remain available for ten minutes after search or playback and while their video is cached.
 
 The byte budget covers cached converted videos across all cameras. Downloads, files being converted, and evicted files still used by active responses also occupy the temporary workspace. Allow additional disk space for these files or enforce a filesystem/volume limit. Two downloads can prepare concurrently, with one active download per camera. Individual transfers accept up to 512 MiB of native camera data and 768 MiB of converted MP4, with a 120-second preparation deadline. Camera credentials and native recording file paths stay inside the bridge.
+
+Recording thumbnails use read-only Baichuan CoverPreview (command 298) to fetch a keyframe near the clip's start. FFmpeg decodes it to a 480-pixel-wide JPEG. The contract advertises `recordingPreviewCameras` independently of playback temporary storage. Thumbnail reads do not download the whole clip. Previews are cached in memory, bounded to 128 images and 32 MiB, with idle expiry at the shorter of `cache.ttlSeconds` and ten minutes. One recording operation per camera runs at a time.
+
+Native recording downloads accept camera completion statuses 300 and 331. A playback preparation failure returns `API_RECORDING_PREPARE_FAILED`, a correlation ID and a safe `stage`: `camera-download`, `conversion`, `cache-limit`, `busy`, `timeout`, `temporary-storage` or `preparation`. The server logs the underlying cause with the same correlation ID. Oversized cached clips return HTTP 413, busy preparations return 503 and preparation timeouts return 504. Other preparation failures return 502.
 
 ## Image orientation
 

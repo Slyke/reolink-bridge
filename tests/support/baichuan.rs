@@ -25,6 +25,8 @@ pub struct Camera {
     pub rotation: AtomicI32,
     pub recording: Option<Vec<u8>>,
     pub recording_downloads: AtomicUsize,
+    pub recording_end_status: AtomicUsize,
+    pub recording_previews: AtomicUsize,
     pub writes: AtomicUsize,
     pub webhook: Mutex<Option<String>>,
     pub ptz: AtomicBool,
@@ -128,8 +130,12 @@ impl Camera {
                 socket.write_u32_le(0).await?;
             }
             socket.write_all(&reply).await?;
-            if command == 143 && status == 200 {
-                self.recording_downloads.fetch_add(1, Ordering::SeqCst);
+            if matches!(command, 143 | 298) && status == 200 {
+                if command == 143 {
+                    self.recording_downloads.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    self.recording_previews.fetch_add(1, Ordering::SeqCst);
+                }
                 for chunk in self.recording.as_deref().unwrap().chunks(16 * 1024) {
                     header[8..12].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
                     socket.write_all(&header).await?;
@@ -137,6 +143,10 @@ impl Camera {
                     socket.write_all(chunk).await?;
                 }
                 header[8..12].copy_from_slice(&0u32.to_le_bytes());
+                let status = self.recording_end_status.load(Ordering::SeqCst);
+                header[16..18].copy_from_slice(
+                    &(if status == 0 { 300u16 } else { status as u16 }).to_le_bytes(),
+                );
                 socket.write_all(&header).await?;
                 socket.write_u32_le(0).await?;
             }
@@ -178,6 +188,13 @@ impl Camera {
                 "<body><FileInfoList><FileInfo><handle>42</handle></FileInfo></FileInfoList></body>".into()
             }
             15=>"<body><FileInfoList><bFinished>1</bFinished><FileInfo><name>RecS01_20261117_120000_120002_AAA.mp4</name><size>18000</size><type>md</type></FileInfo></FileInfoList></body>".into(),
+            298 => {
+                if self.recording.is_none() {return Ok((405,String::new()))}
+                let doc=roxmltree::Document::parse(body)?;
+                ensure!(field(&doc,"channelId")==Some("0") && field(&doc,"frameNo")==Some("1"));
+                ensure!(field(&doc,"streamType")==Some("subStream"));
+                "<body><CoverPreview/></body>".into()
+            }
             143=> {
                 if self.recording.is_none() {return Ok((405,String::new()))}
                 ensure!(body.contains("<streamType>subStream</streamType>"));

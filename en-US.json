@@ -131,5 +131,6 @@
   "reolink-bridge-API_ROTATION_DISABLED": "Rotation is disabled.",
   "reolink-bridge-API_CONFIRM_REQUIRED": "This operation requires confirmation.",
   "reolink-bridge-API_ROTATION_UNSUPPORTED": "This camera has no verified password-change path.",
-  "reolink-bridge-API_ROTATION_RECONCILE_FAILED": "Credential verification could not complete."
+  "reolink-bridge-API_ROTATION_RECONCILE_FAILED": "Credential verification could not complete.",
+  "reolink-bridge-API_RECORDING_PREPARE_FAILED": "The recorded video could not be prepared."
 }

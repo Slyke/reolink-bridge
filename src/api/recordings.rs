@@ -1,3 +1,6 @@
+mod thumbnail;
+pub(super) use thumbnail::get as preview;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
@@ -7,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use axum::{
     Extension, Json,
     body::Body,
@@ -36,6 +39,15 @@ use crate::{
         wire::Device,
     },
 };
+
+#[derive(Debug)]
+struct PreparationStage(&'static str);
+impl std::fmt::Display for PreparationStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+impl std::error::Error for PreparationStage {}
 
 const SEARCH_TTL: Duration = Duration::from_secs(600);
 const MAX_ENTRIES: usize = 8192;
@@ -81,6 +93,7 @@ pub(super) struct Recordings {
     cache_ttl: Duration,
     max_cache_bytes: u64,
     entries: Mutex<BTreeMap<String, Entry>>,
+    thumbnails: Mutex<BTreeMap<String, thumbnail::Thumbnail>>,
     cameras: BTreeMap<String, Mutex<()>>,
     slots: Semaphore,
 }
@@ -115,6 +128,7 @@ impl Recordings {
             cache_ttl,
             max_cache_bytes: config.cache.max_bytes,
             entries: Mutex::default(),
+            thumbnails: Mutex::default(),
             cameras: ids.map(|id| (id, Mutex::new(()))).collect(),
             slots: Semaphore::new(2),
         })
@@ -168,6 +182,7 @@ impl Recordings {
     }
     pub(super) async fn clean(&self) {
         self.prune(&mut *self.entries.lock().await, Instant::now());
+        self.clean_thumbnails().await;
     }
     async fn retain(&self, camera: &str, clips: &[Clip]) {
         let mut entries = self.entries.lock().await;
@@ -203,7 +218,7 @@ impl Recordings {
     async fn cache(&self, key: String, clip: Clip, media: Arc<Media>) -> Result<Arc<Media>> {
         ensure!(
             media.size <= self.max_cache_bytes,
-            "recording exceeds configured cache size limit"
+            PreparationStage("cache-limit")
         );
         let mut entries = self.entries.lock().await;
         let now = Instant::now();
@@ -266,76 +281,88 @@ impl Recordings {
         if let Some(media) = media {
             return Ok(media);
         }
-        let _slot = self.slots.try_acquire()?;
+        let _slot = self.slots.try_acquire().context(PreparationStage("busy"))?;
         let parent = self
             .directory
             .as_ref()
             .ok_or_else(|| anyhow!("recording playback disabled"))?;
         let directory = tempfile::Builder::new()
             .prefix("reolink-recording-")
-            .tempdir_in(parent)?;
+            .tempdir_in(parent)
+            .context(PreparationStage("temporary-storage"))?;
         let input = directory.path().join("camera.ts");
         let path = directory.path().join("playback.mp4");
         let work = async {
-            let mut output = File::create(&input).await?;
-            recording_media::download(device, &clip, &mut output, &api.stop).await?;
+            let mut output = File::create(&input)
+                .await
+                .context(PreparationStage("temporary-storage"))?;
+            recording_media::download(device, &clip, &mut output, &api.stop)
+                .await
+                .context(PreparationStage("camera-download"))?;
             drop(output);
-            let result = Command::new("ffmpeg")
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-nostdin",
-                    "-threads",
-                    "1",
-                    "-filter_threads",
-                    "1",
-                    "-fflags",
-                    "+genpts",
-                ])
-                .arg("-i")
-                .arg(&input)
-                .args([
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "0:a:0?",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-crf",
-                    "23",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-threads",
-                    "1",
-                    "-c:a",
-                    "aac",
-                    "-movflags",
-                    "+faststart",
-                    "-f",
-                    "mp4",
-                ])
-                .arg(&path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .status()
-                .await?;
-            ensure!(result.success(), "recording conversion failed");
-            let size = tokio::fs::metadata(&path).await?.len();
-            ensure!(
-                (32..=MAX_MEDIA_BYTES).contains(&size),
-                "invalid recording size"
-            );
-            tokio::fs::remove_file(&input).await?;
+            let size = async {
+                let result = Command::new("ffmpeg")
+                    .args([
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-nostdin",
+                        "-threads",
+                        "1",
+                        "-filter_threads",
+                        "1",
+                        "-fflags",
+                        "+genpts",
+                    ])
+                    .arg("-i")
+                    .arg(&input)
+                    .args([
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "0:a:0?",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "ultrafast",
+                        "-crf",
+                        "23",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-threads",
+                        "1",
+                        "-c:a",
+                        "aac",
+                        "-movflags",
+                        "+faststart",
+                        "-f",
+                        "mp4",
+                    ])
+                    .arg(&path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true)
+                    .status()
+                    .await?;
+                ensure!(result.success(), "recording conversion failed");
+                let size = tokio::fs::metadata(&path).await?.len();
+                ensure!(
+                    (32..=MAX_MEDIA_BYTES).contains(&size),
+                    "invalid recording size"
+                );
+                Ok::<_, anyhow::Error>(size)
+            }
+            .await
+            .context(PreparationStage("conversion"))?;
+            tokio::fs::remove_file(&input)
+                .await
+                .context(PreparationStage("temporary-storage"))?;
             Ok::<_, anyhow::Error>(size)
         };
         let size = tokio::select! {
             _=api.stop.cancelled()=>return Err(anyhow!("shutdown")),
-            result=timeout(Duration::from_secs(120),work)=>result??,
+            result=timeout(Duration::from_secs(120),work)=>result.context(PreparationStage("timeout"))??,
         };
         let media = Arc::new(Media {
             _directory: directory,
@@ -473,12 +500,29 @@ pub(super) async fn video(
             return error(StatusCode::NOT_FOUND, "API_MEDIA_UNSUPPORTED", &correlation);
         }
     }
-    let Ok(media) = api.recordings.media(&camera, &id, device, &api).await else {
-        return error(
-            StatusCode::BAD_GATEWAY,
-            "API_MEDIA_START_FAILED",
-            &correlation,
-        );
+    let media = match api.recordings.media(&camera, &id, device, &api).await {
+        Ok(media) => media,
+        Err(failure) => {
+            let stage = failure
+                .downcast_ref::<PreparationStage>()
+                .map_or("preparation", |stage| stage.0);
+            if let Some(hub) = &api.hub {
+                hub.diagnostics.error(
+                    "api::recordings::video",
+                    "API_RECORDING_PREPARE_FAILED",
+                    Some(correlation.0.clone()),
+                    json!({"cameraId":camera,"recordingId":id,"stage":stage}),
+                    Some(failure),
+                );
+            }
+            let status = match stage {
+                "cache-limit" => StatusCode::PAYLOAD_TOO_LARGE,
+                "busy" => StatusCode::SERVICE_UNAVAILABLE,
+                "timeout" => StatusCode::GATEWAY_TIMEOUT,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            return (status, Json(json!({"ok":false,"errorKey":"API_RECORDING_PREPARE_FAILED","stage":stage,"correlation_id":correlation.0}))).into_response();
+        }
     };
     let requested = headers.get("range").and_then(|h| h.to_str().ok());
     let Some((start, end)) = byte_range(requested, media.size) else {

@@ -327,6 +327,10 @@ pub fn router(api: Arc<Api>) -> Router {
             "/api/cameras/{id}/recordings/{recording}/video",
             get(recordings::video),
         )
+        .route(
+            "/api/cameras/{id}/recordings/{recording}/preview",
+            get(recordings::preview),
+        )
         .route("/api/cameras/{id}/settings/{group}", get(settings))
         .route("/api/cameras/{id}/media/{stream}", get(media::get))
         .route("/api/cameras/{id}/preview", get(preview::get))
@@ -380,6 +384,7 @@ async fn contract(
     let recordings_available = api.recordings.available();
     Json(json!({"version":1,"eventStream":primary || api.config.events,"media":!profiles.is_empty(),"mediaCameras":profiles,
        "storageCameras":api.devices.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
+       "recordingPreviewCameras":api.devices.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
        "recordingsCameras":api.devices.keys().filter(|id| recordings_available && (primary || api.allows(id))).collect::<Vec<_>>(),
        "previewCameras":api.previews.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
        "enrollment":api.vault.is_some(),"inventory":true,"callbacks":api.callback_allowed(primary, None),"settings":["leds","spotlight","motion","ai","image"],"alerts":["motion"],

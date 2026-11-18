@@ -52,6 +52,10 @@ pub async fn download(
             if part.command != 143 || part.sequence != sequence {
                 continue;
             }
+            // Cameras signal a completed download with 300 or 331, rather than a 200 empty packet.
+            if matches!(part.status, 300 | 331) {
+                break;
+            }
             ensure!(
                 matches!(part.status, 200 | 201),
                 "recording transfer rejected"
@@ -238,4 +242,64 @@ fn psi(pid: u16, table: u8, body: &[u8]) -> Vec<u8> {
     packet.extend(section);
     packet.resize(188, 0xff);
     packet
+}
+
+pub async fn cover(device: &Device, clip: &Clip) -> Result<(&'static str, Vec<u8>)> {
+    let mut session = device.connect().await?;
+    let uid = uid(&mut session).await?;
+    let end = clip.end.min(clip.start + chrono::Duration::seconds(10));
+    let body = format!(
+        r#"<body><CoverPreview version="1.1"><channelId>{}</channelId><uid>{uid}</uid><desc>0</desc><streamType>{}Stream</streamType>{}{}<frameList><frameNo>1</frameNo></frameList></CoverPreview></body>"#,
+        device.channel,
+        clip.stream,
+        time_xml("startTime", clip.start),
+        time_xml("endTime", end)
+    );
+    let first = session.cover_start(&body).await?;
+    let sequence = first.sequence;
+    let mut next = Some(first);
+    let mut buffer = BytesMut::new();
+    let result = async {
+        loop {
+            let packet = match next.take() {
+                Some(packet) => packet,
+                None => session.read().await?,
+            };
+            if packet.command != 298 || packet.sequence != sequence {
+                continue;
+            }
+            ensure!(
+                matches!(packet.status, 200 | 201) && !packet.payload_finished(&session),
+                "recording preview ended without a frame"
+            );
+            let Some(data) = packet.binary(&session) else {
+                continue;
+            };
+            ensure!(
+                buffer.len() + data.len() <= 16 * 1024 * 1024,
+                "recording preview exceeds size limit"
+            );
+            buffer.extend_from_slice(&data);
+            while let Some((consumed, sample)) = media_sample(&buffer)? {
+                if let Media::Video {
+                    iframe: true,
+                    codec,
+                    data,
+                    ..
+                } = sample
+                {
+                    let codec = match codec {
+                        b"H264" => "h264",
+                        b"H265" => "hevc",
+                        _ => return Err(anyhow!("unsupported recording preview codec")),
+                    };
+                    return Ok((codec, data.to_vec()));
+                }
+                buffer.advance(consumed);
+            }
+        }
+    }
+    .await;
+    session.logout().await;
+    result
 }

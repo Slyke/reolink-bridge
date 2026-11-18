@@ -110,6 +110,10 @@ impl Session {
         self.decode(&reply)
     }
 
+    pub async fn cover_start(&mut self, body: &str) -> Result<Packet> {
+        self.exchange(298, 250, "", body, false).await
+    }
+
     pub async fn recording_start(&mut self, channel: u8, body: &str) -> Result<Packet> {
         let extension =
             format!(r#"<Extension version="1.1"><channelId>{channel}</channelId></Extension>"#);
