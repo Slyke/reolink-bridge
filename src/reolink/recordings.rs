@@ -34,7 +34,11 @@ pub struct Clip {
 
 pub async fn storage(session: &mut Session) -> Result<Vec<Card>> {
     let raw = session.command(102, None, "").await?;
-    let doc = xml::document(&raw)?;
+    parse_cards(&raw)
+}
+
+fn parse_cards(raw: &str) -> Result<Vec<Card>> {
+    let doc = xml::document(raw)?;
     let root = doc.root_element();
     ensure!(
         xml::find(root, "HddInfoList").is_some() || xml::find(root, "HddInfo").is_some(),
@@ -44,14 +48,14 @@ pub async fn storage(session: &mut Session) -> Result<Vec<Card>> {
         .filter(|n| n.has_tag_name("HddInfo"))
         .map(|node| {
             let slot = number(node, "number").unwrap_or(0) as u32;
-            let size = |g, m| {
-                let gb = number(node, g);
-                let mb = number(node, m);
+            let size = |whole, suffixed, remainder| {
+                let gb = number(node, whole).or_else(|| number(node, suffixed));
+                let mb = number(node, remainder);
                 (gb.is_some() || mb.is_some())
                     .then(|| gb.unwrap_or(0) * 1_000_000_000 + mb.unwrap_or(0) * 1_000_000)
             };
-            let total_bytes = size("capacityG", "capacityM");
-            let free_bytes = size("remainSizeG", "remainSizeM");
+            let total_bytes = size("capacity", "capacityG", "capacityM");
+            let free_bytes = size("remainSize", "remainSizeG", "remainSizeM");
             ensure!(
                 free_bytes
                     .zip(total_bytes)
@@ -93,10 +97,10 @@ pub fn wall_time(node: Node<'_, '_>) -> Option<NaiveDateTime> {
     )
 }
 
-pub async fn clock(session: &mut Session) -> Option<NaiveDateTime> {
-    let raw = session.command(104, None, "").await.ok()?;
-    let doc = xml::document(&raw).ok()?;
-    wall_time(doc.root_element())
+pub async fn clock(session: &mut Session) -> Result<NaiveDateTime> {
+    let raw = session.command(104, None, "").await?;
+    let doc = xml::document(&raw)?;
+    wall_time(doc.root_element()).ok_or_else(|| anyhow!("invalid camera clock"))
 }
 
 pub fn time_xml(tag: &str, value: NaiveDateTime) -> String {
@@ -235,6 +239,27 @@ fn parse_clip(node: Node<'_, '_>, stream: &str, day: NaiveDate) -> Option<Clip> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capacity_uses_whole_gigabytes_and_megabyte_remainders() {
+        // The free-space remainder can be larger than the capacity remainder.
+        for (total, free) in [("capacity", "remainSize"), ("capacityG", "remainSizeG")] {
+            let raw = format!(
+                "<HddInfo><{total}>63</{total}><capacityM>100</capacityM><{free}>23</{free}><remainSizeM>900</remainSizeM></HddInfo>"
+            );
+            let card = parse_cards(&raw).unwrap().pop().unwrap();
+            assert_eq!(card.total_bytes, Some(63_100_000_000));
+            assert_eq!(card.free_bytes, Some(23_900_000_000));
+            assert_eq!(card.used_bytes, Some(39_200_000_000));
+        }
+        let unknown = parse_cards("<HddInfo><capacity>64</capacity></HddInfo>").unwrap();
+        assert_eq!(unknown[0].total_bytes, Some(64_000_000_000));
+        assert_eq!(unknown[0].used_bytes, None);
+        assert!(
+            parse_cards("<HddInfo><capacity>1</capacity><remainSize>2</remainSize></HddInfo>")
+                .is_err()
+        );
+    }
+
     #[test]
     fn filename_times_and_clock_are_validated() {
         let raw = "<FileInfo><name>/record/RecM01_20261117_120000_120050_ABC.mp4</name><size>500</size><type>md</type></FileInfo>";

@@ -417,6 +417,31 @@ pub(super) async fn metadata(
     }
 }
 
+fn read_failure(
+    api: &Api,
+    correlation: &CorrelationId,
+    camera: &str,
+    caller: &str,
+    key: &'static str,
+    cause: anyhow::Error,
+) -> Response {
+    let status = if cause.is::<tokio::time::error::Elapsed>() {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    if let Some(hub) = &api.hub {
+        hub.diagnostics.error(
+            caller,
+            key,
+            Some(correlation.0.clone()),
+            json!({"cameraId":camera,"httpStatus":status.as_u16()}),
+            Some(cause),
+        );
+    }
+    error(status, key, correlation)
+}
+
 pub(super) async fn storage(
     State(api): State<Arc<Api>>,
     Path(camera): Path<String>,
@@ -442,15 +467,43 @@ pub(super) async fn storage(
     };
     let result = timeout(Duration::from_secs(15), async {
         let mut session = device.connect().await?;
-        let cards = recordings::storage(&mut session).await;
-        let clock = recordings::clock(&mut session).await;
+        let result = match recordings::storage(&mut session).await {
+            Ok(cards) => Ok((cards, recordings::clock(&mut session).await)),
+            Err(cause) => Err(cause),
+        };
         session.logout().await;
-        Ok::<_, anyhow::Error>((cards?, clock))
+        result
     })
-    .await;
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
     match result {
-        Ok(Ok((cards,clock)))=>Json(json!({"cards":cards,"playbackAvailable":api.recordings.available(),"cameraTime":clock,"refreshedAt":Utc::now(),"streams":["main","sub"],"correlation_id":correlation.0})).into_response(),
-        _=>error(StatusCode::UNPROCESSABLE_ENTITY,"API_SETTING_READ_FAILED",&correlation),
+        Ok((cards, clock)) => {
+            let clock = match clock {
+                Ok(time) => Some(time),
+                Err(cause) => {
+                    if let Some(hub) = &api.hub {
+                        hub.diagnostics.error(
+                            "api::recordings::clock",
+                            "API_CAMERA_CLOCK_READ_FAILED",
+                            Some(correlation.0.clone()),
+                            json!({"cameraId":camera}),
+                            Some(cause),
+                        );
+                    }
+                    None
+                }
+            };
+            Json(json!({"cards":cards,"playbackAvailable":api.recordings.available(),"cameraTime":clock,"refreshedAt":Utc::now(),"streams":["main","sub"],"correlation_id":correlation.0})).into_response()
+        }
+        Err(cause) => read_failure(
+            &api,
+            &correlation,
+            &camera,
+            "api::recordings::storage",
+            "API_STORAGE_READ_FAILED",
+            cause,
+        ),
     }
 }
 
@@ -503,17 +556,22 @@ pub(super) async fn list(
         session.logout().await;
         result
     })
-    .await;
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
     match result {
-        Ok(Ok((mut clips, truncated))) => {
+        Ok((mut clips, truncated)) => {
             clips.sort_by_key(|clip| clip.start);
             api.recordings.retain(&camera, &clips).await;
             Json(json!({"recordings":clips,"truncated":truncated,"date":query.date,"stream":query.stream,"correlation_id":correlation.0})).into_response()
         }
-        _ => error(
-            StatusCode::BAD_GATEWAY,
-            "API_SETTING_READ_FAILED",
+        Err(cause) => read_failure(
+            &api,
             &correlation,
+            &camera,
+            "api::recordings::list",
+            "API_RECORDING_SEARCH_FAILED",
+            cause,
         ),
     }
 }

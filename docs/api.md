@@ -93,7 +93,7 @@ Configure `api.recordings.temporaryDirectory` to select the existing directory u
 
 The contract reports native devices in `storageCameras`. It includes them in `recordingsCameras` when the temporary directory is usable. The storage response includes `playbackAvailable`, so clients can disable playback independently of card statistics and file searches. A video request made while the directory is unavailable returns HTTP 422 before any camera download.
 
-Storage and file searches use read-only Baichuan operations. The API reports storage quantities in bytes and recording times in the camera's local wall clock. Each search returns a maximum of 4096 entries and reports truncation.
+Storage and file searches use read-only Baichuan operations. The API reports storage quantities in bytes and recording times in the camera's local wall clock. Each search returns a maximum of 4096 entries and reports truncation. A failed card read returns `API_STORAGE_READ_FAILED`. A failed file search returns `API_RECORDING_SEARCH_FAILED`. Both include a correlation ID for the device error in the bridge log. Each endpoint works independently. If only the camera clock fails, storage still returns the cards with `cameraTime: null`.
 
 Video reads use Baichuan recording downloads. FFmpeg converts the camera's video and available AAC audio into a seekable H.264/AAC MP4. Configure `api.recordings.cache.maxBytes` for the combined converted-video cache budget and `api.recordings.cache.ttlSeconds` for its idle lifetime. Defaults are 2147483648 bytes (2 GiB) and 600 seconds (10 minutes). Both values are integers. The byte budget must be at least 32 and the lifetime must be positive and supported by the system clock.
 

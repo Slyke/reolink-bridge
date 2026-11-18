@@ -755,7 +755,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     let card = response(&client, &storage, SERVICE, None).await;
     assert_eq!(card.0, 200, "{card:?}");
     assert_eq!(card.1["cards"][0]["totalBytes"], 63_500_000_000u64);
-    assert_eq!(card.1["cards"][0]["usedBytes"], 40_400_000_000u64);
+    assert_eq!(card.1["cards"][0]["usedBytes"], 39_700_000_000u64);
     assert_eq!(card.1["cameraTime"], "2026-11-17T12:30:00");
     let denied = response(&client, &storage, "wrong", None).await;
     let correlation = denied.1["correlation_id"].as_str().unwrap();
@@ -794,6 +794,41 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         sleep(Duration::from_millis(20)).await;
     }
     let search = format!("{origin}/api/cameras/fixture/recordings?date=2026-11-17&stream=sub");
+    // Storage statistics, the camera clock and the recording index are independent reads.
+    for (command, url, status, key) in [
+        (102, &storage, 502, "API_STORAGE_READ_FAILED"),
+        (104, &storage, 200, "API_CAMERA_CLOCK_READ_FAILED"),
+        (14, &search, 502, "API_RECORDING_SEARCH_FAILED"),
+    ] {
+        camera.reject_read_command.store(command, Ordering::SeqCst);
+        let (actual, body) = response(&client, url, SERVICE, None).await;
+        assert_eq!(actual, status, "{body:?}");
+        if command == 104 {
+            assert!(body["cameraTime"].is_null());
+            assert_eq!(body["cards"][0]["totalBytes"], 63_500_000_000u64);
+        } else {
+            assert_eq!(body["errorKey"], key);
+        }
+        let correlation = body["correlation_id"].as_str().unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            let logs = std::fs::read_to_string(&log_file)?;
+            if let Some(line) = logs
+                .lines()
+                .find(|line| line.contains(correlation) && line.contains(key))
+            {
+                assert!(line.contains(&format!("command {command} returned status 405")));
+                assert!(!line.contains(baichuan::PASSWORD));
+                break;
+            }
+            ensure!(Instant::now() < until, "missing correlated cause for {key}");
+            sleep(Duration::from_millis(20)).await;
+        }
+        if command == 102 {
+            assert_eq!(response(&client, &search, SERVICE, None).await.0, 200);
+        }
+    }
+    camera.reject_read_command.store(0, Ordering::SeqCst);
     let clips = response(&client, &search, SERVICE, None).await;
     assert_eq!(clips.0, 200, "{clips:?}");
     assert_eq!(clips.1["recordings"].as_array().unwrap().len(), 1);

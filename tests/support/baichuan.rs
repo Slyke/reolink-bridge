@@ -27,6 +27,7 @@ pub struct Camera {
     pub recording_downloads: AtomicUsize,
     pub recording_end_status: AtomicUsize,
     pub recording_previews: AtomicUsize,
+    pub reject_read_command: AtomicUsize,
     pub reject_recording_cover: AtomicBool,
     pub writes: AtomicUsize,
     pub webhook: Mutex<Option<String>>,
@@ -180,9 +181,12 @@ impl Camera {
     }
 
     fn handle(&self, command: u32, body: &str) -> Result<(u16, String)> {
+        if self.reject_read_command.load(Ordering::SeqCst) == command as usize {
+            return Ok((405, String::new()));
+        }
         let response = match command {
             2 | 16 | 31 | 93 | 144 => String::new(),
-            102=>"<body><HddInfoList><HddInfo><number>0</number><storageType>2</storageType><mount>1</mount><format>1</format><capacityG>63</capacityG><capacityM>500</capacityM><remainSizeG>23</remainSizeG><remainSizeM>100</remainSizeM></HddInfo></HddInfoList></body>".into(),
+            102=>"<body><HddInfoList><HddInfo><number>0</number><storageType>2</storageType><mount>1</mount><format>1</format><capacity>63</capacity><capacityM>500</capacityM><remainSize>23</remainSize><remainSizeM>800</remainSizeM></HddInfo></HddInfoList></body>".into(),
             104=>"<body><SystemGeneral><year>2026</year><month>11</month><day>17</day><hour>12</hour><minute>30</minute><second>00</second></SystemGeneral></body>".into(),
             14=> {
                 ensure!(body.contains("<streamType>subStream</streamType>") || body.contains("<streamType>mainStream</streamType>"));

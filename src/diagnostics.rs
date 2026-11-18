@@ -102,6 +102,7 @@ impl Diagnostics {
             "MQTT_RESULT_QUEUE_FULL",
             "WEBSOCKET_SEND_FAILED",
             "API_RECORDING_PREVIEW_FALLBACK",
+            "API_CAMERA_CLOCK_READ_FAILED",
             "API_PREVIEW_CACHE_FAILED",
         ] {
             config
