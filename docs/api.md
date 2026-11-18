@@ -12,7 +12,7 @@ api: {
   // Omit cameraIds on a dedicated bridge, or list allowed camera IDs.
   cameraIds: ["entrance", "new-camera"],
   commands: true,
-  // events: true, // Allow this scoped token to subscribe via WebSocket.
+  // events: true, // Allow this scoped token to subscribe via WS or HTTP events.
   targets: {
     staging: { host: "192.0.2.2", port: 9000, cameraId: "new-camera" },
   },
@@ -59,9 +59,17 @@ cache: { backend: "valkey", url: "${BRIDGE_VALKEY_URL}", keyPrefix: "reolink-bri
 
 The bridge serves its in-memory frame if the Valkey connection drops.
 
+## HTTP event stream
+
+`GET /api/events` accepts the primary HTTP token or a scoped service token with `api.events: true`. Optional comma-separated `cameras` and `events` query parameters use the same camera and event filters as WebSocket subscriptions. Scoped credentials apply their camera allowlist to every snapshot and event.
+
+The response is `text/event-stream`. Each SSE data message contains one JSON object. The initial `{"op":"ready","snapshots":[...]}` message supplies cached state, followed by the existing `snapshot` and `event` update envelopes. A `{"op":"gap","snapshots":[...]}` message reports a subscriber backlog and refreshes current state. Comment heartbeats are sent every eight seconds. Reconnect to obtain a new state snapshot after a disconnect.
+
+The stream reads the bridge's event hub. Connections share its existing camera subscriptions. It adds no camera requests. `GET /api/contract` advertises `eventStream` when the caller can subscribe.
+
 ## Authorization and enrollment
 
-The optional `api.serviceToken` accepts `api.cameraIds` as an allowlist. Enable `api.commands` to permit typed commands and `api.events` to permit subscriptions with that token on the bridge's WebSocket interface. `api.adminToken` is required for enrollment and credential rotation. Each extra token must be distinct from `http.token` and at least 24 characters long. MQTT access is administered with broker ACLs.
+The optional `api.serviceToken` accepts `api.cameraIds` as an allowlist. Enable `api.commands` to permit typed commands and `api.events` to permit WebSocket and HTTP event subscriptions with that token. `api.adminToken` is required for enrollment and credential rotation. Each extra token must be distinct from `http.token` and at least 24 characters long. MQTT access is administered with broker ACLs.
 
 To enable HTTP callback administration set `api.callbackDestinations` to a list of exact receiver URLs. Use `http.token` or a service token with no camera allowlist. The `POST` and `PUT` bodies use the same `id`, `url`, `cameras` and `events` fields as static `callbacks` entries. Updates replace the bridge configuration file atomically, which requires a writable config directory. The callback HTTP client refuses redirects. [Callback delivery and filters](./interfaces.md#manage-downstream-callbacks)
 

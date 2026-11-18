@@ -31,7 +31,7 @@ pub async fn run(directory: &Path, bridge: &str, broker: u16, client: &Client) -
         "publicOrigin":origin,"listen":{"port":port},"auth":{"mode":"local"},
         "database":{"driver":"sqlite","path":directory.join("wui.sqlite")},
         "bridges":[{
-            "label":"Test bridge","id":"fixture","commands":"http","events":"mqtt","capture":"mqtt",
+            "label":"Test bridge","id":"fixture","commands":"http","events":["api","ws","mqtt"],"capture":"mqtt",
             "http":{"url":bridge,"token":super::SERVICE,"adminToken":super::ADMIN},
             "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"}
         }]
@@ -96,6 +96,23 @@ pub async fn run(directory: &Path, bridge: &str, broker: u16, client: &Client) -
     headers.insert(
         "x-csrf-token",
         HeaderValue::from_str(session["csrf"].as_str().context("fixture csrf")?)?,
+    );
+    let upstreams = client
+        .get(format!("{base}/status"))
+        .headers(headers.clone())
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let upstreams: Value = serde_json::from_str(&upstreams)?;
+    ensure!(
+        upstreams["upstreams"][0]["connections"]
+            .as_array()
+            .is_some_and(|connections| connections
+                .iter()
+                .any(|connection| connection["id"] == "api" && connection["feed"] == "active")),
+        "WUI did not consume the bridge HTTP event stream"
     );
     let admin = client
         .get(format!("{base}/admin"))

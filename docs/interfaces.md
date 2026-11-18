@@ -43,6 +43,10 @@ An empty camera or event filter matches all. The event filter applies to live ev
 
 Subsequent updates use `{"op":"event","event":{...}}` and `{"op":"snapshot","snapshot":{...}}`. If the socket falls behind, `{"op":"gap","snapshots":[...]}` refreshes current state. Use `id` to match direct replies and treat updates as separate messages. See [event JSON](./events.md) and [control requests](./controls.md).
 
+## HTTP event subscriptions
+
+Use authenticated `GET /api/events` for the same cached snapshots and live events over HTTP SSE. It supports camera/event filtering, scoped API credentials, eight-second heartbeats, and backlog gap messages. See the [HTTP event stream contract](./api.md#http-event-stream).
+
 ## Manage downstream callbacks
 
 Use the [HTTP API](./api.md#authorization-and-enrollment) to manage callbacks with an approved receiver, or use the WebSocket commands below.

@@ -54,6 +54,24 @@ async fn response(client: &Client, url: &str, token: &str, body: Option<Value>) 
     (status, reply)
 }
 
+async fn event_message(response: &mut reqwest::Response, buffer: &mut Vec<u8>) -> Result<Value> {
+    loop {
+        if let Some(end) = buffer.windows(2).position(|pair| pair == b"\n\n") {
+            let frame: Vec<_> = buffer.drain(..end + 2).collect();
+            let frame = std::str::from_utf8(&frame)?;
+            if let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) {
+                return Ok(serde_json::from_str(data)?);
+            }
+        } else {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+                .await??
+                .context("event stream ended")?;
+            buffer.extend_from_slice(&chunk);
+            ensure!(buffer.len() < 2_000_000, "event frame limit");
+        }
+    }
+}
+
 async fn start(config: &Path, client: &Client, origin: &str) -> Result<Child> {
     let bridge = Command::new(env!("CARGO_BIN_EXE_reolink-bridge"))
         .arg(config)
@@ -144,6 +162,15 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
         );
         sleep(Duration::from_millis(25)).await;
     }
+    assert_eq!(
+        client
+            .get(format!("{origin}/api/events"))
+            .bearer_auth(SERVICE)
+            .send()
+            .await?
+            .status(),
+        403
+    );
     let starts = camera.snapshot_requests.lock().unwrap().clone();
     assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(675));
     assert_eq!(
@@ -442,6 +469,64 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
         ensure!(Instant::now() < until, "settings discovery failed");
         sleep(Duration::from_millis(50)).await;
     }
+
+    assert_eq!(
+        client
+            .get(url("/events"))
+            .bearer_auth("invalid-token")
+            .send()
+            .await?
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(url("/events?cameras=outside-scope"))
+            .bearer_auth(SERVICE)
+            .send()
+            .await?
+            .status(),
+        403
+    );
+    let mut event_stream = client
+        .get(url("/events?cameras=new"))
+        .bearer_auth(SERVICE)
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(event_stream.headers()["content-type"], "text/event-stream");
+    assert_eq!(event_stream.headers()["cache-control"], "no-store, private");
+    let mut event_buffer = Vec::new();
+    let initial = event_message(&mut event_stream, &mut event_buffer).await?;
+    assert_eq!(initial["op"], "ready");
+    let snapshots = initial["snapshots"]
+        .as_array()
+        .context("initial snapshots")?;
+    assert!(!snapshots.is_empty());
+    assert!(snapshots.iter().all(|item| item["camera_id"] == "new"));
+    let reply = response(
+        &client,
+        &url("/cameras/new/command/exec"),
+        SERVICE,
+        Some(json!({
+            "id":Uuid::new_v4(),"command":{"setting":"status_led","enabled":false}
+        })),
+    )
+    .await;
+    assert_eq!(reply.0, 200, "{:?}", reply);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let message = event_message(&mut event_stream, &mut event_buffer).await?;
+        if message["op"] == "snapshot" && message["snapshot"]["topic"] == "state/settings" {
+            assert_eq!(message["snapshot"]["camera_id"], "new");
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "HTTP event stream did not forward live state"
+        );
+    }
+    drop(event_stream);
 
     let mut ws_request = format!("ws://127.0.0.1:{port}/ws").into_client_request()?;
     ws_request

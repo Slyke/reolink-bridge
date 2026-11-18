@@ -40,6 +40,8 @@ use crate::{
     xml,
 };
 
+mod events;
+
 pub struct App {
     pub hub: Arc<Hub>,
     pub push: PushRoutes,
@@ -63,6 +65,7 @@ pub fn router(app: Arc<App>, ws_path: &str) -> Router {
     let routes = Router::new()
         .route("/livez", get(liveness))
         .route("/readyz", get(readiness))
+        .route("/api/events", get(events::stream))
         .route("/ingest/onvif/{id}/{key}", post(notify))
         .route("/ingest/reolink/{id}/{key}", post(native))
         .route(

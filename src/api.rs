@@ -375,7 +375,7 @@ async fn contract(
         })
         .map(|(id, profile)| (id.clone(), json!(profile.streams)))
         .collect();
-    Json(json!({"version":1,"media":!profiles.is_empty(),"mediaCameras":profiles,
+    Json(json!({"version":1,"eventStream":primary || api.config.events,"media":!profiles.is_empty(),"mediaCameras":profiles,
        "recordingsCameras":api.devices.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
        "previewCameras":api.previews.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
        "enrollment":api.vault.is_some(),"inventory":true,"callbacks":api.callback_allowed(primary, None),"settings":["leds","spotlight","motion","ai","image"],"alerts":["motion"],
