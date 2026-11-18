@@ -52,3 +52,16 @@ Set `http.listen` to `0.0.0.0:8080` for this port mapping. Check `/livez` and `/
 Set `api.recordings.temporaryDirectory` to the recording workspace. It defaults to `/tmp`. Set the value to `null` to disable recorded-video playback. The runtime user needs write access to the selected directory. Missing or unwritable storage disables recorded-video playback. Card statistics and file searches are exposed through their read endpoints.
 
 For Kubernetes, mount a disk-backed `emptyDir` at the configured path and give user/group `10001` write access, for example with `fsGroup: 10001`. The temporary cache is reconstructed after pod replacement. Retain the existing certificate volume independently.
+
+Set `api.recordings.cache.maxBytes` and `api.recordings.cache.ttlSeconds` to bound the converted-video cache by total bytes and inactivity. Defaults are 2147483648 bytes (2 GiB) and 600 seconds (10 minutes). Playback renews the idle lifetime, and size pressure evicts the least recently played clips. Oversized clips fail playback. Allow space beyond the cache budget for native downloads, conversions, and files held by active responses. A volume size limit can cap the entire workspace.
+
+~~~json
+{
+  "api": {
+    "recordings": {
+      "temporaryDirectory": "/tmp",
+      "cache": { "maxBytes": 2147483648, "ttlSeconds": 600 }
+    }
+  }
+}
+~~~

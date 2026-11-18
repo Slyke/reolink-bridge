@@ -670,13 +670,13 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"},
         "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
         "cameras":[{"id":"fixture","host":"127.0.0.1","baichuanPort":bc,"onvifPort":null,"username":"admin","password":baichuan::PASSWORD,"eventTransport":"baichuan"}],
-        "api":{"serviceToken":SERVICE,"cameraIds":["fixture"],"commands":true,"recordings":{"temporaryDirectory":workspace}}
+        "api":{"serviceToken":SERVICE,"cameraIds":["fixture"],"commands":true,"recordings":{"temporaryDirectory":workspace,"cache":{"maxBytes":1_048_576,"ttlSeconds":2}}}
     }).to_string())?;
     let client = Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(20))
         .build()?;
-    let _bridge = start(&config, &client, &origin).await?;
+    let mut bridge = start(&config, &client, &origin).await?;
     let storage = format!("{origin}/api/cameras/fixture/storage");
     assert_eq!(response(&client, &storage, "wrong", None).await.0, 401);
     let card = response(&client, &storage, SERVICE, None).await;
@@ -742,6 +742,17 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         json!(["fixture"])
     );
 
+    sleep(Duration::from_millis(2100)).await;
+    let expired = client
+        .get(&video)
+        .bearer_auth(SERVICE)
+        .header("range", "bytes=0-31")
+        .send()
+        .await?;
+    assert_eq!(expired.status(), 206);
+    assert_eq!(expired.bytes().await?, data[..32]);
+    assert_eq!(camera.recording_downloads.load(Ordering::SeqCst), 2);
+
     let until = Instant::now() + Duration::from_secs(8);
     loop {
         if response(
@@ -775,6 +786,22 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     assert!(camera.mirror.load(Ordering::SeqCst));
     assert!(camera.flip.load(Ordering::SeqCst));
     assert_eq!(camera.rotation.load(Ordering::SeqCst), 0);
+    assert_eq!(camera.writes.load(Ordering::SeqCst), 4);
+
+    bridge.kill().await?;
+    bridge.wait().await?;
+    let limited_workspace = directory.path().join("limited-recording-workspace");
+    std::fs::create_dir(&limited_workspace)?;
+    let mut limited: Value = serde_json::from_slice(&std::fs::read(&config)?)?;
+    limited["api"]["recordings"] =
+        json!({"temporaryDirectory":limited_workspace,"cache":{"maxBytes":32,"ttlSeconds":600}});
+    std::fs::write(&config, limited.to_string())?;
+    let _limited_bridge = start(&config, &client, &origin).await?;
+    assert_eq!(response(&client, &search, SERVICE, None).await.0, 200);
+    let oversized = client.get(&video).bearer_auth(SERVICE).send().await?;
+    assert_eq!(oversized.status(), 502);
+    assert_eq!(camera.recording_downloads.load(Ordering::SeqCst), 3);
+    assert_eq!(std::fs::read_dir(&limited_workspace)?.count(), 0);
     assert_eq!(camera.writes.load(Ordering::SeqCst), 4);
     Ok(())
 }

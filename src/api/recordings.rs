@@ -1,5 +1,10 @@
 use std::{
-    collections::BTreeMap, io::Write, path::PathBuf, process::Stdio, sync::Arc, time::Duration,
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Result, anyhow, ensure};
@@ -32,13 +37,32 @@ use crate::{
     },
 };
 
-const TTL: Duration = Duration::from_secs(600);
+const SEARCH_TTL: Duration = Duration::from_secs(600);
+const MAX_ENTRIES: usize = 8192;
+const MAX_MEDIA_BYTES: u64 = 768 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Config {
     #[serde(default = "temporary_directory")]
     temporary_directory: Option<PathBuf>,
+    #[serde(default)]
+    cache: CacheConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct CacheConfig {
+    max_bytes: u64,
+    ttl_seconds: u64,
+}
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: 2 * 1024 * 1024 * 1024,
+            ttl_seconds: 600,
+        }
+    }
 }
 fn temporary_directory() -> Option<PathBuf> {
     Some(PathBuf::from("/tmp"))
@@ -47,12 +71,15 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             temporary_directory: temporary_directory(),
+            cache: CacheConfig::default(),
         }
     }
 }
 
 pub(super) struct Recordings {
     directory: Option<PathBuf>,
+    cache_ttl: Duration,
+    max_cache_bytes: u64,
     entries: Mutex<BTreeMap<String, Entry>>,
     cameras: BTreeMap<String, Mutex<()>>,
     slots: Semaphore,
@@ -60,7 +87,11 @@ pub(super) struct Recordings {
 struct Entry {
     clip: Clip,
     expires: Instant,
-    media: Option<Arc<Media>>,
+    media: Option<CachedMedia>,
+}
+struct CachedMedia {
+    file: Arc<Media>,
+    accessed: Instant,
 }
 struct Media {
     _directory: tempfile::TempDir,
@@ -69,13 +100,24 @@ struct Media {
 }
 
 impl Recordings {
-    pub(super) fn new(config: &Config, ids: impl Iterator<Item = String>) -> Self {
-        Self {
+    pub(super) fn new(config: &Config, ids: impl Iterator<Item = String>) -> Result<Self> {
+        let cache_ttl = Duration::from_secs(config.cache.ttl_seconds);
+        ensure!(
+            !cache_ttl.is_zero() && Instant::now().checked_add(cache_ttl).is_some(),
+            "recording cache ttlSeconds must be positive and supported by the system clock"
+        );
+        ensure!(
+            config.cache.max_bytes >= 32,
+            "recording cache maxBytes must be at least 32"
+        );
+        Ok(Self {
             directory: config.temporary_directory.clone(),
+            cache_ttl,
+            max_cache_bytes: config.cache.max_bytes,
             entries: Mutex::default(),
             cameras: ids.map(|id| (id, Mutex::new(()))).collect(),
             slots: Semaphore::new(2),
-        }
+        })
     }
     pub(super) fn available(&self) -> bool {
         let Some(directory) = &self.directory else {
@@ -90,33 +132,117 @@ impl Recordings {
             .and_then(|mut file| file.write_all(b"recording workspace check"))
             .is_ok()
     }
-    pub(super) async fn clean(&self) {
-        self.entries
-            .lock()
-            .await
-            .retain(|_, entry| entry.expires > Instant::now());
+    pub(super) fn cleanup_interval(&self) -> Duration {
+        self.cache_ttl.min(Duration::from_secs(60))
     }
-    async fn retain(&self, camera: &str, clips: &[Clip]) {
-        let mut entries = self.entries.lock().await;
-        entries.retain(|_, entry| entry.expires > Instant::now());
-        while entries.len() + clips.len() > 8192 {
+    fn prune(&self, entries: &mut BTreeMap<String, Entry>, now: Instant) {
+        entries.retain(|_, entry| {
+            if entry
+                .media
+                .as_ref()
+                .is_some_and(|cached| now.duration_since(cached.accessed) >= self.cache_ttl)
+            {
+                entry.media = None;
+            }
+            entry.expires > now || entry.media.is_some()
+        });
+    }
+    fn trim_catalog(entries: &mut BTreeMap<String, Entry>, protected: impl Fn(&str) -> bool) {
+        while entries.len() > MAX_ENTRIES {
             let oldest = entries
                 .iter()
-                .min_by_key(|(_, e)| e.expires)
-                .map(|(k, _)| k.clone());
+                .filter(|(key, _)| !protected(key))
+                .min_by_key(|(_, entry)| {
+                    (
+                        entry.media.is_some(),
+                        entry
+                            .media
+                            .as_ref()
+                            .map_or(entry.expires, |cached| cached.accessed),
+                    )
+                })
+                .map(|(key, _)| key.clone());
             let Some(key) = oldest else { break };
             entries.remove(&key);
         }
+    }
+    pub(super) async fn clean(&self) {
+        self.prune(&mut *self.entries.lock().await, Instant::now());
+    }
+    async fn retain(&self, camera: &str, clips: &[Clip]) {
+        let mut entries = self.entries.lock().await;
+        let now = Instant::now();
+        self.prune(&mut entries, now);
+        let mut refreshed = BTreeSet::new();
         for clip in clips {
-            let entry = entries
-                .entry(format!("{camera}/{}", clip.id))
-                .or_insert_with(|| Entry {
-                    clip: clip.clone(),
-                    expires: Instant::now() + TTL,
-                    media: None,
-                });
-            entry.expires = Instant::now() + TTL;
+            let key = format!("{camera}/{}", clip.id);
+            refreshed.insert(key.clone());
+            let entry = entries.entry(key).or_insert_with(|| Entry {
+                clip: clip.clone(),
+                expires: now + SEARCH_TTL,
+                media: None,
+            });
+            entry.expires = now + SEARCH_TTL;
         }
+        Self::trim_catalog(&mut entries, |key| refreshed.contains(key));
+    }
+    async fn lookup(&self, key: &str) -> Result<(Clip, Option<Arc<Media>>)> {
+        let mut entries = self.entries.lock().await;
+        let now = Instant::now();
+        self.prune(&mut entries, now);
+        let entry = entries
+            .get_mut(key)
+            .ok_or_else(|| anyhow!("recording search expired"))?;
+        entry.expires = now + SEARCH_TTL;
+        let media = entry.media.as_mut().map(|cached| {
+            cached.accessed = now;
+            cached.file.clone()
+        });
+        Ok((entry.clip.clone(), media))
+    }
+    async fn cache(&self, key: String, clip: Clip, media: Arc<Media>) -> Result<Arc<Media>> {
+        ensure!(
+            media.size <= self.max_cache_bytes,
+            "recording exceeds configured cache size limit"
+        );
+        let mut entries = self.entries.lock().await;
+        let now = Instant::now();
+        self.prune(&mut entries, now);
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.media = None;
+        }
+        let mut bytes = entries
+            .values()
+            .filter_map(|entry| entry.media.as_ref())
+            .map(|cached| cached.file.size)
+            .sum::<u64>();
+        while bytes > self.max_cache_bytes - media.size {
+            let oldest = entries
+                .iter()
+                .filter_map(|(key, entry)| entry.media.as_ref().map(|cached| (key, cached)))
+                .min_by_key(|(_, cached)| cached.accessed)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            if let Some(cached) = entries
+                .get_mut(&oldest)
+                .and_then(|entry| entry.media.take())
+            {
+                bytes -= cached.file.size;
+            }
+        }
+        entries.insert(
+            key.clone(),
+            Entry {
+                clip,
+                expires: now + SEARCH_TTL,
+                media: Some(CachedMedia {
+                    file: media.clone(),
+                    accessed: now,
+                }),
+            },
+        );
+        Self::trim_catalog(&mut entries, |candidate| candidate == key);
+        Ok(media)
     }
     async fn media(
         &self,
@@ -136,17 +262,10 @@ impl Recordings {
             .ok_or_else(|| anyhow!("unknown camera"))?
             .lock()
             .await;
-        let clip = {
-            let entries = self.entries.lock().await;
-            let entry = entries
-                .get(&key)
-                .filter(|e| e.expires > Instant::now())
-                .ok_or_else(|| anyhow!("recording search expired"))?;
-            if let Some(media) = &entry.media {
-                return Ok(media.clone());
-            }
-            entry.clip.clone()
-        };
+        let (clip, media) = self.lookup(&key).await?;
+        if let Some(media) = media {
+            return Ok(media);
+        }
         let _slot = self.slots.try_acquire()?;
         let parent = self
             .directory
@@ -208,7 +327,7 @@ impl Recordings {
             ensure!(result.success(), "recording conversion failed");
             let size = tokio::fs::metadata(&path).await?.len();
             ensure!(
-                (32..=768 * 1024 * 1024).contains(&size),
+                (32..=MAX_MEDIA_BYTES).contains(&size),
                 "invalid recording size"
             );
             tokio::fs::remove_file(&input).await?;
@@ -223,29 +342,7 @@ impl Recordings {
             path,
             size,
         });
-        let mut entries = self.entries.lock().await;
-        entries.retain(|_, entry| entry.expires > Instant::now());
-        let mut bytes = entries
-            .values()
-            .filter_map(|e| e.media.as_ref())
-            .map(|m| m.size)
-            .sum::<u64>();
-        while bytes + size > 2 * 1024 * 1024 * 1024 {
-            let oldest = entries
-                .iter()
-                .filter(|(_, e)| e.media.is_some())
-                .min_by_key(|(_, e)| e.expires)
-                .map(|(key, _)| key.clone());
-            let Some(oldest) = oldest else { break };
-            if let Some(media) = entries.get_mut(&oldest).and_then(|e| e.media.take()) {
-                bytes = bytes.saturating_sub(media.size);
-            }
-        }
-        if let Some(entry) = entries.get_mut(&key) {
-            entry.media = Some(media.clone());
-            entry.expires = Instant::now() + TTL;
-        }
-        Ok(media)
+        self.cache(key, clip, media).await
     }
 }
 
@@ -370,11 +467,9 @@ pub(super) async fn video(
         );
     }
     {
-        let entries = api.recordings.entries.lock().await;
-        if !entries
-            .get(&format!("{camera}/{id}"))
-            .is_some_and(|e| e.expires > Instant::now())
-        {
+        let mut entries = api.recordings.entries.lock().await;
+        api.recordings.prune(&mut entries, Instant::now());
+        if !entries.contains_key(&format!("{camera}/{id}")) {
             return error(StatusCode::NOT_FOUND, "API_MEDIA_UNSUPPORTED", &correlation);
         }
     }
@@ -484,21 +579,254 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config: Config =
             serde_json::from_value(json!({"temporaryDirectory":directory.path()})).unwrap();
-        let recordings = Recordings::new(&config, std::iter::empty());
+        let recordings = Recordings::new(&config, std::iter::empty()).unwrap();
         assert!(recordings.available());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         let disabled: Config = serde_json::from_value(json!({"temporaryDirectory":null})).unwrap();
-        assert!(!Recordings::new(&disabled, std::iter::empty()).available());
+        assert!(
+            !Recordings::new(&disabled, std::iter::empty())
+                .unwrap()
+                .available()
+        );
         let missing: Config =
             serde_json::from_value(json!({"temporaryDirectory":directory.path().join("missing")}))
                 .unwrap();
-        assert!(!Recordings::new(&missing, std::iter::empty()).available());
+        assert!(
+            !Recordings::new(&missing, std::iter::empty())
+                .unwrap()
+                .available()
+        );
         let file = directory.path().join("file");
         std::fs::write(&file, b"test").unwrap();
         let invalid: Config = serde_json::from_value(json!({"temporaryDirectory":file})).unwrap();
-        assert!(!Recordings::new(&invalid, std::iter::empty()).available());
+        assert!(
+            !Recordings::new(&invalid, std::iter::empty())
+                .unwrap()
+                .available()
+        );
         let empty: Config = serde_json::from_value(json!({"temporaryDirectory":""})).unwrap();
-        assert!(!Recordings::new(&empty, std::iter::empty()).available());
+        assert!(
+            !Recordings::new(&empty, std::iter::empty())
+                .unwrap()
+                .available()
+        );
+    }
+
+    fn clip(id: &str) -> Clip {
+        let start = NaiveDate::from_ymd_opt(2026, 11, 17)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        Clip {
+            id: id.into(),
+            start,
+            end: start + chrono::Duration::seconds(10),
+            stream: "sub".into(),
+            size_bytes: None,
+            kind: None,
+        }
+    }
+
+    fn media(directory: &std::path::Path, size: u64) -> Arc<Media> {
+        let directory = tempfile::tempdir_in(directory).unwrap();
+        let path = directory.path().join("playback.mp4");
+        std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+        Arc::new(Media {
+            _directory: directory,
+            path,
+            size,
+        })
+    }
+
+    #[test]
+    fn cache_limits_have_defaults_and_reject_invalid_values() {
+        let defaults = Recordings::new(&Config::default(), std::iter::empty()).unwrap();
+        assert_eq!(defaults.cache_ttl, Duration::from_secs(600));
+        assert_eq!(defaults.max_cache_bytes, 2_147_483_648);
+        for (value, seconds, bytes) in [
+            (json!({"cache":{"ttlSeconds":3600}}), 3600, 2_147_483_648),
+            (json!({"cache":{"maxBytes":1_048_576}}), 600, 1_048_576),
+        ] {
+            let config: Config = serde_json::from_value(value).unwrap();
+            let recordings = Recordings::new(&config, std::iter::empty()).unwrap();
+            assert_eq!(recordings.cache_ttl, Duration::from_secs(seconds));
+            assert_eq!(recordings.max_cache_bytes, bytes);
+        }
+        for value in [
+            json!({"cache":{"ttlSeconds":0}}),
+            json!({"cache":{"ttlSeconds":u64::MAX}}),
+            json!({"cache":{"maxBytes":31}}),
+        ] {
+            let config: Config = serde_json::from_value(value).unwrap();
+            assert!(Recordings::new(&config, std::iter::empty()).is_err());
+        }
+        for value in [
+            json!({"cache":{"ttlSeconds":-1}}),
+            json!({"cache":{"maxBytes":1.5}}),
+            json!({"cache":{"ttl":600}}),
+        ] {
+            assert!(serde_json::from_value::<Config>(value).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_size_is_shared_and_evicts_least_recently_played_clips() {
+        let directory = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(json!({"cache":{"maxBytes":128}})).unwrap();
+        let recordings = Recordings::new(&config, std::iter::empty()).unwrap();
+        let first = media(directory.path(), 64);
+        let first_path = first.path.clone();
+        recordings
+            .cache("one/a".into(), clip("a"), first)
+            .await
+            .unwrap();
+        let second = recordings
+            .cache("two/b".into(), clip("b"), media(directory.path(), 64))
+            .await
+            .unwrap();
+        let second_path = second.path.clone();
+        {
+            let mut entries = recordings.entries.lock().await;
+            entries
+                .get_mut("one/a")
+                .unwrap()
+                .media
+                .as_mut()
+                .unwrap()
+                .accessed = Instant::now() - Duration::from_secs(30);
+            entries
+                .get_mut("two/b")
+                .unwrap()
+                .media
+                .as_mut()
+                .unwrap()
+                .accessed = Instant::now() - Duration::from_secs(20);
+        }
+        recordings.lookup("one/a").await.unwrap();
+        recordings
+            .cache("three/c".into(), clip("c"), media(directory.path(), 64))
+            .await
+            .unwrap();
+        let entries = recordings.entries.lock().await;
+        assert!(entries["one/a"].media.is_some());
+        assert!(entries["two/b"].media.is_none());
+        assert!(entries["three/c"].media.is_some());
+        assert_eq!(
+            entries
+                .values()
+                .filter_map(|entry| entry.media.as_ref())
+                .map(|cached| cached.file.size)
+                .sum::<u64>(),
+            128
+        );
+        assert!(first_path.exists());
+        // A response already using an evicted clip can finish before its file is removed.
+        assert!(second_path.exists());
+        drop(second);
+        assert!(!second_path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_full_cache_keeps_new_recording_search_results_playable() {
+        let directory = tempfile::tempdir().unwrap();
+        let recordings = Recordings::new(&Config::default(), std::iter::empty()).unwrap();
+        let file = media(directory.path(), 64);
+        {
+            let mut entries = recordings.entries.lock().await;
+            for index in 0..MAX_ENTRIES {
+                entries.insert(
+                    format!("one/{index}"),
+                    Entry {
+                        clip: clip(&index.to_string()),
+                        expires: Instant::now() + SEARCH_TTL,
+                        media: Some(CachedMedia {
+                            file: file.clone(),
+                            accessed: Instant::now(),
+                        }),
+                    },
+                );
+            }
+        }
+        recordings.retain("two", &[clip("new")]).await;
+        assert!(recordings.lookup("two/new").await.is_ok());
+        assert_eq!(recordings.entries.lock().await.len(), MAX_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn searching_does_not_keep_expired_video_cached() {
+        let directory = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(json!({"cache":{"ttlSeconds":5}})).unwrap();
+        let recordings = Recordings::new(&config, std::iter::empty()).unwrap();
+        let file = media(directory.path(), 64);
+        let path = file.path.clone();
+        recordings
+            .cache("one/a".into(), clip("a"), file)
+            .await
+            .unwrap();
+        recordings
+            .entries
+            .lock()
+            .await
+            .get_mut("one/a")
+            .unwrap()
+            .media
+            .as_mut()
+            .unwrap()
+            .accessed = Instant::now() - Duration::from_secs(6);
+        recordings.retain("one", &[clip("a")]).await;
+        assert!(!path.exists());
+        assert!(recordings.lookup("one/a").await.unwrap().1.is_none());
+    }
+
+    #[tokio::test]
+    async fn playback_renews_cache_expiry_independently_of_search_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(json!({"cache":{"ttlSeconds":1200}})).unwrap();
+        let recordings = Recordings::new(&config, std::iter::empty()).unwrap();
+        let file = media(directory.path(), 64);
+        let path = file.path.clone();
+        recordings
+            .cache("one/a".into(), clip("a"), file)
+            .await
+            .unwrap();
+        {
+            let mut entries = recordings.entries.lock().await;
+            let entry = entries.get_mut("one/a").unwrap();
+            entry.expires = Instant::now() - Duration::from_secs(1);
+            entry.media.as_mut().unwrap().accessed = Instant::now() - Duration::from_secs(1199);
+        }
+        let active = recordings.lookup("one/a").await.unwrap().1.unwrap();
+        let mut entries = recordings.entries.lock().await;
+        recordings.prune(&mut entries, Instant::now() + Duration::from_secs(2));
+        assert!(entries["one/a"].media.is_some());
+        recordings.prune(&mut entries, Instant::now() + Duration::from_secs(1201));
+        assert!(!entries.contains_key("one/a"));
+        assert!(path.exists());
+        drop(active);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn oversized_clip_is_discarded_without_evicting_cached_clips() {
+        let directory = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(json!({"cache":{"maxBytes":128}})).unwrap();
+        let recordings = Recordings::new(&config, std::iter::empty()).unwrap();
+        recordings
+            .cache("one/a".into(), clip("a"), media(directory.path(), 128))
+            .await
+            .unwrap();
+        let file = media(directory.path(), 129);
+        let path = file.path.clone();
+        assert!(
+            recordings
+                .cache("two/b".into(), clip("b"), file)
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
+        let entries = recordings.entries.lock().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries["one/a"].media.as_ref().unwrap().file.size, 128);
     }
 
     #[test]

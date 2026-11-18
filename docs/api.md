@@ -19,7 +19,10 @@ api: {
   media: {
     entrance: { port: 554, streams: ["main", "sub"] },
   },
-  recordings: { temporaryDirectory: "/tmp" }, // null disables recorded-video playback
+  recordings: {
+    temporaryDirectory: "/tmp", // null disables recorded-video playback
+    cache: { maxBytes: 2147483648, ttlSeconds: 600 },
+  },
   previews: {
     cameras: { entrance: { intervalMs: 5000 } },
   },
@@ -90,7 +93,11 @@ The contract reports native devices in `storageCameras`. It includes them in `re
 
 Storage and file searches use read-only Baichuan operations. The API reports storage quantities in bytes and recording times in the camera's local wall clock. Each search returns a maximum of 4096 entries and reports truncation.
 
-Video reads use Baichuan recording downloads. FFmpeg converts the camera's video and available AAC audio into a seekable H.264/AAC MP4. The private temporary cache expires after ten minutes, with a two-GiB cache budget and two concurrent downloads. A camera has one active download at a time. Individual transfers accept up to 512 MiB of native camera data and 768 MiB of converted MP4, with a 120-second preparation deadline. Camera credentials and native recording file paths stay inside the bridge.
+Video reads use Baichuan recording downloads. FFmpeg converts the camera's video and available AAC audio into a seekable H.264/AAC MP4. Configure `api.recordings.cache.maxBytes` for the combined converted-video cache budget and `api.recordings.cache.ttlSeconds` for its idle lifetime. Defaults are 2147483648 bytes (2 GiB) and 600 seconds (10 minutes). Both values are integers. The byte budget must be at least 32 and the lifetime must be positive and supported by the system clock.
+
+Each playback request, including a byte-range request, renews that clip's idle lifetime. Recording searches do not extend video-cache lifetime. Expired clips are removed on the next cache operation or periodic cleanup, which runs every 60 seconds or the configured lifetime, whichever is shorter. Size pressure evicts the least recently played cached clips. A converted clip larger than the configured budget fails playback and is discarded. In-progress responses retain their files until they finish. Recording-search IDs remain available for ten minutes after search or playback and while their video is cached.
+
+The byte budget covers cached converted videos across all cameras. Downloads, files being converted, and evicted files still used by active responses also occupy the temporary workspace. Allow additional disk space for these files or enforce a filesystem/volume limit. Two downloads can prepare concurrently, with one active download per camera. Individual transfers accept up to 512 MiB of native camera data and 768 MiB of converted MP4, with a 120-second preparation deadline. Camera credentials and native recording file paths stay inside the bridge.
 
 ## Image orientation
 

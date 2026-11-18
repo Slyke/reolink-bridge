@@ -214,7 +214,7 @@ impl Api {
             })
             .collect();
         let previews = preview::prepare(&config.previews, &devices, snapshot_slot, stop.clone())?;
-        let recordings = recordings::Recordings::new(&config.recordings, devices.keys().cloned());
+        let recordings = recordings::Recordings::new(&config.recordings, devices.keys().cloned())?;
         Ok(Self {
             recordings,
             config,
@@ -241,7 +241,7 @@ impl Api {
             loop {
                 tokio::select! {
                     _=cleaning.stop.cancelled()=>return,
-                    _=tokio::time::sleep(Duration::from_secs(60))=>cleaning.recordings.clean().await,
+                    _=tokio::time::sleep(cleaning.recordings.cleanup_interval())=>cleaning.recordings.clean().await,
                 }
             }
         });
