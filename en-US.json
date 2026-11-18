@@ -138,5 +138,6 @@
   "reolink-bridge-HTTP_READINESS_FAILED": "The bridge is not ready for traffic.",
   "reolink-bridge-API_RECORDING_PREVIEW_FAILED": "The recording preview could not be prepared.",
   "reolink-bridge-API_PREVIEW_CAPTURE_FAILED": "The preview capture failed; any previous cached frame is retained.",
-  "reolink-bridge-API_RECORDING_METADATA_FAILED": "The recording metadata could not be read."
+  "reolink-bridge-API_RECORDING_METADATA_FAILED": "The recording metadata could not be read.",
+  "reolink-bridge-API_PREVIEW_CACHE_FAILED": "The Valkey preview cache operation failed; memory previews remain available."
 }

@@ -243,6 +243,9 @@ impl Api {
 
     pub fn attach(mut self, hub: Arc<Hub>, workers: &mut JoinSet<()>) -> Arc<Self> {
         self.hub = Some(hub.clone());
+        if let Some(store) = &self.recordings.thumbnail_store {
+            let _ = store.diagnostics.set(hub.diagnostics.clone());
+        }
         preview::start(&self.previews, hub, workers);
         let api = Arc::new(self);
         let cleaning = api.clone();

@@ -245,7 +245,7 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
 
     camera.reject_snapshots.store(true, Ordering::SeqCst);
     bridge.kill().await?;
-    let _restart = start(&config, &client, &origin).await?;
+    let mut restart = start(&config, &client, &origin).await?;
     if valkey.is_some() {
         let until = Instant::now() + Duration::from_secs(4);
         loop {
@@ -271,6 +271,30 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
                 .status(),
             503
         );
+    }
+    restart.kill().await?;
+    restart.wait().await?;
+    camera.reject_snapshots.store(false, Ordering::SeqCst);
+    let log_file = directory.path().join("cache-errors.jsonl");
+    let mut degraded: Value = serde_json::from_slice(&std::fs::read(&config)?)?;
+    degraded["api"]["previews"]["cache"] = json!({"backend":"valkey","url":"redis://127.0.0.1:1"});
+    degraded["logging"] = json!({"sinks":{"console":{"enabled":false},"file":{"enabled":true,"format":"json","path":log_file}}});
+    std::fs::write(&config, degraded.to_string())?;
+    let _degraded = start(&config, &client, &origin).await?;
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = client.get(&preview).bearer_auth(SERVICE).send().await?;
+        let logged = std::fs::read_to_string(&log_file)
+            .unwrap_or_default()
+            .contains("API_PREVIEW_CACHE_FAILED");
+        if frame.status().is_success() && logged {
+            break;
+        }
+        ensure!(
+            Instant::now() < until,
+            "Valkey failure must be logged while memory capture remains usable"
+        );
+        sleep(Duration::from_millis(40)).await;
     }
     Ok(())
 }

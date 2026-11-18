@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{Api, error};
-use crate::{http::CorrelationId, hub::Hub, reolink::wire::Device};
+use crate::{diagnostics::Diagnostics, http::CorrelationId, hub::Hub, reolink::wire::Device};
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(35);
 const CACHE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -97,6 +97,7 @@ pub(super) fn store(config: &Config) -> Result<Option<Arc<Valkey>>> {
                 client,
                 prefix: key_prefix.clone(),
                 connection: Mutex::new(None),
+                diagnostics: OnceLock::new(),
             }))
         }
     })
@@ -288,6 +289,7 @@ pub(super) struct Valkey {
     client: redis::Client,
     prefix: String,
     connection: Mutex<Option<MultiplexedConnection>>,
+    pub(super) diagnostics: OnceLock<Diagnostics>,
 }
 
 impl Valkey {
@@ -324,25 +326,39 @@ impl Valkey {
     }
 
     async fn command<T: FromRedisValue>(&self, cmd: &redis::Cmd) -> Option<T> {
-        timeout(CACHE_TIMEOUT, async {
+        let result = timeout(CACHE_TIMEOUT, async {
             let mut connection = self.connection.lock().await;
             if connection.is_none() {
                 let config = AsyncConnectionConfig::new().set_response_timeout(CACHE_TIMEOUT);
-                *connection = self
-                    .client
-                    .get_multiplexed_async_connection_with_config(&config)
-                    .await
-                    .ok();
+                *connection = Some(
+                    self.client
+                        .get_multiplexed_async_connection_with_config(&config)
+                        .await?,
+                );
             }
-            let result = cmd.query_async(connection.as_mut()?).await;
+            let result = cmd.query_async(connection.as_mut().unwrap()).await;
             if result.is_err() {
                 *connection = None;
             }
-            result.ok()
+            result
         })
-        .await
-        .ok()
-        .flatten()
+        .await;
+        let kind = match result {
+            Ok(Ok(value)) => return Some(value),
+            Ok(Err(error)) => format!("{:?}", error.kind()),
+            Err(_) => "timeout".into(),
+        };
+        if let Some(diagnostics) = self.diagnostics.get() {
+            // Do not log Redis URLs, credentials, commands, or raw error messages.
+            diagnostics.error(
+                "api::preview::cache",
+                "API_PREVIEW_CACHE_FAILED",
+                None,
+                json!({"backend":"valkey","failure":kind}),
+                None,
+            );
+        }
+        None
     }
 
     async fn load(&self, id: &str) -> Option<Frame> {
