@@ -77,7 +77,37 @@ pub fn router(app: Arc<App>, ws_path: &str) -> Router {
         .with_state(app.clone());
     routes
         .merge(crate::api::router(app.api.clone()))
+        .layer(middleware::from_fn_with_state(
+            app.api.clone(),
+            check_camera_identity,
+        ))
         .layer(middleware::from_fn_with_state(app.hub.clone(), correlate))
+}
+
+// Clients that track a physical camera can bind their request to the inventory they saw.
+async fn check_camera_identity(
+    State(api): State<Arc<crate::api::Api>>,
+    request: HttpRequest,
+    next: Next,
+) -> Response {
+    if let Some(expected) = request.headers().get("x-camera-stable-id")
+        && let Some((camera, _)) = request
+            .uri()
+            .path()
+            .strip_prefix("/api/cameras/")
+            .and_then(|route| route.split_once('/'))
+        && api.authenticated(request.headers())
+        && !expected
+            .to_str()
+            .is_ok_and(|value| api.camera_identity(camera) == Some(value))
+    {
+        let correlation = request
+            .extensions()
+            .get::<CorrelationId>()
+            .expect("request correlation");
+        return (StatusCode::CONFLICT, Json(json!({"ok":false,"errorKey":"API_CAMERA_IDENTITY_CHANGED","correlation_id":correlation.0}))).into_response();
+    }
+    next.run(request).await
 }
 
 const CORRELATION_HEADER: &str = "x-correlation-id";
@@ -315,7 +345,7 @@ async fn execute_camera(
         caller: "http::execute_camera",
         correlation: correlation.0,
     };
-    if !app.api.command_access(&headers, &camera_id) {
+    if !app.api.authenticated(&headers) {
         return errors.http(StatusCode::UNAUTHORIZED, "HTTP_CONTROL_AUTH_REQUIRED");
     }
     let Json(request) = match request {
@@ -387,8 +417,7 @@ async fn upgrade(
         caller: "http::upgrade",
         correlation: correlation.0,
     };
-    let primary = app.api.primary(&headers);
-    if !primary && !app.api.service(&headers) {
+    if !app.api.authenticated(&headers) {
         return errors.http(StatusCode::UNAUTHORIZED, "WEBSOCKET_AUTH_REQUIRED");
     }
     let upgrade = match upgrade {
@@ -398,7 +427,7 @@ async fn upgrade(
     upgrade
         .max_frame_size(32 * 1024)
         .max_message_size(32 * 1024)
-        .on_upgrade(move |socket| websocket(socket, app, headers, primary))
+        .on_upgrade(move |socket| websocket(socket, app))
         .into_response()
 }
 
@@ -433,7 +462,7 @@ enum Operation {
     },
 }
 
-async fn websocket(mut socket: WebSocket, app: Arc<App>, headers: HeaderMap, primary: bool) {
+async fn websocket(mut socket: WebSocket, app: Arc<App>) {
     let mut updates = app.hub.subscribe();
     let mut filter = None;
     let mut replies = FuturesUnordered::new();
@@ -443,7 +472,7 @@ async fn websocket(mut socket: WebSocket, app: Arc<App>, headers: HeaderMap, pri
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Text(message))) => {
-                        let Some(reply) = handle(&app, &message, &mut filter, &mut updates, &mut replies, &headers, primary).await else {
+                        let Some(reply) = handle(&app, &message, &mut filter, &mut updates, &mut replies).await else {
                             continue;
                         };
                         reply
@@ -496,8 +525,6 @@ async fn handle<'a>(
     filter: &mut Option<Filter>,
     updates: &mut broadcast::Receiver<Update>,
     replies: &mut PendingReplies<'a>,
-    headers: &HeaderMap,
-    primary: bool,
 ) -> Option<Value> {
     let correlation = Uuid::new_v4().to_string();
     let errors = RequestErrors {
@@ -518,30 +545,7 @@ async fn handle<'a>(
             return Some(reply);
         }
     };
-    let scoped = (!primary).then_some(app.api.as_ref());
-    let mut operation = request.operation;
-    if let Some(api) = scoped {
-        let permitted = match &mut operation {
-            Operation::Subscribe { filter } => api
-                .event_filter(filter.clone())
-                .map(|scope| *filter = scope)
-                .is_some(),
-            Operation::Snapshot => api.event_filter(Filter::default()).is_some(),
-            Operation::CallbacksList | Operation::CallbacksRemove { .. } => {
-                api.callback_allowed(false, None)
-            }
-            Operation::CallbacksAdd { callback } | Operation::CallbacksUpdate { callback } => {
-                api.callback_allowed(false, Some(&callback.url))
-            }
-            Operation::Control { camera_id, .. } => api.command_access(headers, camera_id),
-        };
-        if !permitted {
-            let mut reply = errors.reply("API_SCOPE_DENIED", None);
-            complete_ws_reply(&mut reply, request.id, correlation);
-            return Some(reply);
-        }
-    }
-    let mut reply = match operation {
+    let mut reply = match request.operation {
         Operation::Subscribe { filter: requested } => match requested.validate(&app.api.registered)
         {
             Ok(()) => {
@@ -553,10 +557,7 @@ async fn handle<'a>(
             Err(error) => errors.reply("WEBSOCKET_FILTER_INVALID", Some(error)),
         },
         Operation::Snapshot => {
-            let default = scoped
-                .and_then(|api| api.event_filter(Filter::default()))
-                .unwrap_or_default();
-            json!({"ok":true,"snapshots":snapshots(&app.hub, filter.as_ref().unwrap_or(&default))})
+            json!({"ok":true,"snapshots":snapshots(&app.hub, filter.as_ref().unwrap_or(&Filter::default()))})
         }
         Operation::CallbacksList => json!({"ok":true,"callbacks":app.hub.callbacks.list()}),
         Operation::CallbacksAdd { callback } => {

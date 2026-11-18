@@ -70,6 +70,7 @@ impl LiveEvent {
 
 #[derive(Default)]
 struct CameraState {
+    stable_id: String,
     snapshots: BTreeMap<String, Arc<Snapshot>>,
     online: bool,
     mqtt_ready: bool,
@@ -87,7 +88,7 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(
-        ids: &BTreeSet<String>,
+        identities: BTreeMap<String, String>,
         callbacks: Arc<Callbacks>,
         secrets: Vec<String>,
         diagnostics: Diagnostics,
@@ -95,8 +96,17 @@ impl Hub {
         let (updates, _) = broadcast::channel(256);
         Arc::new(Self {
             cameras: Mutex::new(
-                ids.iter()
-                    .map(|id| (id.clone(), CameraState::default()))
+                identities
+                    .into_iter()
+                    .map(|(id, stable_id)| {
+                        (
+                            id,
+                            CameraState {
+                                stable_id,
+                                ..CameraState::default()
+                            },
+                        )
+                    })
                     .collect(),
             ),
             updates,
@@ -138,6 +148,7 @@ impl Hub {
 
     fn store(&self, camera: &mut CameraState, id: &str, topic: &str, mut payload: Value) {
         xml::redact(&mut payload, &self.secrets);
+        payload["stable_id"] = json!(camera.stable_id);
         let snapshot = Arc::new(Snapshot {
             camera_id: id.into(),
             topic: topic.into(),
@@ -206,6 +217,7 @@ impl Hub {
         {
             let mut all = self.cameras.lock().unwrap();
             let camera = all.get_mut(id).unwrap();
+            payload["stable_id"] = json!(camera.stable_id);
             if camera.observed.len() < 256 && !camera.observed.contains_key(&vendor_topic) {
                 camera
                     .observed

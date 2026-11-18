@@ -82,7 +82,7 @@ pub async fn get(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !api.read_access(&headers, &id) {
+    if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     let Some(profile) = api

@@ -255,7 +255,7 @@ async fn local_broker_http_websocket_and_camera_controls() {
     let inventory: Value = serde_json::from_str(&inventory).unwrap();
     assert_eq!(
         inventory["cameras"],
-        json!([{"id":"fixed","active":true},{"id":"lab","active":true}])
+        json!([{"id":"fixed","stableId":"fixed","active":true},{"id":"lab","stableId":"lab","active":true}])
     );
     let (status, live) = probe(&http, address, "/livez").await;
     assert_eq!(status, StatusCode::OK);

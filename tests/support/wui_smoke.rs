@@ -32,7 +32,7 @@ pub async fn run(directory: &Path, bridge: &str, broker: u16, client: &Client) -
         "database":{"driver":"sqlite","path":directory.join("wui.sqlite")},
         "bridges":[{
             "label":"Test bridge","id":"fixture","commands":"http","events":["api","ws","mqtt"],"capture":"mqtt",
-            "http":{"url":bridge,"token":super::SERVICE,"adminToken":super::ADMIN},
+            "http":{"url":bridge,"token":super::PRIMARY},
             "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"}
         }]
     }).to_string())?;

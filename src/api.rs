@@ -45,15 +45,7 @@ use credentials::{
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
-    pub service_token: Option<String>,
-    pub admin_token: Option<String>,
     pub storage_directory: Option<PathBuf>,
-    // An explicit list limits the scoped service token and credential operations.
-    pub camera_ids: Option<BTreeSet<String>>,
-    #[serde(default)]
-    pub commands: bool,
-    #[serde(default)]
-    pub events: bool,
     #[serde(default)]
     pub callback_destinations: BTreeSet<Url>,
     #[serde(default)]
@@ -74,6 +66,7 @@ pub struct Api {
     vault: Option<Mutex<Vault>>,
     configured: BTreeSet<String>,
     pub registered: BTreeSet<String>,
+    identities: BTreeMap<String, String>,
     active: BTreeSet<String>,
     devices: BTreeMap<String, Device>,
     previews: preview::Previews,
@@ -92,32 +85,17 @@ impl Api {
         snapshot_slot: Arc<Semaphore>,
         stop: CancellationToken,
     ) -> Result<Self> {
-        let safe = |token: &str| {
-            (24..=256).contains(&token.len()) && token.bytes().all(|b| (33..=126).contains(&b))
-        };
-        ensure!(
-            config
-                .service_token
-                .as_ref()
-                .is_none_or(|token| safe(token) && token != http_token),
-            "invalid or reused API service token"
-        );
-        ensure!(
-            config.admin_token.as_ref().is_none_or(|token| safe(token)
-                && token != http_token
-                && Some(token) != config.service_token.as_ref()),
-            "invalid or reused API admin token"
-        );
-        ensure!(
-            config.admin_token.is_some() == config.storage_directory.is_some(),
-            "API admin requires a private vault"
-        );
         ensure!(
             (config.targets.is_empty() && config.rotation_ids.is_empty())
-                || config.admin_token.is_some(),
-            "API credential management requires an admin token"
+                || config.storage_directory.is_some(),
+            "camera provisioning and credential rotation require api.storageDirectory"
         );
         let configured: BTreeSet<_> = cameras.iter().map(|cam| cam.id.clone()).collect();
+        let mut identities: BTreeMap<_, _> = cameras
+            .iter()
+            .map(|c| (c.id.clone(), c.identity().to_owned()))
+            .collect();
+        let stable_ids: BTreeSet<_> = identities.values().cloned().collect();
         let mut addresses = BTreeSet::new();
         let mut target_ids = BTreeSet::new();
         ensure!(
@@ -126,6 +104,7 @@ impl Api {
                     valid_id(id)
                         && valid_id(&target.camera_id)
                         && !configured.contains(&target.camera_id)
+                        && !stable_ids.contains(&target.camera_id)
                         && target_ids.insert(target.camera_id.clone())
                         && target.port != 0
                         && (target.host.is_private()
@@ -184,18 +163,18 @@ impl Api {
             .transpose()?;
         let mut registered = configured.clone();
         if let Some(vault) = &vault {
-            vault.configure(cameras)?;
-            registered.extend(vault.registered().cloned());
+            vault.configure(cameras, &config.targets)?;
+            for stable in vault.registered().filter(|id| target_ids.contains(*id)) {
+                ensure!(
+                    registered.insert(stable.clone()),
+                    "configured camera ID collides with a vaulted camera"
+                );
+                identities.insert(stable.clone(), stable.clone());
+            }
         }
         ensure!(
-            config
-                .camera_ids
-                .as_ref()
-                .is_none_or(|cameras| !cameras.is_empty()
-                    && cameras
-                        .iter()
-                        .all(|id| configured.contains(id) || target_ids.contains(id))),
-            "invalid API camera scope"
+            cameras.iter().all(|camera| camera.password.is_some()),
+            "camera requires cameras[].password or a matching verified vault credential"
         );
         let active = cameras.iter().map(|cam| cam.id.clone()).collect();
         let devices: BTreeMap<String, Device> = cameras
@@ -217,6 +196,7 @@ impl Api {
         let previews = preview::prepare(
             &config.previews,
             &devices,
+            &identities,
             snapshot_slot,
             stop.clone(),
             store.clone(),
@@ -229,8 +209,9 @@ impl Api {
             config,
             http_token: http_token.to_owned(),
             vault: vault.map(Mutex::new),
-            configured,
+            configured: stable_ids,
             registered,
+            identities,
             active,
             devices,
             previews,
@@ -239,6 +220,19 @@ impl Api {
             settings_slots: Semaphore::new(8),
             stop,
         })
+    }
+
+    fn enrollment_progress(&self, vault: &Vault, id: Uuid) -> Option<(Status, Option<String>)> {
+        vault.progress(id, |stable| {
+            self.active
+                .iter()
+                .find(|public| self.identities[*public] == stable)
+                .cloned()
+        })
+    }
+
+    pub fn camera_identity(&self, id: &str) -> Option<&str> {
+        self.identities.get(id).map(String::as_str)
     }
 
     pub fn attach(mut self, hub: Arc<Hub>, workers: &mut JoinSet<()>) -> Arc<Self> {
@@ -260,64 +254,16 @@ impl Api {
         api
     }
 
-    fn allows(&self, id: &str) -> bool {
-        self.config
-            .camera_ids
-            .as_ref()
-            .is_none_or(|ids| ids.contains(id))
-    }
-
-    pub fn primary(&self, headers: &HeaderMap) -> bool {
+    pub fn authenticated(&self, headers: &HeaderMap) -> bool {
         authorized(headers, &self.http_token)
     }
 
-    pub fn service(&self, headers: &HeaderMap) -> bool {
-        self.config
-            .service_token
-            .as_ref()
-            .is_some_and(|token| authorized(headers, token))
-    }
-
-    fn read_access(&self, headers: &HeaderMap, camera: &str) -> bool {
-        self.primary(headers) || (self.service(headers) && self.allows(camera))
-    }
-    fn admin(&self, headers: &HeaderMap) -> bool {
-        self.config
-            .admin_token
-            .as_ref()
-            .is_some_and(|token| authorized(headers, token))
-    }
     fn hub(&self) -> &Hub {
         self.hub.as_ref().unwrap()
     }
 
-    pub fn command_access(&self, headers: &HeaderMap, camera: &str) -> bool {
-        self.primary(headers)
-            || (self.config.commands && self.service(headers) && self.allows(camera))
-    }
-
-    pub fn event_filter(&self, mut filter: crate::config::Filter) -> Option<crate::config::Filter> {
-        if !self.config.events || filter.cameras.iter().any(|id| !self.allows(id)) {
-            return None;
-        }
-        if filter.cameras.is_empty() {
-            let scoped: Vec<_> = self
-                .registered
-                .iter()
-                .filter(|id| self.allows(id))
-                .cloned()
-                .collect();
-            if scoped.is_empty() && !self.registered.is_empty() {
-                return None;
-            }
-            filter.cameras = scoped;
-        }
-        Some(filter)
-    }
-
-    pub fn callback_allowed(&self, primary: bool, destination: Option<&Url>) -> bool {
-        (primary || self.config.camera_ids.is_none())
-            && !self.config.callback_destinations.is_empty()
+    fn callback_allowed(&self, destination: Option<&Url>) -> bool {
+        !self.config.callback_destinations.is_empty()
             && destination.is_none_or(|url| self.config.callback_destinations.contains(url))
     }
 }
@@ -384,28 +330,29 @@ async fn contract(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    let primary = api.primary(&headers);
-    if !primary && !api.service(&headers) {
+    if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     let profiles: Map<String, Value> = api
         .config
         .media
         .iter()
-        .filter(|(id, _)| {
-            api.active.contains(*id) && api.devices.contains_key(*id) && (primary || api.allows(id))
-        })
+        .filter(|(id, _)| api.active.contains(*id) && api.devices.contains_key(*id))
         .map(|(id, profile)| (id.clone(), json!(profile.streams)))
         .collect();
-    let recordings_available = api.recordings.available();
-    Json(json!({"version":1,"eventStream":primary || api.config.events,"media":!profiles.is_empty(),"mediaCameras":profiles,
-       "storageCameras":api.devices.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
-       "recordingPreviewCameras":api.devices.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
-       "recordingMetadataCameras":api.devices.keys().filter(|id| recordings_available && (primary || api.allows(id))).collect::<Vec<_>>(),
-       "recordingsCameras":api.devices.keys().filter(|id| recordings_available && (primary || api.allows(id))).collect::<Vec<_>>(),
+    let recordings = if api.recordings.available() {
+        api.devices.keys().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    Json(json!({"version":1,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
+       "storageCameras":api.devices.keys().collect::<Vec<_>>(),
+       "recordingPreviewCameras":api.devices.keys().collect::<Vec<_>>(),
+       "recordingMetadataCameras":recordings,
+       "recordingsCameras":recordings,
        "previewNotifications":true,
-       "previewCameras":api.previews.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
-       "enrollment":api.vault.is_some(),"inventory":true,"callbacks":api.callback_allowed(primary, None),"settings":["leds","spotlight","motion","ai","image"],"alerts":["motion"],
+       "previewCameras":api.previews.keys().collect::<Vec<_>>(),
+       "enrollment":api.vault.is_some(),"inventory":true,"callbacks":api.callback_allowed(None),"settings":["leds","spotlight","motion","ai","image"],"alerts":["motion"],
        "correlation_id":correlation.0})).into_response()
 }
 
@@ -414,11 +361,10 @@ async fn inventory(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    let primary = api.primary(&headers);
-    if !primary && !api.service(&headers) {
+    if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    Json(json!({"cameras":api.registered.iter().filter(|id| primary || api.allows(id)).map(|id| json!({"id":id,"active":api.active.contains(id)})).collect::<Vec<_>>(), "correlation_id":correlation.0})).into_response()
+    Json(json!({"cameras":api.registered.iter().map(|id| json!({"id":id,"stableId":api.identities[id],"active":api.active.contains(id)})).collect::<Vec<_>>(), "correlation_id":correlation.0})).into_response()
 }
 
 async fn callbacks(
@@ -426,11 +372,10 @@ async fn callbacks(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    let primary = api.primary(&headers);
-    if !primary && !api.service(&headers) {
+    if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    if !api.callback_allowed(primary, None) {
+    if !api.callback_allowed(None) {
         return error(
             StatusCode::FORBIDDEN,
             "CALLBACK_DESTINATION_DENIED",
@@ -500,15 +445,14 @@ async fn change_callback(
     correlation: &CorrelationId,
     edit: CallbackEdit,
 ) -> Response {
-    let primary = api.primary(headers);
-    if !primary && !api.service(headers) {
+    if !api.authenticated(headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", correlation);
     }
     let destination = match &edit {
         CallbackEdit::Add(callback) | CallbackEdit::Update(callback) => Some(&callback.url),
         CallbackEdit::Remove(_) => None,
     };
-    if !api.callback_allowed(primary, destination) {
+    if !api.callback_allowed(destination) {
         return error(
             StatusCode::FORBIDDEN,
             "CALLBACK_DESTINATION_DENIED",
@@ -536,7 +480,7 @@ async fn settings(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !api.read_access(&headers, &id) {
+    if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     let Some(device) = api.devices.get(&id) else {
@@ -624,8 +568,8 @@ async fn targets(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !api.admin(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
+    if !api.authenticated(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     Json(json!({"targets":api.config.targets.keys().collect::<Vec<_>>(),"correlation_id":correlation.0})).into_response()
 }
@@ -636,8 +580,8 @@ async fn enroll(
     Extension(correlation): Extension<CorrelationId>,
     Json(body): Json<EnrollmentRequest>,
 ) -> Response {
-    if !api.admin(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
+    if !api.authenticated(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     let Some(vault) = &api.vault else {
         return error(
@@ -672,8 +616,8 @@ async fn enrollment_status(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !api.admin(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
+    if !api.authenticated(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     let Some(vault) = &api.vault else {
         return error(
@@ -685,7 +629,7 @@ async fn enrollment_status(
     let Ok(vault) = vault.try_lock() else {
         return progress(Status::InProgress, None, &correlation);
     };
-    match vault.progress(id, &api.active) {
+    match api.enrollment_progress(&vault, id) {
         Some((state, camera)) => progress(state, camera, &correlation),
         None => error(
             StatusCode::NOT_FOUND,
@@ -707,8 +651,8 @@ async fn resume(
     Extension(correlation): Extension<CorrelationId>,
     Json(body): Json<Resume>,
 ) -> Response {
-    if !api.admin(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
+    if !api.authenticated(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     let Some(vault) = &api.vault else {
         return error(
@@ -740,7 +684,7 @@ async fn finish_enrollment(
     import: bool,
     correlation: &CorrelationId,
 ) -> Response {
-    if vault.progress(id, &api.active).is_none() {
+    if api.enrollment_progress(vault, id).is_none() {
         return error(StatusCode::NOT_FOUND, "API_ENROLLMENT_UNKNOWN", correlation);
     }
     if !matches!(
@@ -757,7 +701,7 @@ async fn finish_enrollment(
             correlation,
         );
     }
-    let (status, camera) = vault.progress(id, &api.active).unwrap();
+    let (status, camera) = api.enrollment_progress(vault, id).unwrap();
     progress(status, camera, correlation)
 }
 
@@ -774,9 +718,16 @@ async fn rotation_status(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !api.admin(&headers) || !api.allows(&id) {
-        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
+    if !api.authenticated(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
+    let Some(stable) = api.camera_identity(&id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "API_ROTATION_UNSUPPORTED",
+            &correlation,
+        );
+    };
     let Some(vault) = &api.vault else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -788,7 +739,7 @@ async fn rotation_status(
         return progress(Status::InProgress, None, &correlation);
     };
     progress(
-        vault.rotation_progress(&id, &api.devices),
+        vault.rotation_progress(stable, api.devices.get(&id)),
         None,
         &correlation,
     )
@@ -801,8 +752,8 @@ async fn rotate(
     Extension(correlation): Extension<CorrelationId>,
     Json(body): Json<Rotate>,
 ) -> Response {
-    if !api.admin(&headers) || !api.allows(&id) {
-        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
+    if !api.authenticated(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     if !body.confirmation || body.id.get_version_num() != 4 {
         return error(
@@ -811,6 +762,13 @@ async fn rotate(
             &correlation,
         );
     }
+    let Some(stable) = api.camera_identity(&id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "API_ROTATION_UNSUPPORTED",
+            &correlation,
+        );
+    };
     let Some(vault) = &api.vault else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -825,13 +783,13 @@ async fn rotate(
             &correlation,
         );
     };
-    if vault.rotation_progress(&id, &api.devices) == Status::RestartRequired {
+    if vault.rotation_progress(stable, api.devices.get(&id)) == Status::RestartRequired {
         return progress(Status::RestartRequired, None, &correlation);
     }
-    let old = vault.credential(&id).or_else(|| {
+    let old = vault.credential(stable).or_else(|| {
         let device = api.devices.get(&id)?;
         Some(Credential {
-            id: id.clone(),
+            id: stable.to_owned(),
             host: device.host.clone(),
             port: device.port,
             channel: device.channel,
@@ -849,10 +807,10 @@ async fn rotate(
         );
     };
     if !matches!(
-        timeout(Duration::from_secs(53), vault.rotate(&id, body.id, old)).await,
+        timeout(Duration::from_secs(53), vault.rotate(stable, body.id, old)).await,
         Ok(Ok(()))
     ) {
-        let status = vault.rotation_progress(&id, &api.devices);
+        let status = vault.rotation_progress(stable, api.devices.get(&id));
         if matches!(status, Status::InProgress | Status::RecoveryRequired) {
             return progress(status, None, &correlation);
         }
@@ -863,7 +821,7 @@ async fn rotate(
         );
     }
     progress(
-        vault.rotation_progress(&id, &api.devices),
+        vault.rotation_progress(stable, api.devices.get(&id)),
         None,
         &correlation,
     )
@@ -876,8 +834,8 @@ async fn reconcile_rotation(
     Extension(correlation): Extension<CorrelationId>,
     Json(body): Json<Rotate>,
 ) -> Response {
-    if !api.admin(&headers) || !api.allows(&id) {
-        return error(StatusCode::UNAUTHORIZED, "API_ADMIN_REQUIRED", &correlation);
+    if !api.authenticated(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     if !body.confirmation || body.id.get_version_num() != 4 {
         return error(
@@ -886,6 +844,13 @@ async fn reconcile_rotation(
             &correlation,
         );
     }
+    let Some(stable) = api.camera_identity(&id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "API_ROTATION_UNSUPPORTED",
+            &correlation,
+        );
+    };
     let Some(vault) = &api.vault else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -901,7 +866,7 @@ async fn reconcile_rotation(
         );
     };
     if !matches!(
-        timeout(Duration::from_secs(33), vault.reconcile(&id)).await,
+        timeout(Duration::from_secs(33), vault.reconcile(stable)).await,
         Ok(Ok(()))
     ) {
         return error(
@@ -911,7 +876,7 @@ async fn reconcile_rotation(
         );
     }
     progress(
-        vault.rotation_progress(&id, &api.devices),
+        vault.rotation_progress(stable, api.devices.get(&id)),
         None,
         &correlation,
     )

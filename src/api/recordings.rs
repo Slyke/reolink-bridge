@@ -385,7 +385,7 @@ pub(super) async fn metadata(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !api.read_access(&headers, &camera) {
+    if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     let Some(device) = api.devices.get(&camera) else {
@@ -448,7 +448,7 @@ pub(super) async fn storage(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !api.read_access(&headers, &camera) {
+    if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     let Some(device) = api.devices.get(&camera) else {
@@ -525,7 +525,7 @@ pub(super) async fn list(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !api.read_access(&headers, &camera) {
+    if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     if !matches!(query.stream.as_str(), "main" | "sub") {
@@ -582,7 +582,7 @@ pub(super) async fn video(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !api.read_access(&headers, &camera) {
+    if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     let Some(device) = api.devices.get(&camera) else {

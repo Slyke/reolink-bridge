@@ -1,18 +1,11 @@
 # HTTP API
 
-The authenticated API is available under `/api` on the bridge's HTTP listener. Send `http.token` as a bearer token. Inventory is available with the standard bridge configuration. Use the optional `api` section for cached previews, video profiles, restricted credentials, and enrollment.
+The authenticated API is available under `/api` on the bridge's HTTP listener. Send `http.token` as a bearer token. Inventory is available with the standard bridge configuration. Use the optional `api` section for cached previews, video profiles, recording storage, and enrollment.
 
 ```json5
 api: {
-  // Optional scoped alternative to http.token.
-  serviceToken: "${BRIDGE_API_SERVICE_TOKEN}",
-  // Omit adminToken/storageDirectory for viewing and controls only.
-  adminToken: "${BRIDGE_API_ADMIN_TOKEN}",
+  // For provisioning and camera password rotation, mount persistent storage at this path.
   storageDirectory: "./local-only/vault",
-  // Omit cameraIds on a dedicated bridge, or list allowed camera IDs.
-  cameraIds: ["entrance", "new-camera"],
-  commands: true,
-  // events: true, // Allow this scoped token to subscribe via WS or HTTP events.
   targets: {
     staging: { host: "192.0.2.2", port: 9000, cameraId: "new-camera" },
   },
@@ -29,27 +22,27 @@ api: {
 }
 ```
 
-Replace the documentation address with a private IPv4 target from the installation network. Configure restricted egress; enrollment accepts only configured RFC1918, link-local or loopback addresses. Use private TLS, a dedicated admin token, and a directory protected with mode 0700. Store the vault on a persistent local filesystem with atomic rename and durable sync. The bridge stages and verifies credentials in this directory. API callers never receive camera credentials. Files are mode 0600. Back up the vault as sensitive material separately from the bridge configuration.
+Replace the documentation address with a private IPv4 target from the installation network. Configure restricted egress; enrollment accepts only configured RFC1918, link-local or loopback addresses. Use private TLS and a credential directory protected with mode 0700. Store the vault on a persistent local filesystem with atomic rename and durable sync. The bridge stages and verifies credentials in this directory. API callers never receive camera credentials. Files are mode 0600. Back up the vault as sensitive material separately from the bridge configuration.
 
 | Method and path under `/api` | Credential | Behavior |
 | --- | --- | --- |
-| GET `/contract` | HTTP or scoped service token | Contract version and configured inventory, settings, media, callback, and enrollment capabilities. |
-| GET `/inventory` | HTTP or scoped service token | Registered camera IDs within scope, including devices paused for credential recovery. |
-| POST `/cameras/{id}/command/exec` | HTTP or scoped service token with `commands` | Typed command. [Camera controls](./controls.md) |
-| GET/POST `/callbacks` | Callback access | List or add callback delivery rules. |
-| PUT/DELETE `/callbacks/{id}` | Callback access | Update or delete a rule. Use the same ID in the URL and the update body. |
-| GET `/cameras/{id}/settings/{group}` | HTTP or scoped service token | Fresh allowlisted setting values for `leds`, `spotlight`, `motion`, or `ai` and `image`, without raw vendor XML. Writes use the existing typed command interface. |
-| GET/HEAD `/cameras/{id}/preview` | HTTP or scoped service token | Latest cached JPEG or its headers. Supports `If-None-Match` and returns `304` when the image is unchanged. |
-| GET `/cameras/{id}/storage` | HTTP or scoped service token | Card capacity, used/free bytes, readiness, and the camera's local clock. |
-| GET `/cameras/{id}/recordings?date=YYYY-MM-DD&stream=sub` | HTTP or scoped service token | Search a camera-local day. The stream can be `main` or `sub`. Returns opaque recording IDs. |
-| GET `/cameras/{id}/recordings/{recordingId}/video` | HTTP or scoped service token | Browser-playable MP4 with HTTP byte ranges for seeking. Search first to obtain the recording ID. |
-| GET `/cameras/{id}/recordings/{recordingId}/metadata` | HTTP or scoped service token | Timestamped object coordinates from the prepared recording, when embedded by the camera. Shares the video download/cache. |
-| GET `/cameras/{id}/recordings/{recordingId}/preview` | HTTP or scoped service token | JPEG keyframe preview. Optional offsetMs selects a position within the clip (0–86400000, one-second buckets). Search first to obtain the ID. Does not require a writable recording workspace. |
-| GET `/cameras/{id}/media/{stream}` | HTTP or scoped service token | Bounded multipart MJPEG stream from configured H.264 RTSP/TCP. FFmpeg is required in the private bridge environment. The RTSP client owns credentials; FFmpeg receives elementary video bytes. |
-| GET `/enrollment-targets` | admin | Allowlisted target names. |
-| POST `/enrollments` | admin | Reserve and begin a UUID operation with target, separate `uid` and/or `serial`, `method` (`initialize` or `import`), and `confirmation: true`. First-password flow requires a UID. |
-| GET `/enrollments/{id}` and POST `/enrollments/{id}/resume` | admin | Read or continue the persisted operation. Use `{"method":"import"}` after the local setup fallback. |
-| GET/POST `/cameras/{id}/rotation` and POST `/cameras/{id}/rotation/reconcile` | admin | Check status, stage and submit one verified-device change, or verify the staged and previous credentials. POST requires UUID `id` and `confirmation: true`. |
+| GET `/contract` | `http.token` | Contract version and configured inventory, settings, media, callback, and enrollment capabilities. |
+| GET `/inventory` | `http.token` | Registered public IDs, stable identities and activation status. Devices paused for credential recovery remain visible. |
+| POST `/cameras/{id}/command/exec` | `http.token` | Typed command. [Camera controls](./controls.md) |
+| GET/POST `/callbacks` | `http.token` | List or add callback delivery rules. |
+| PUT/DELETE `/callbacks/{id}` | `http.token` | Update or delete a rule. Use the same ID in the URL and the update body. |
+| GET `/cameras/{id}/settings/{group}` | `http.token` | Fresh allowlisted setting values for `leds`, `spotlight`, `motion`, or `ai` and `image`, without raw vendor XML. Writes use the existing typed command interface. |
+| GET/HEAD `/cameras/{id}/preview` | `http.token` | Latest cached JPEG or its headers. Supports `If-None-Match` and returns `304` when the image is unchanged. |
+| GET `/cameras/{id}/storage` | `http.token` | Card capacity, used/free bytes, readiness, and the camera's local clock. |
+| GET `/cameras/{id}/recordings?date=YYYY-MM-DD&stream=sub` | `http.token` | Search a camera-local day. The stream can be `main` or `sub`. Returns opaque recording IDs. |
+| GET `/cameras/{id}/recordings/{recordingId}/video` | `http.token` | Browser-playable MP4 with HTTP byte ranges for seeking. Search first to obtain the recording ID. |
+| GET `/cameras/{id}/recordings/{recordingId}/metadata` | `http.token` | Timestamped object coordinates from the prepared recording, when embedded by the camera. Shares the video download/cache. |
+| GET `/cameras/{id}/recordings/{recordingId}/preview` | `http.token` | JPEG keyframe preview. Optional offsetMs selects a position within the clip (0–86400000, one-second buckets). Search first to obtain the ID. Does not require a writable recording workspace. |
+| GET `/cameras/{id}/media/{stream}` | `http.token` | Bounded multipart MJPEG stream from configured H.264 RTSP/TCP. FFmpeg is required in the private bridge environment. The RTSP client owns credentials; FFmpeg receives elementary video bytes. |
+| GET `/enrollment-targets` | `http.token` | Allowlisted target names. |
+| POST `/enrollments` | `http.token` | Reserve and begin a UUID operation with target, separate `uid` and/or `serial`, `method` (`initialize` or `import`), and `confirmation: true`. First-password flow requires a UID. |
+| GET `/enrollments/{id}` and POST `/enrollments/{id}/resume` | `http.token` | Read or continue the persisted operation. Use `{"method":"import"}` after the local setup fallback. |
+| GET/POST `/cameras/{id}/rotation` and POST `/cameras/{id}/rotation/reconcile` | `http.token` | Check status, stage and submit one verified-device change, or verify the staged and previous credentials. POST requires UUID `id` and `confirmation: true`. |
 
 ## Background camera previews
 
@@ -67,7 +60,7 @@ The bridge serves its in-memory frame if the Valkey connection drops.
 
 ## HTTP event stream
 
-`GET /api/events` accepts the primary HTTP token or a scoped service token with `api.events: true`. Optional comma-separated `cameras` and `events` query parameters use the same camera and event filters as WebSocket subscriptions. Scoped credentials apply their camera allowlist to every snapshot and event.
+`GET /api/events` uses `http.token`. Optional comma-separated `cameras` and `events` query parameters use the same camera and event filters as WebSocket subscriptions.
 
 The response is `text/event-stream`. Each SSE data message contains one JSON object. The initial `{"op":"ready","snapshots":[...]}` message supplies cached state, followed by the existing `snapshot` and `event` update envelopes. A `{"op":"gap","snapshots":[...]}` message reports a subscriber backlog and refreshes current state. Comment heartbeats are sent every eight seconds. Reconnect to obtain a new state snapshot after a disconnect.
 
@@ -75,9 +68,19 @@ The stream reads the bridge's event hub. Connections share its existing camera s
 
 ## Authorization and enrollment
 
-The optional `api.serviceToken` accepts `api.cameraIds` as an allowlist. Enable `api.commands` to permit typed commands and `api.events` to permit WebSocket and HTTP event subscriptions with that token. `api.adminToken` is required for enrollment and credential rotation. Each extra token must be distinct from `http.token` and at least 24 characters long. MQTT access is administered with broker ACLs.
+The bridge authenticates HTTP and WebSocket clients with one PSK, `http.token`. A client holding that PSK can call the enabled operations for every configured camera. Applications manage user accounts and per-camera permissions. MQTT uses the broker's credentials and ACLs. When upgrading, point clients at the existing `http.token` and remove the retired `api.serviceToken`, `api.adminToken`, `api.cameraIds`, `api.commands`, and `api.events` fields.
 
-To enable HTTP callback administration set `api.callbackDestinations` to a list of exact receiver URLs. Use `http.token` or a service token with no camera allowlist. The `POST` and `PUT` bodies use the same `id`, `url`, `cameras` and `events` fields as static `callbacks` entries. Updates replace the bridge configuration file atomically, which requires a writable config directory. The callback HTTP client refuses redirects. [Callback delivery and filters](./interfaces.md#manage-downstream-callbacks)
+`api.storageDirectory` holds verified camera credentials and recoverable enrollment and password-rotation operations. Configure it when using `api.targets` or `api.rotationIds`. Generating a Wi-Fi QR in a client and using statically configured camera credentials needs no vault. Keep the directory after bridge-managed provisioning if it supplies the camera password. `api.recordings.temporaryDirectory` is the disposable video cache.
+
+### Camera IDs and ConfigMap handoff
+
+The public `cameras[].id` names HTTP paths, event filters, MQTT topics and preview/media profiles. The optional `cameras[].stableId` identifies the same camera within this bridge across public ID changes. It defaults to the initial public ID. For example, to move `lumus` to `garage`, edit its existing entry to include `id: "garage", stableId: "lumus"` and carry forward its connection settings. Rename its keys in `api.previews.cameras`, `api.media`, `api.rotationIds`, and any callback camera filters or MQTT subscriptions that reference the old name. Keep the same stable ID for future moves. Use a fresh stable ID when assigning a former name to a different camera.
+
+After enrollment, add the static camera entry with the original target's `cameraId` as its stable ID and the same host, Baichuan port, channel and username. Remove its provisioning target. The bridge resolves the password from the verified vault entry when the static entry omits `password`. Removing both entries takes the camera out of service on restart. Adding it back with the same stable ID restores its binding. Existing retained messages under an old MQTT topic can be cleared using the broker's normal procedures.
+
+Inventory returns `id` and `stableId`. State and event payloads include `camera_id` and `stable_id`. A client can bind a camera HTTP request with the `X-Camera-Stable-Id` header or an MQTT command with the optional `stable_id` field. The bridge rejects a mismatched identity before executing the request.
+
+To enable HTTP callback administration set `api.callbackDestinations` to a list of exact receiver URLs. Authenticate with `http.token`. The `POST` and `PUT` bodies use the same `id`, `url`, `cameras` and `events` fields as static `callbacks` entries. Updates replace the bridge configuration file atomically, which requires a writable config directory. The callback HTTP client refuses redirects. [Callback delivery and filters](./interfaces.md#manage-downstream-callbacks)
 
 The former `wui` config key is accepted as an alias for `api` during upgrades. Clients should use the paths in the table.
 

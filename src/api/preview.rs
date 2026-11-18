@@ -106,6 +106,7 @@ pub(super) fn store(config: &Config) -> Result<Option<Arc<Valkey>>> {
 pub(super) fn prepare(
     config: &Config,
     devices: &BTreeMap<String, Device>,
+    identities: &BTreeMap<String, String>,
     slots: Arc<Semaphore>,
     stop: CancellationToken,
     store: Option<Arc<Valkey>>,
@@ -115,6 +116,7 @@ pub(super) fn prepare(
         .iter()
         .filter_map(|(id, profile)| {
             let device = devices.get(id)?.clone();
+            let stable = identities.get(id)?;
             let origin = Sha256::digest(format!(
                 "{}:{}:{}",
                 device.host, device.port, device.channel
@@ -126,7 +128,7 @@ pub(super) fn prepare(
                     camera_id: id.clone(),
                     hub: OnceLock::new(),
                     interval: Duration::from_millis(profile.interval_ms),
-                    cache_id: format!("{id}:{origin:x}"),
+                    cache_id: format!("{stable}:{origin:x}"),
                     store: store.clone(),
                     slots: slots.clone(),
                     stop: stop.clone(),
@@ -402,7 +404,7 @@ pub(super) async fn get(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !api.read_access(&headers, &id) {
+    if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     let Some(preview) = api.previews.get(&id) else {

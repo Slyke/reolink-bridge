@@ -93,6 +93,7 @@ fn websocket_path() -> String {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Camera {
     pub id: String,
+    pub stable_id: Option<String>,
     pub host: String,
     pub username: String,
     pub password: Option<String>,
@@ -110,6 +111,12 @@ pub struct Camera {
     pub native_webhook: Option<NativeWebhook>,
     #[serde(default)]
     pub ptz: PtzMode,
+}
+
+impl Camera {
+    pub fn identity(&self) -> &str {
+        self.stable_id.as_deref().unwrap_or(&self.id)
+    }
 }
 
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -255,6 +262,20 @@ pub fn parse(mut document: Value, environment: &impl Fn(&str) -> Option<String>)
     // and legacy environment overrides once, including for structured startup failures.
     if let Some(fields) = document.as_object_mut() {
         fields.remove("logging");
+        // Old manifests may still reference retired credentials. Only http.token authenticates clients.
+        for name in ["api", "wui"] {
+            if let Some(api) = fields.get_mut(name).and_then(Value::as_object_mut) {
+                for retired in [
+                    "serviceToken",
+                    "adminToken",
+                    "cameraIds",
+                    "commands",
+                    "events",
+                ] {
+                    api.remove(retired);
+                }
+            }
+        }
     }
     let raw = document.clone();
     resolve_environment_references(&mut document, environment);
@@ -336,18 +357,34 @@ pub fn parse(mut document: Value, environment: &impl Fn(&str) -> Option<String>)
         "configure at least one camera"
     );
     let mut ids = BTreeSet::new();
+    let mut identities = BTreeSet::new();
     for (index, camera) in config.cameras.iter_mut().enumerate() {
         ensure!(
             valid_id(&camera.id) && ids.insert(camera.id.clone()),
             "invalid or duplicate camera ID"
         );
-        camera.password = Some(required_secret(
-            camera.password.take(),
-            camera.password_env.take(),
-            &raw["cameras"][index]["password"],
-            "cameras[].password",
-            environment,
-        )?);
+        ensure!(
+            valid_id(camera.identity()) && identities.insert(camera.identity().to_owned()),
+            "invalid or duplicate camera stableId"
+        );
+        // A verified credential from this bridge can supply the password when a provisioned
+        // camera moves into the static configuration. Explicit secret references must still resolve.
+        if !raw["cameras"][index]["password"].is_null()
+            || camera.password_env.is_some()
+            || config
+                .api
+                .as_ref()
+                .and_then(|api| api.storage_directory.as_ref())
+                .is_none()
+        {
+            camera.password = Some(required_secret(
+                camera.password.take(),
+                camera.password_env.take(),
+                &raw["cameras"][index]["password"],
+                "cameras[].password",
+                environment,
+            )?);
+        }
         ensure!(
             camera.channel < 100
                 && !camera.username.is_empty()

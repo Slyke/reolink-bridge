@@ -211,16 +211,37 @@ impl Vault {
         Ok(())
     }
 
-    pub fn configure(&self, cameras: &mut Vec<Camera>) -> Result<()> {
-        let mut known: BTreeSet<_> = cameras.iter().map(|camera| camera.id.clone()).collect();
+    pub fn configure(
+        &self,
+        cameras: &mut Vec<Camera>,
+        targets: &BTreeMap<String, Target>,
+    ) -> Result<()> {
         for device in self.data.devices.values() {
-            if let Some(camera) = cameras.iter_mut().find(|camera| camera.id == device.id) {
+            if let Some(camera) = cameras
+                .iter_mut()
+                .find(|camera| camera.identity() == device.id)
+            {
                 ensure!(
                     device.matches(camera),
                     "API vault camera binding differs from configured device"
                 );
                 camera.password = Some(device.password.clone());
-            } else if device.enrolled && known.insert(device.id.clone()) {
+            } else if device.enrolled
+                && let Some(target) = targets
+                    .values()
+                    .find(|target| target.camera_id == device.id)
+            {
+                ensure!(
+                    target.host.to_string() == device.host && target.port == device.port,
+                    "API vault camera binding differs from enrollment target"
+                );
+                ensure!(
+                    !cameras.iter().any(|c| c.id == device.id
+                        || (c.host == device.host
+                            && c.baichuan_port == Some(device.port)
+                            && c.channel == device.channel)),
+                    "configured camera ID collides with an enrolled camera"
+                );
                 cameras.push(device.camera()?);
             }
         }
@@ -228,7 +249,7 @@ impl Vault {
         cameras.retain(|camera| {
             self.data
                 .rotations
-                .get(&camera.id)
+                .get(camera.identity())
                 .is_none_or(|rotation| rotation.staged.is_none())
         });
         Ok(())
@@ -284,12 +305,13 @@ impl Vault {
     pub fn progress(
         &self,
         id: Uuid,
-        active: &BTreeSet<String>,
+        public_id: impl FnOnce(&str) -> Option<String>,
     ) -> Option<(Status, Option<String>)> {
         let job = self.data.jobs.get(&id)?;
         let verified = self.data.devices.contains_key(&job.camera);
+        let active = public_id(&job.camera);
         let status = if verified {
-            if active.contains(&job.camera) {
+            if active.is_some() {
                 Status::Active
             } else {
                 Status::RestartRequired
@@ -297,7 +319,10 @@ impl Vault {
         } else {
             job.status
         };
-        Some((status, verified.then(|| job.camera.clone())))
+        Some((
+            status,
+            verified.then(|| active.unwrap_or_else(|| job.camera.clone())),
+        ))
     }
 
     pub async fn resume(
@@ -398,16 +423,14 @@ impl Vault {
         self.save(data)
     }
 
-    pub fn rotation_progress(&self, camera: &str, devices: &BTreeMap<String, Device>) -> Status {
+    pub fn rotation_progress(&self, camera: &str, running: Option<&Device>) -> Status {
         self.data
             .rotations
             .get(camera)
             .map_or(Status::NotStarted, |rotation| {
                 if rotation.status == Status::Verified
                     && self.data.devices.get(camera).is_some_and(|current| {
-                        devices
-                            .get(camera)
-                            .is_none_or(|running| running.password != current.password)
+                        running.is_none_or(|running| running.password != current.password)
                     })
                 {
                     Status::RestartRequired

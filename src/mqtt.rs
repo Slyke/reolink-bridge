@@ -38,6 +38,7 @@ use crate::{
 #[serde(deny_unknown_fields)]
 struct Command {
     id: String,
+    stable_id: Option<String>,
     command: CameraCommand,
 }
 
@@ -61,6 +62,7 @@ enum SnapshotSetting {
 }
 
 pub struct CameraCommands {
+    pub stable_id: String,
     pub control: ControlHandle,
     pub device: Device,
     pub snapshot_slot: Arc<Semaphore>,
@@ -333,8 +335,24 @@ async fn run_command(
     };
     let mut id = None;
     let mut reply = match request {
+        Ok(request)
+            if request
+                .stable_id
+                .as_ref()
+                .is_some_and(|expected| *expected != services.stable_id) =>
+        {
+            id = Some(request.id);
+            diagnostics.error(
+                "mqtt::run_command",
+                "API_CAMERA_IDENTITY_CHANGED",
+                Some(correlation.clone()),
+                Value::Null,
+                None,
+            )
+        }
         Ok(Command {
             id: request_id,
+            stable_id: _,
             command:
                 CameraCommand::Snapshot(SnapshotCommand {
                     setting: SnapshotSetting::Snapshot,
@@ -364,6 +382,7 @@ async fn run_command(
         }
         Ok(Command {
             id: request_id,
+            stable_id: _,
             command: CameraCommand::Control(command),
         }) => {
             id = Some(request_id);

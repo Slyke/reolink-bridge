@@ -32,7 +32,6 @@ pub(super) async fn stream(
     Extension(correlation): Extension<CorrelationId>,
     Query(options): Query<Options>,
 ) -> Response {
-    let primary = app.api.primary(&headers);
     let denied = |status| {
         (
             status,
@@ -40,7 +39,7 @@ pub(super) async fn stream(
         )
             .into_response()
     };
-    if !primary && !app.api.service(&headers) {
+    if !app.api.authenticated(&headers) {
         return denied(StatusCode::UNAUTHORIZED);
     }
     let list = |value: &str| {
@@ -50,18 +49,12 @@ pub(super) async fn stream(
             .map(str::to_owned)
             .collect()
     };
-    let mut filter = Filter {
+    let filter = Filter {
         cameras: list(&options.cameras),
         events: list(&options.events),
     };
     if filter.cameras.len() > 128 || filter.events.len() > 128 {
         return denied(StatusCode::FORBIDDEN);
-    }
-    if !primary {
-        let Some(scoped) = app.api.event_filter(filter) else {
-            return denied(StatusCode::FORBIDDEN);
-        };
-        filter = scoped;
     }
     if filter.validate(&app.api.registered).is_err() {
         return denied(StatusCode::FORBIDDEN);

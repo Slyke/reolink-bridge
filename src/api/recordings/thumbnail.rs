@@ -1,6 +1,6 @@
 use std::{process::Stdio, sync::Arc, time::Duration};
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use axum::{
     Extension,
     extract::{Path, Query, State},
@@ -69,7 +69,10 @@ impl Recordings {
             "{}:{}:{}",
             device.host, device.port, device.channel
         ));
-        let key = format!("{camera}:{origin:x}:{id}:{offset_ms}");
+        let stable = api
+            .camera_identity(camera)
+            .context("unknown camera identity")?;
+        let key = format!("{stable}:{origin:x}:{id}:{offset_ms}");
         self.clean_thumbnails().await;
         {
             let mut cache = self.thumbnails.lock().await;
@@ -248,7 +251,7 @@ pub(in crate::api) async fn get(
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
-    if !api.read_access(&headers, &camera) {
+    if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
     if query.offset_ms > 86_400_000 {

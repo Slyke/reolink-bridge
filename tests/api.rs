@@ -73,13 +73,21 @@ async fn event_message(response: &mut reqwest::Response, buffer: &mut Vec<u8>) -
 }
 
 async fn start(config: &Path, client: &Client, origin: &str) -> Result<Child> {
-    let bridge = Command::new(env!("CARGO_BIN_EXE_reolink-bridge"))
+    let mut bridge = Command::new(env!("CARGO_BIN_EXE_reolink-bridge"))
         .arg(config)
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .spawn()?;
     let until = Instant::now() + Duration::from_secs(8);
     while Instant::now() < until {
+        if let Some(status) = bridge.try_wait()? {
+            let log = std::fs::read_to_string(config.with_file_name("requests.jsonl"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "fixture bridge exited with {status}: {}",
+                log.lines().last().unwrap_or("")
+            );
+        }
         if client
             .get(format!("{origin}/livez"))
             .send()
@@ -95,7 +103,7 @@ async fn start(config: &Path, client: &Client, origin: &str) -> Result<Child> {
 
 #[tokio::test]
 #[ignore = "requires Mosquitto on PATH; BRIDGE_TEST_VALKEY_URL enables the Valkey run"]
-async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> {
+async fn background_previews_are_authenticated_and_wait_for_each_image() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut image = Vec::new();
     image::codecs::jpeg::JpegEncoder::new(&mut image).encode(
@@ -169,7 +177,7 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
             .send()
             .await?
             .status(),
-        403
+        401
     );
     let mut events = client
         .get(format!("{origin}/api/events"))
@@ -193,7 +201,7 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
     let starts = camera.snapshot_requests.lock().unwrap().clone();
     assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(675));
     assert_eq!(
-        response(&client, &contract, SERVICE, None).await.1["previewCameras"],
+        response(&client, &contract, PRIMARY, None).await.1["previewCameras"],
         json!(["fixture"])
     );
     assert_eq!(
@@ -207,7 +215,7 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
     );
     let frame = client
         .get(&preview)
-        .bearer_auth(SERVICE)
+        .bearer_auth(PRIMARY)
         .send()
         .await?
         .error_for_status()?;
@@ -220,7 +228,7 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
     assert_eq!(frame.bytes().await?.as_ref(), image.as_slice());
     let metadata = client
         .head(&preview)
-        .bearer_auth(SERVICE)
+        .bearer_auth(PRIMARY)
         .send()
         .await?
         .error_for_status()?;
@@ -228,7 +236,7 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
     assert!(metadata.bytes().await?.is_empty());
     let unchanged = client
         .get(&preview)
-        .bearer_auth(SERVICE)
+        .bearer_auth(PRIMARY)
         .header("if-none-match", tag.clone())
         .send()
         .await?;
@@ -236,7 +244,7 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
     assert!(unchanged.bytes().await?.is_empty());
     let manual = client
         .get(format!("{preview}?refresh=true"))
-        .bearer_auth(SERVICE)
+        .bearer_auth(PRIMARY)
         .send()
         .await?
         .error_for_status()?;
@@ -249,7 +257,7 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
     if valkey.is_some() {
         let until = Instant::now() + Duration::from_secs(4);
         loop {
-            let response = client.get(&preview).bearer_auth(SERVICE).send().await?;
+            let response = client.get(&preview).bearer_auth(PRIMARY).send().await?;
             if response.status().is_success() {
                 assert_eq!(response.headers()["etag"], tag);
                 assert_eq!(response.bytes().await?.as_ref(), image.as_slice());
@@ -265,7 +273,7 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
         assert_eq!(
             client
                 .get(&preview)
-                .bearer_auth(SERVICE)
+                .bearer_auth(PRIMARY)
                 .send()
                 .await?
                 .status(),
@@ -283,7 +291,7 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
     let _degraded = start(&config, &client, &origin).await?;
     let until = Instant::now() + Duration::from_secs(5);
     loop {
-        let frame = client.get(&preview).bearer_auth(SERVICE).send().await?;
+        let frame = client.get(&preview).bearer_auth(PRIMARY).send().await?;
         let logged = std::fs::read_to_string(&log_file)
             .unwrap_or_default()
             .contains("API_PREVIEW_CACHE_FAILED");
@@ -301,7 +309,7 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
 
 #[tokio::test]
 #[ignore = "requires Mosquitto on PATH"]
-async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_restart() -> Result<()> {
+async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let vault = directory.path().join("vault");
     std::fs::create_dir(&vault)?;
@@ -372,34 +380,37 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
         response(&client, &url("/contract"), PRIMARY, None).await.0,
         200
     );
+    for retired in [SERVICE, ADMIN] {
+        for endpoint in [
+            "/contract",
+            "/inventory",
+            "/enrollment-targets",
+            "/callbacks",
+            "/events",
+        ] {
+            assert_eq!(
+                response(&client, &url(endpoint), retired, None).await.0,
+                401,
+                "{endpoint}"
+            );
+        }
+        let mut ws = format!("ws://127.0.0.1:{port}/ws").into_client_request()?;
+        ws.headers_mut()
+            .insert("authorization", format!("Bearer {retired}").parse()?);
+        assert!(
+            matches!(connect_async(ws).await, Err(tokio_tungstenite::tungstenite::Error::Http(reply)) if reply.status() == 401)
+        );
+    }
     assert_eq!(
-        response(&client, &url("/contract"), ADMIN, None).await.0,
-        401
-    );
-    assert_eq!(
-        response(&client, &url("/contract"), SERVICE, None).await.1["version"],
+        response(&client, &url("/contract"), PRIMARY, None).await.1["version"],
         1
-    );
-    assert_eq!(
-        response(&client, &url("/enrollment-targets"), SERVICE, None)
-            .await
-            .0,
-        401
-    );
-
-    let callback =
-        json!({"id":"receiver","url":"http://127.0.0.1:9/events","events":["fixture-only"]});
-    assert_eq!(
-        response(&client, &url("/contract"), SERVICE, None).await.1["callbacks"],
-        false
     );
     assert_eq!(
         response(&client, &url("/contract"), PRIMARY, None).await.1["callbacks"],
         true
     );
-    let denied = response(&client, &url("/callbacks"), SERVICE, Some(callback.clone())).await;
-    assert_eq!(denied.0, 403);
-    assert_eq!(denied.1["errorKey"], "CALLBACK_DESTINATION_DENIED");
+    let callback =
+        json!({"id":"receiver","url":"http://127.0.0.1:9/events","events":["fixture-only"]});
     let mut other_destination = callback.clone();
     other_destination["url"] = json!("http://127.0.0.1:9/unlisted");
     assert_eq!(
@@ -446,7 +457,7 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
 
     let rejected = json!({"id":Uuid::new_v4(),"target":"factory","method":"initialize","uid":UID,"confirmation":false});
     assert_eq!(
-        response(&client, &url("/enrollments"), ADMIN, Some(rejected))
+        response(&client, &url("/enrollments"), PRIMARY, Some(rejected))
             .await
             .0,
         422
@@ -454,7 +465,13 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 0);
     let enrollment = Uuid::new_v4();
     let request = json!({"id":enrollment,"target":"factory","method":"initialize","uid":UID,"confirmation":true});
-    let enrolled = response(&client, &url("/enrollments"), ADMIN, Some(request.clone())).await;
+    let enrolled = response(
+        &client,
+        &url("/enrollments"),
+        PRIMARY,
+        Some(request.clone()),
+    )
+    .await;
     assert_eq!(enrolled.1["status"], "restart-required", "{:?}", enrolled);
     assert_eq!(enrolled.1["camera_id"], "new");
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 1);
@@ -468,7 +485,7 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
         0o600
     );
     assert_eq!(
-        response(&client, &url("/enrollments"), ADMIN, Some(request))
+        response(&client, &url("/enrollments"), PRIMARY, Some(request))
             .await
             .0,
         200
@@ -477,7 +494,7 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
 
     let invalid = json!({"id":Uuid::new_v4(),"target":"import","method":"import","serial":"WRONG-SERIAL","confirmation":true});
     assert_eq!(
-        response(&client, &url("/enrollments"), ADMIN, Some(invalid))
+        response(&client, &url("/enrollments"), PRIMARY, Some(invalid))
             .await
             .1["status"],
         "identity-mismatch"
@@ -490,7 +507,7 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
         response(
             &client,
             &url(&format!("/enrollments/{enrollment}")),
-            ADMIN,
+            PRIMARY,
             None
         )
         .await
@@ -498,12 +515,12 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
         "active"
     );
     assert_eq!(
-        response(&client, &url("/inventory"), SERVICE, None).await.1["cameras"],
-        json!([{"id":"new","active":true}])
+        response(&client, &url("/inventory"), PRIMARY, None).await.1["cameras"],
+        json!([{"id":"new","stableId":"new","active":true}])
     );
     let until = Instant::now() + Duration::from_secs(6);
     loop {
-        let reply = response(&client, &url("/cameras/new/settings/leds"), SERVICE, None).await;
+        let reply = response(&client, &url("/cameras/new/settings/leds"), PRIMARY, None).await;
         if reply.0 == 200 {
             assert_eq!(reply.1["values"]["leds"]["status_led"], false);
             assert!(reply.1["values"]["leds"].get("vendor").is_none());
@@ -525,7 +542,7 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
     assert_eq!(
         client
             .get(url("/events?cameras=outside-scope"))
-            .bearer_auth(SERVICE)
+            .bearer_auth(PRIMARY)
             .send()
             .await?
             .status(),
@@ -533,7 +550,7 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
     );
     let mut event_stream = client
         .get(url("/events?cameras=new"))
-        .bearer_auth(SERVICE)
+        .bearer_auth(PRIMARY)
         .send()
         .await?
         .error_for_status()?;
@@ -550,7 +567,7 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
     let reply = response(
         &client,
         &url("/cameras/new/command/exec"),
-        SERVICE,
+        PRIMARY,
         Some(json!({
             "id":Uuid::new_v4(),"command":{"setting":"status_led","enabled":false}
         })),
@@ -574,7 +591,7 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
     let mut ws_request = format!("ws://127.0.0.1:{port}/ws").into_client_request()?;
     ws_request
         .headers_mut()
-        .insert("authorization", format!("Bearer {SERVICE}").parse()?);
+        .insert("authorization", format!("Bearer {PRIMARY}").parse()?);
     let (mut ws, _) = connect_async(ws_request).await?;
     ws.send(Message::Text(
         json!({"id":"wrong","op":"subscribe","cameras":["outside-scope"]})
@@ -584,12 +601,12 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
     .await?;
     let reply: Value = serde_json::from_str(ws.next().await.unwrap()?.to_text()?)?;
     assert_eq!(reply["ok"], false);
-    assert_eq!(reply["errorKey"], "API_SCOPE_DENIED");
+    assert_eq!(reply["errorKey"], "WEBSOCKET_FILTER_INVALID");
     ws.close(None).await?;
 
     let video = client
         .get(url("/cameras/new/media/main"))
-        .bearer_auth(SERVICE)
+        .bearer_auth(PRIMARY)
         .send()
         .await?;
     ensure!(
@@ -616,30 +633,76 @@ async fn scoped_contract_enrollment_and_interrupted_rotation_recover_after_resta
     let rotation = url("/cameras/new/rotation");
     camera.block_after_write.store(true, Ordering::SeqCst);
     let rotate = json!({"id":Uuid::new_v4(),"confirmation":true});
-    let interrupted = response(&client, &rotation, ADMIN, Some(rotate)).await;
+    let interrupted = response(&client, &rotation, PRIMARY, Some(rotate)).await;
     assert_eq!(interrupted.1["status"], "recovery-required");
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 2);
     bridge.kill().await?;
     bridge = start(&config, &client, &origin).await?;
     assert_eq!(
-        response(&client, &url("/inventory"), SERVICE, None).await.1["cameras"],
-        json!([{"id":"new","active":false}])
+        response(&client, &url("/inventory"), PRIMARY, None).await.1["cameras"],
+        json!([{"id":"new","stableId":"new","active":false}])
     );
     camera.block_login.store(false, Ordering::SeqCst);
     let recovered = response(
         &client,
         &format!("{rotation}/reconcile"),
-        ADMIN,
+        PRIMARY,
         Some(json!({"id":Uuid::new_v4(),"confirmation":true})),
     )
     .await;
     assert_eq!(recovered.1["status"], "restart-required");
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 2);
     bridge.kill().await?;
+    // Move the provisioned camera into static config under a new public ID. Its verified
+    // credential and completed rotation still live under the original stable identity.
+    let mut moved = body;
+    moved["cameras"] = json!([{
+        "id":"garage","stableId":"new","host":"127.0.0.1","baichuanPort":address.port(),
+        "onvifPort":null,"eventTransport":"baichuan","username":"admin"
+    }]);
+    moved["api"]["targets"]
+        .as_object_mut()
+        .unwrap()
+        .remove("factory");
+    moved["api"]["media"] = json!({"garage":{"port":rtsp_port,"streams":["main"]}});
+    std::fs::write(&config, moved.to_string())?;
     let _bridge = start(&config, &client, &origin).await?;
     assert_eq!(
-        response(&client, &rotation, ADMIN, None).await.1["status"],
+        response(&client, &url("/inventory"), PRIMARY, None).await.1["cameras"],
+        json!([{"id":"garage","stableId":"new","active":true}])
+    );
+    assert_eq!(
+        response(&client, &url("/cameras/garage/rotation"), PRIMARY, None)
+            .await
+            .1["status"],
         "verified"
+    );
+    let progress = response(
+        &client,
+        &url(&format!("/enrollments/{enrollment}")),
+        PRIMARY,
+        None,
+    )
+    .await
+    .1;
+    assert_eq!(progress["status"], "active");
+    assert_eq!(progress["camera_id"], "garage");
+    let blocked = client
+        .get(url("/cameras/garage/settings/leds"))
+        .bearer_auth(PRIMARY)
+        .header("x-camera-stable-id", "replacement")
+        .send()
+        .await?;
+    assert_eq!(blocked.status(), 409);
+    assert_eq!(
+        serde_json::from_str::<Value>(&blocked.text().await?)?["errorKey"],
+        "API_CAMERA_IDENTITY_CHANGED"
+    );
+    assert_eq!(
+        response(&client, &url("/cameras/new/rotation"), PRIMARY, None)
+            .await
+            .0,
+        404
     );
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 2);
     Ok(())
@@ -742,7 +805,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"},
         "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
         "cameras":[{"id":"fixture","host":"127.0.0.1","baichuanPort":bc,"onvifPort":null,"username":"admin","password":baichuan::PASSWORD,"eventTransport":"baichuan"}],
-        "api":{"serviceToken":SERVICE,"cameraIds":["fixture"],"commands":true,"previews":{"cache":thumbnail_cache},"recordings":{"temporaryDirectory":workspace,"cache":{"maxBytes":1_048_576,"ttlSeconds":2}}},
+        "api":{"previews":{"cache":thumbnail_cache},"recordings":{"temporaryDirectory":workspace,"cache":{"maxBytes":1_048_576,"ttlSeconds":2}}},
         "logging":{"sinks":{"console":{"enabled":false},"file":{"enabled":true,"format":"json","path":log_file}}}
     }).to_string())?;
     let client = Client::builder()
@@ -752,7 +815,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     let mut bridge = start(&config, &client, &origin).await?;
     let storage = format!("{origin}/api/cameras/fixture/storage");
     assert_eq!(response(&client, &storage, "wrong", None).await.0, 401);
-    let card = response(&client, &storage, SERVICE, None).await;
+    let card = response(&client, &storage, PRIMARY, None).await;
     assert_eq!(card.0, 200, "{card:?}");
     assert_eq!(card.1["cards"][0]["totalBytes"], 63_500_000_000u64);
     assert_eq!(card.1["cards"][0]["usedBytes"], 39_700_000_000u64);
@@ -764,7 +827,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         let logs = std::fs::read_to_string(&log_file).unwrap_or_default();
         if logs.contains(correlation) {
             assert!(logs.contains("API_SCOPE_DENIED"));
-            assert!(!logs.contains(baichuan::PASSWORD) && !logs.contains(SERVICE));
+            assert!(!logs.contains(baichuan::PASSWORD) && !logs.contains(PRIMARY));
             break;
         }
         ensure!(Instant::now() < until, "API failure was not logged");
@@ -801,7 +864,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         (14, &search, 502, "API_RECORDING_SEARCH_FAILED"),
     ] {
         camera.reject_read_command.store(command, Ordering::SeqCst);
-        let (actual, body) = response(&client, url, SERVICE, None).await;
+        let (actual, body) = response(&client, url, PRIMARY, None).await;
         assert_eq!(actual, status, "{body:?}");
         if command == 104 {
             assert!(body["cameraTime"].is_null());
@@ -825,11 +888,11 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
             sleep(Duration::from_millis(20)).await;
         }
         if command == 102 {
-            assert_eq!(response(&client, &search, SERVICE, None).await.0, 200);
+            assert_eq!(response(&client, &search, PRIMARY, None).await.0, 200);
         }
     }
     camera.reject_read_command.store(0, Ordering::SeqCst);
-    let clips = response(&client, &search, SERVICE, None).await;
+    let clips = response(&client, &search, PRIMARY, None).await;
     assert_eq!(clips.0, 200, "{clips:?}");
     assert_eq!(clips.1["recordings"].as_array().unwrap().len(), 1);
     let id = clips.1["recordings"][0]["id"].as_str().unwrap();
@@ -845,7 +908,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         401
     );
     for _ in 0..2 {
-        let response = client.get(&preview).bearer_auth(SERVICE).send().await?;
+        let response = client.get(&preview).bearer_auth(PRIMARY).send().await?;
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers()["content-type"], "image/jpeg");
         let jpeg = response.bytes().await?;
@@ -853,7 +916,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     }
     assert_eq!(camera.recording_previews.load(Ordering::SeqCst), 1);
     assert_eq!(camera.recording_downloads.load(Ordering::SeqCst), 0);
-    let result = client.get(&video).bearer_auth(SERVICE).send().await?;
+    let result = client.get(&video).bearer_auth(PRIMARY).send().await?;
     ensure!(
         result.status().is_success(),
         "recording media returned {}",
@@ -863,7 +926,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     assert!(data.windows(4).any(|w| w == b"ftyp"));
     let partial = client
         .get(&video)
-        .bearer_auth(SERVICE)
+        .bearer_auth(PRIMARY)
         .header("range", "bytes=0-31")
         .send()
         .await?;
@@ -873,7 +936,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     let metadata = response(
         &client,
         &format!("{origin}/api/cameras/fixture/recordings/{id}/metadata"),
-        SERVICE,
+        PRIMARY,
         None,
     )
     .await;
@@ -904,19 +967,19 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     );
     let archived = directory.path().join("archived-workspace");
     std::fs::rename(&workspace, &archived)?;
-    let contract = response(&client, &format!("{origin}/api/contract"), SERVICE, None)
+    let contract = response(&client, &format!("{origin}/api/contract"), PRIMARY, None)
         .await
         .1;
     assert_eq!(contract["storageCameras"], json!(["fixture"]));
     assert_eq!(contract["recordingsCameras"], json!([]));
     assert_eq!(
-        response(&client, &storage, SERVICE, None).await.1["playbackAvailable"],
+        response(&client, &storage, PRIMARY, None).await.1["playbackAvailable"],
         false
     );
     assert_eq!(
         client
             .get(&video)
-            .bearer_auth(SERVICE)
+            .bearer_auth(PRIMARY)
             .send()
             .await?
             .status(),
@@ -925,7 +988,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     assert_eq!(camera.recording_downloads.load(Ordering::SeqCst), 1);
     std::fs::rename(&archived, &workspace)?;
     assert_eq!(
-        response(&client, &format!("{origin}/api/contract"), SERVICE, None)
+        response(&client, &format!("{origin}/api/contract"), PRIMARY, None)
             .await
             .1["recordingsCameras"],
         json!(["fixture"])
@@ -935,7 +998,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     sleep(Duration::from_millis(2100)).await;
     let expired = client
         .get(&video)
-        .bearer_auth(SERVICE)
+        .bearer_auth(PRIMARY)
         .header("range", "bytes=0-31")
         .send()
         .await?;
@@ -948,7 +1011,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         if response(
             &client,
             &format!("{origin}/api/cameras/fixture/settings/image"),
-            SERVICE,
+            PRIMARY,
             None,
         )
         .await
@@ -964,7 +1027,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         let changed = response(
             &client,
             &format!("{origin}/api/cameras/fixture/command/exec"),
-            SERVICE,
+            PRIMARY,
             Some(json!({
                 "id":Uuid::new_v4(),"command":{"setting":"image_orientation","action":action}
             })),
@@ -987,8 +1050,8 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         json!({"temporaryDirectory":limited_workspace,"cache":{"maxBytes":32,"ttlSeconds":600}});
     std::fs::write(&config, limited.to_string())?;
     let mut limited_bridge = start(&config, &client, &origin).await?;
-    assert_eq!(response(&client, &search, SERVICE, None).await.0, 200);
-    let oversized = client.get(&video).bearer_auth(SERVICE).send().await?;
+    assert_eq!(response(&client, &search, PRIMARY, None).await.0, 200);
+    let oversized = client.get(&video).bearer_auth(PRIMARY).send().await?;
     assert_eq!(oversized.status(), 413);
     let details: Value = serde_json::from_str(&oversized.text().await?)?;
     assert_eq!(details["stage"], "cache-limit");
@@ -998,7 +1061,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     for _ in 0..2 {
         let thumbnail = client
             .get(format!("{preview}?offsetMs=1000"))
-            .bearer_auth(SERVICE)
+            .bearer_auth(PRIMARY)
             .send()
             .await?;
         assert_eq!(thumbnail.status(), 200);
@@ -1026,11 +1089,11 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         limited_bridge.kill().await?;
         limited_bridge.wait().await?;
         let _restarted = start(&config, &client, &origin).await?;
-        assert_eq!(response(&client, &search, SERVICE, None).await.0, 200);
+        assert_eq!(response(&client, &search, PRIMARY, None).await.0, 200);
         assert_eq!(
             client
                 .get(format!("{preview}?offsetMs=1000"))
-                .bearer_auth(SERVICE)
+                .bearer_auth(PRIMARY)
                 .send()
                 .await?
                 .status(),
