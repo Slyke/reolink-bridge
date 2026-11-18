@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -54,6 +54,7 @@ pub struct Diagnostics {
     codes: Arc<ErrorCodeMap>,
     startup_runtime: Option<Value>,
     queue_full_reported: Arc<AtomicBool>,
+    reported: Arc<Mutex<BTreeMap<(String, String), std::time::Instant>>>,
 }
 
 enum Record {
@@ -96,6 +97,7 @@ impl Diagnostics {
             "MQTT_SNAPSHOT_LAG",
             "MQTT_RESULT_QUEUE_FULL",
             "WEBSOCKET_SEND_FAILED",
+            "API_RECORDING_PREVIEW_FALLBACK",
         ] {
             config
                 .gates
@@ -127,6 +129,7 @@ impl Diagnostics {
                 codes: Arc::new(codes),
                 startup_runtime,
                 queue_full_reported: Arc::new(AtomicBool::new(false)),
+                reported: Arc::default(),
             },
             task,
         ))
@@ -163,6 +166,18 @@ impl Diagnostics {
         context: Value,
         cause: Option<anyhow::Error>,
     ) -> Value {
+        if let Some(id) = &correlation_id {
+            let mut reported = self.reported.lock().unwrap();
+            if reported.len() >= 1024
+                && let Some(oldest) = reported
+                    .iter()
+                    .min_by_key(|(_, time)| *time)
+                    .map(|(key, _)| key.clone())
+            {
+                reported.remove(&oldest);
+            }
+            reported.insert((id.clone(), key.into()), std::time::Instant::now());
+        }
         let options = error_options(caller, key, correlation_id, context, cause);
         let code = self
             .codes
@@ -178,6 +193,17 @@ impl Diagnostics {
         });
         self.enqueue(Record::Error(options));
         reply
+    }
+
+    pub fn already_reported(&self, id: &str, key: &str) -> bool {
+        self.reported
+            .lock()
+            .unwrap()
+            .contains_key(&(id.into(), key.into()))
+    }
+
+    pub fn knows(&self, key: &str) -> bool {
+        self.codes.contains_key(key)
     }
 
     fn enqueue(&self, record: Record) {

@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use anyhow::{Result, ensure};
 use axum::{
@@ -12,6 +16,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use redis::{AsyncConnectionConfig, FromRedisValue, aio::MultiplexedConnection};
 use serde::Deserialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Mutex, Semaphore, watch},
@@ -22,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{Api, error};
-use crate::{http::CorrelationId, reolink::wire::Device};
+use crate::{http::CorrelationId, hub::Hub, reolink::wire::Device};
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(35);
 const CACHE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -66,13 +71,8 @@ fn default_key_prefix() -> String {
 
 pub(super) type Previews = BTreeMap<String, Arc<Preview>>;
 
-pub(super) fn prepare(
-    config: &Config,
-    devices: &BTreeMap<String, Device>,
-    slots: Arc<Semaphore>,
-    stop: CancellationToken,
-) -> Result<Previews> {
-    let store = match &config.cache {
+pub(super) fn store(config: &Config) -> Result<Option<Arc<Valkey>>> {
+    Ok(match &config.cache {
         CacheConfig::Memory => None,
         CacheConfig::Valkey { url, key_prefix } => {
             ensure!(
@@ -99,7 +99,16 @@ pub(super) fn prepare(
                 connection: Mutex::new(None),
             }))
         }
-    };
+    })
+}
+
+pub(super) fn prepare(
+    config: &Config,
+    devices: &BTreeMap<String, Device>,
+    slots: Arc<Semaphore>,
+    stop: CancellationToken,
+    store: Option<Arc<Valkey>>,
+) -> Result<Previews> {
     Ok(config
         .cameras
         .iter()
@@ -113,6 +122,8 @@ pub(super) fn prepare(
                 id.clone(),
                 Arc::new(Preview {
                     device,
+                    camera_id: id.clone(),
+                    hub: OnceLock::new(),
                     interval: Duration::from_millis(profile.interval_ms),
                     cache_id: format!("{id}:{origin:x}"),
                     store: store.clone(),
@@ -126,9 +137,10 @@ pub(super) fn prepare(
         .collect())
 }
 
-pub(super) fn start(previews: &Previews, workers: &mut JoinSet<()>) {
-    for preview in previews.values().cloned() {
-        workers.spawn(preview.run());
+pub(super) fn start(previews: &Previews, hub: Arc<Hub>, workers: &mut JoinSet<()>) {
+    for (id, preview) in previews {
+        let _ = preview.hub.set(hub.clone());
+        workers.spawn(preview.clone().run(id.clone(), hub.clone()));
     }
 }
 
@@ -165,6 +177,8 @@ struct StateOfPreview {
 
 pub(super) struct Preview {
     device: Device,
+    camera_id: String,
+    hub: OnceLock<Arc<Hub>>,
     interval: Duration,
     cache_id: String,
     store: Option<Arc<Valkey>>,
@@ -175,7 +189,7 @@ pub(super) struct Preview {
 }
 
 impl Preview {
-    async fn run(self: Arc<Self>) {
+    async fn run(self: Arc<Self>, id: String, hub: Arc<Hub>) {
         if let Some(store) = &self.store {
             tokio::select! {
                 _ = self.stop.cancelled() => return,
@@ -194,6 +208,16 @@ impl Preview {
         }
         let mut updates = self.state.subscribe();
         loop {
+            if let Some(frame) = &updates.borrow().frame {
+                hub.section(
+                    &id,
+                    "state/preview",
+                    "preview",
+                    json!({
+                        "etag":frame.etag, "captured_at":frame.captured_at,
+                    }),
+                );
+            }
             let (next, previous) = {
                 let state = updates.borrow_and_update();
                 (
@@ -227,7 +251,19 @@ impl Preview {
             result = timeout(CAPTURE_TIMEOUT, async {
                 let _slot = self.slots.acquire().await?;
                 self.device.capture_jpeg().await
-            }) => result.ok().and_then(Result::ok).and_then(|(jpeg, captured_at)| Frame::new(jpeg, captured_at)),
+            }) => {
+                let result = result.map_err(anyhow::Error::from).and_then(|result| result)
+                    .and_then(|(jpeg,captured_at)| Frame::new(jpeg,captured_at).ok_or_else(|| anyhow::anyhow!("invalid preview JPEG")));
+                match result {
+                    Ok(frame) => Some(frame),
+                    Err(cause) => {
+                        if let Some(hub) = self.hub.get() {
+                            hub.diagnostics.error("api::preview::capture","API_PREVIEW_CAPTURE_FAILED",None,json!({"cameraId":self.camera_id}),Some(cause));
+                        }
+                        None
+                    }
+                }
+            },
         };
         let finished = Instant::now();
         self.state.send_modify(|state| {
@@ -248,13 +284,41 @@ impl Preview {
     }
 }
 
-struct Valkey {
+pub(super) struct Valkey {
     client: redis::Client,
     prefix: String,
     connection: Mutex<Option<MultiplexedConnection>>,
 }
 
 impl Valkey {
+    pub(super) async fn recording(
+        &self,
+        id: &str,
+        jpeg: Option<&Bytes>,
+        ttl: Duration,
+    ) -> Option<Bytes> {
+        let key = format!("{}:recording-preview:{id}", self.prefix);
+        if let Some(jpeg) = jpeg {
+            let _: Option<()> = self
+                .command(
+                    redis::cmd("SET")
+                        .arg(key)
+                        .arg(jpeg.as_ref())
+                        .arg("PX")
+                        .arg(ttl.as_millis().max(1) as u64),
+                )
+                .await;
+            return None;
+        }
+        let value: Vec<u8> = self
+            .command(redis::cmd("GETRANGE").arg(key).arg(0).arg(512 * 1024))
+            .await?;
+        (value.len() <= 512 * 1024
+            && value.starts_with(&[0xff, 0xd8])
+            && value.ends_with(&[0xff, 0xd9]))
+        .then(|| Bytes::from(value))
+    }
+
     fn key(&self, id: &str) -> String {
         format!("{}:preview:{id}", self.prefix)
     }

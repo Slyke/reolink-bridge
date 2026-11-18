@@ -132,5 +132,11 @@
   "reolink-bridge-API_CONFIRM_REQUIRED": "This operation requires confirmation.",
   "reolink-bridge-API_ROTATION_UNSUPPORTED": "This camera has no verified password-change path.",
   "reolink-bridge-API_ROTATION_RECONCILE_FAILED": "Credential verification could not complete.",
-  "reolink-bridge-API_RECORDING_PREPARE_FAILED": "The recorded video could not be prepared."
+  "reolink-bridge-API_RECORDING_PREPARE_FAILED": "The recorded video could not be prepared.",
+  "reolink-bridge-API_RECORDING_PREVIEW_FALLBACK": "The camera thumbnail command failed; using a recording keyframe.",
+  "reolink-bridge-HTTP_REQUEST_REJECTED": "The HTTP request failed.",
+  "reolink-bridge-HTTP_READINESS_FAILED": "The bridge is not ready for traffic.",
+  "reolink-bridge-API_RECORDING_PREVIEW_FAILED": "The recording preview could not be prepared.",
+  "reolink-bridge-API_PREVIEW_CAPTURE_FAILED": "The preview capture failed; any previous cached frame is retained.",
+  "reolink-bridge-API_RECORDING_METADATA_FAILED": "The recording metadata could not be read."
 }

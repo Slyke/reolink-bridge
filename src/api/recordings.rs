@@ -94,6 +94,8 @@ pub(super) struct Recordings {
     max_cache_bytes: u64,
     entries: Mutex<BTreeMap<String, Entry>>,
     thumbnails: Mutex<BTreeMap<String, thumbnail::Thumbnail>>,
+    cover_unavailable: Mutex<BTreeMap<String, Instant>>,
+    pub(super) thumbnail_store: Option<Arc<super::preview::Valkey>>,
     cameras: BTreeMap<String, Mutex<()>>,
     slots: Semaphore,
 }
@@ -107,6 +109,7 @@ struct CachedMedia {
     accessed: Instant,
 }
 struct Media {
+    metadata: recording_media::RecordingMetadata,
     _directory: tempfile::TempDir,
     path: PathBuf,
     size: u64,
@@ -129,6 +132,8 @@ impl Recordings {
             max_cache_bytes: config.cache.max_bytes,
             entries: Mutex::default(),
             thumbnails: Mutex::default(),
+            cover_unavailable: Mutex::default(),
+            thumbnail_store: None,
             cameras: ids.map(|id| (id, Mutex::new(()))).collect(),
             slots: Semaphore::new(2),
         })
@@ -296,7 +301,7 @@ impl Recordings {
             let mut output = File::create(&input)
                 .await
                 .context(PreparationStage("temporary-storage"))?;
-            recording_media::download(device, &clip, &mut output, &api.stop)
+            let metadata = recording_media::download(device, &clip, &mut output, &api.stop)
                 .await
                 .context(PreparationStage("camera-download"))?;
             drop(output);
@@ -358,18 +363,57 @@ impl Recordings {
             tokio::fs::remove_file(&input)
                 .await
                 .context(PreparationStage("temporary-storage"))?;
-            Ok::<_, anyhow::Error>(size)
+            Ok::<_, anyhow::Error>((size, metadata))
         };
-        let size = tokio::select! {
+        let (size, metadata) = tokio::select! {
             _=api.stop.cancelled()=>return Err(anyhow!("shutdown")),
             result=timeout(Duration::from_secs(120),work)=>result.context(PreparationStage("timeout"))??,
         };
         let media = Arc::new(Media {
+            metadata,
             _directory: directory,
             path,
             size,
         });
         self.cache(key, clip, media).await
+    }
+}
+
+pub(super) async fn metadata(
+    State(api): State<Arc<Api>>,
+    Path((camera, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Extension(correlation): Extension<CorrelationId>,
+) -> Response {
+    if !api.read_access(&headers, &camera) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
+    }
+    let Some(device) = api.devices.get(&camera) else {
+        return error(StatusCode::NOT_FOUND, "API_MEDIA_UNSUPPORTED", &correlation);
+    };
+    if !api.recordings.available() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "API_MEDIA_UNSUPPORTED",
+            &correlation,
+        );
+    }
+    if api
+        .recordings
+        .lookup(&format!("{camera}/{id}"))
+        .await
+        .is_err()
+    {
+        return error(StatusCode::NOT_FOUND, "API_MEDIA_UNSUPPORTED", &correlation);
+    }
+    match api.recordings.media(&camera,&id,device,&api).await {
+        Ok(media) => Json(json!({"source":"recording","frames":media.metadata.frames,"truncated":media.metadata.truncated})).into_response(),
+        Err(cause) => {
+            if let Some(hub) = &api.hub {
+                hub.diagnostics.error("api::recordings::metadata","API_RECORDING_METADATA_FAILED",Some(correlation.0.clone()),json!({"cameraId":camera,"recordingId":id}),Some(cause));
+            }
+            error(StatusCode::BAD_GATEWAY,"API_RECORDING_METADATA_FAILED",&correlation)
+        }
     }
 }
 
@@ -676,6 +720,7 @@ mod tests {
         let path = directory.path().join("playback.mp4");
         std::fs::File::create(&path).unwrap().set_len(size).unwrap();
         Arc::new(Media {
+            metadata: Default::default(),
             _directory: directory,
             path,
             size,

@@ -27,6 +27,7 @@ pub struct Camera {
     pub recording_downloads: AtomicUsize,
     pub recording_end_status: AtomicUsize,
     pub recording_previews: AtomicUsize,
+    pub reject_recording_cover: AtomicBool,
     pub writes: AtomicUsize,
     pub webhook: Mutex<Option<String>>,
     pub ptz: AtomicBool,
@@ -189,6 +190,7 @@ impl Camera {
             }
             15=>"<body><FileInfoList><bFinished>1</bFinished><FileInfo><name>RecS01_20261117_120000_120002_AAA.mp4</name><size>18000</size><type>md</type></FileInfo></FileInfoList></body>".into(),
             298 => {
+                if self.reject_recording_cover.load(Ordering::SeqCst) { return Ok((405,String::new())); }
                 if self.recording.is_none() {return Ok((405,String::new()))}
                 let doc=roxmltree::Document::parse(body)?;
                 ensure!(field(&doc,"channelId")==Some("0") && field(&doc,"frameNo")==Some("1"));

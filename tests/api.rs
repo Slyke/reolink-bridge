@@ -171,6 +171,25 @@ async fn background_previews_are_scoped_and_wait_for_each_image() -> Result<()> 
             .status(),
         403
     );
+    let mut events = client
+        .get(format!("{origin}/api/events"))
+        .bearer_auth(PRIMARY)
+        .send()
+        .await?;
+    let ready = event_message(&mut events, &mut Vec::new()).await?;
+    let notified = ready["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["topic"] == "state/preview")
+        .expect("preview refresh notification");
+    assert!(
+        notified["payload"]["preview"]["etag"]
+            .as_str()
+            .unwrap()
+            .starts_with('"')
+    );
+    drop(events);
     let starts = camera.snapshot_requests.lock().unwrap().clone();
     assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(675));
     assert_eq!(
@@ -628,13 +647,36 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         .output()
         .await?;
     ensure!(encoded.status.success(), "synthetic camera encoder");
+    let tlv = |tag: u8, value: &[u8]| {
+        let mut output = vec![tag];
+        output.extend((value.len() as u16).to_le_bytes());
+        output.extend(value);
+        output
+    };
+    let dimensions: Vec<_> = [896u16, 480]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let bounds: Vec<_> = [100u16, 50, 450, 250, 92]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let mut raw = tlv(3, &dimensions);
+    raw.extend(tlv(1, &tlv(3, &tlv(4, &bounds))));
+    let mut lz4 = lz4_flex::frame::FrameEncoder::new(Vec::new());
+    std::io::Write::write_all(&mut lz4, &raw)?;
+    let mut payload = tlv(1, &[1, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    payload.extend(tlv(2, &tlv(2, &lz4.finish()?)));
+    let mut extra = vec![0; 8];
+    extra.extend(tlv(255, &payload));
     let mut recording = Vec::new();
     for index in 0..16u32 {
         recording.extend(b"00dcH264");
         recording.extend((encoded.stdout.len() as u32).to_le_bytes());
-        recording.extend(0u32.to_le_bytes());
+        recording.extend((extra.len() as u32).to_le_bytes());
         recording.extend((index * 125_000).to_le_bytes());
         recording.extend(0u32.to_le_bytes());
+        recording.extend(&extra);
         recording.extend(&encoded.stdout);
         recording.extend(std::iter::repeat_n(
             0,
@@ -667,11 +709,17 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     let config = directory.path().join("bridge.json5");
     let workspace = directory.path().join("recording-workspace");
     std::fs::create_dir(&workspace)?;
+    let log_file = directory.path().join("requests.jsonl");
+    let thumbnail_cache = std::env::var("BRIDGE_TEST_VALKEY_URL").map_or_else(
+        |_| json!({"backend":"memory"}),
+        |url| json!({"backend":"valkey","url":url,"keyPrefix":format!("recording-test-{}",Uuid::new_v4())})
+    );
     std::fs::write(&config,json!({
         "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"},
         "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
         "cameras":[{"id":"fixture","host":"127.0.0.1","baichuanPort":bc,"onvifPort":null,"username":"admin","password":baichuan::PASSWORD,"eventTransport":"baichuan"}],
-        "api":{"serviceToken":SERVICE,"cameraIds":["fixture"],"commands":true,"recordings":{"temporaryDirectory":workspace,"cache":{"maxBytes":1_048_576,"ttlSeconds":2}}}
+        "api":{"serviceToken":SERVICE,"cameraIds":["fixture"],"commands":true,"previews":{"cache":thumbnail_cache},"recordings":{"temporaryDirectory":workspace,"cache":{"maxBytes":1_048_576,"ttlSeconds":2}}},
+        "logging":{"sinks":{"console":{"enabled":false},"file":{"enabled":true,"format":"json","path":log_file}}}
     }).to_string())?;
     let client = Client::builder()
         .no_proxy()
@@ -685,6 +733,19 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     assert_eq!(card.1["cards"][0]["totalBytes"], 63_500_000_000u64);
     assert_eq!(card.1["cards"][0]["usedBytes"], 40_400_000_000u64);
     assert_eq!(card.1["cameraTime"], "2026-11-17T12:30:00");
+    let denied = response(&client, &storage, "wrong", None).await;
+    let correlation = denied.1["correlation_id"].as_str().unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let logs = std::fs::read_to_string(&log_file).unwrap_or_default();
+        if logs.contains(correlation) {
+            assert!(logs.contains("API_SCOPE_DENIED"));
+            assert!(!logs.contains(baichuan::PASSWORD) && !logs.contains(SERVICE));
+            break;
+        }
+        ensure!(Instant::now() < until, "API failure was not logged");
+        sleep(Duration::from_millis(20)).await;
+    }
     let search = format!("{origin}/api/cameras/fixture/recordings?date=2026-11-17&stream=sub");
     let clips = response(&client, &search, SERVICE, None).await;
     assert_eq!(clips.0, 200, "{clips:?}");
@@ -727,6 +788,32 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     assert_eq!(partial.status(), 206);
     assert_eq!(partial.bytes().await?, data[..32]);
     assert_eq!(camera.recording_downloads.load(Ordering::SeqCst), 1);
+    let metadata = response(
+        &client,
+        &format!("{origin}/api/cameras/fixture/recordings/{id}/metadata"),
+        SERVICE,
+        None,
+    )
+    .await;
+    assert_eq!(metadata.0, 200);
+    assert_eq!(metadata.1["source"], "recording");
+    let samples = metadata.1["frames"].as_array().unwrap();
+    assert_eq!(samples.len(), 8);
+    assert_eq!(samples[1]["offsetMs"], 250);
+    assert_eq!(samples[0]["objects"][0]["class"], "person");
+    assert!(
+        (samples[0]["objects"][0]["bounding_box"]["top"]
+            .as_f64()
+            .unwrap()
+            - 50.0 / 480.0)
+            .abs()
+            < 1e-12
+    );
+    assert_eq!(
+        camera.recording_downloads.load(Ordering::SeqCst),
+        1,
+        "metadata reuses the prepared download"
+    );
     assert!(
         std::fs::read_dir(&workspace)?.any(|entry| entry.is_ok_and(|entry| entry
             .file_name()
@@ -817,7 +904,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     limited["api"]["recordings"] =
         json!({"temporaryDirectory":limited_workspace,"cache":{"maxBytes":32,"ttlSeconds":600}});
     std::fs::write(&config, limited.to_string())?;
-    let _limited_bridge = start(&config, &client, &origin).await?;
+    let mut limited_bridge = start(&config, &client, &origin).await?;
     assert_eq!(response(&client, &search, SERVICE, None).await.0, 200);
     let oversized = client.get(&video).bearer_auth(SERVICE).send().await?;
     assert_eq!(oversized.status(), 413);
@@ -825,6 +912,54 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     assert_eq!(details["stage"], "cache-limit");
     assert_eq!(camera.recording_downloads.load(Ordering::SeqCst), 3);
     assert_eq!(std::fs::read_dir(&limited_workspace)?.count(), 0);
+    camera.reject_recording_cover.store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        let thumbnail = client
+            .get(format!("{preview}?offsetMs=1000"))
+            .bearer_auth(SERVICE)
+            .send()
+            .await?;
+        assert_eq!(thumbnail.status(), 200);
+        assert!(thumbnail.bytes().await?.starts_with(&[0xff, 0xd8]));
+    }
+    assert_eq!(
+        camera.recording_downloads.load(Ordering::SeqCst),
+        4,
+        "fallback reads one keyframe and caches it"
+    );
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let logs = std::fs::read_to_string(&log_file).unwrap_or_default();
+        if logs.contains("API_RECORDING_PREVIEW_FALLBACK") {
+            assert!(logs.contains("returned status 405"));
+            break;
+        }
+        ensure!(
+            Instant::now() < until,
+            "thumbnail fallback cause was not logged"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    if std::env::var("BRIDGE_TEST_VALKEY_URL").is_ok() {
+        limited_bridge.kill().await?;
+        limited_bridge.wait().await?;
+        let _restarted = start(&config, &client, &origin).await?;
+        assert_eq!(response(&client, &search, SERVICE, None).await.0, 200);
+        assert_eq!(
+            client
+                .get(format!("{preview}?offsetMs=1000"))
+                .bearer_auth(SERVICE)
+                .send()
+                .await?
+                .status(),
+            200
+        );
+        assert_eq!(
+            camera.recording_downloads.load(Ordering::SeqCst),
+            4,
+            "Valkey thumbnails survive bridge restart"
+        );
+    }
     assert_eq!(camera.writes.load(Ordering::SeqCst), 4);
     Ok(())
 }

@@ -93,6 +93,16 @@ pub async fn run(device: &Device, id: &str, hub: &Hub, stop: &CancellationToken)
     result
 }
 
+pub(super) fn recording_objects(
+    extra: &[u8],
+    iframe: bool,
+    dimensions: &mut Option<(u32, u32)>,
+) -> Option<Vec<Object>> {
+    let overlay = Overlay::decode(extra, iframe)?;
+    *dimensions = overlay.dimensions.or(*dimensions);
+    Some(overlay.objects(*dimensions))
+}
+
 pub(super) enum Media<'a> {
     Info(u32, u32),
     Video {

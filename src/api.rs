@@ -213,8 +213,17 @@ impl Api {
                 ))
             })
             .collect();
-        let previews = preview::prepare(&config.previews, &devices, snapshot_slot, stop.clone())?;
-        let recordings = recordings::Recordings::new(&config.recordings, devices.keys().cloned())?;
+        let store = preview::store(&config.previews)?;
+        let previews = preview::prepare(
+            &config.previews,
+            &devices,
+            snapshot_slot,
+            stop.clone(),
+            store.clone(),
+        )?;
+        let mut recordings =
+            recordings::Recordings::new(&config.recordings, devices.keys().cloned())?;
+        recordings.thumbnail_store = store;
         Ok(Self {
             recordings,
             config,
@@ -233,8 +242,8 @@ impl Api {
     }
 
     pub fn attach(mut self, hub: Arc<Hub>, workers: &mut JoinSet<()>) -> Arc<Self> {
-        self.hub = Some(hub);
-        preview::start(&self.previews, workers);
+        self.hub = Some(hub.clone());
+        preview::start(&self.previews, hub, workers);
         let api = Arc::new(self);
         let cleaning = api.clone();
         workers.spawn(async move {
@@ -331,6 +340,10 @@ pub fn router(api: Arc<Api>) -> Router {
             "/api/cameras/{id}/recordings/{recording}/preview",
             get(recordings::preview),
         )
+        .route(
+            "/api/cameras/{id}/recordings/{recording}/metadata",
+            get(recordings::metadata),
+        )
         .route("/api/cameras/{id}/settings/{group}", get(settings))
         .route("/api/cameras/{id}/media/{stream}", get(media::get))
         .route("/api/cameras/{id}/preview", get(preview::get))
@@ -385,7 +398,9 @@ async fn contract(
     Json(json!({"version":1,"eventStream":primary || api.config.events,"media":!profiles.is_empty(),"mediaCameras":profiles,
        "storageCameras":api.devices.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
        "recordingPreviewCameras":api.devices.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
+       "recordingMetadataCameras":api.devices.keys().filter(|id| recordings_available && (primary || api.allows(id))).collect::<Vec<_>>(),
        "recordingsCameras":api.devices.keys().filter(|id| recordings_available && (primary || api.allows(id))).collect::<Vec<_>>(),
+       "previewNotifications":true,
        "previewCameras":api.previews.keys().filter(|id| primary || api.allows(id)).collect::<Vec<_>>(),
        "enrollment":api.vault.is_some(),"inventory":true,"callbacks":api.callback_allowed(primary, None),"settings":["leds","spotlight","motion","ai","image"],"alerts":["motion"],
        "correlation_id":correlation.0})).into_response()

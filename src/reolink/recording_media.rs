@@ -1,5 +1,7 @@
+use crate::model::Object;
 use anyhow::{Result, anyhow, ensure};
 use bytes::{Buf, BytesMut};
+use serde::Serialize;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
     time::{Duration, timeout},
@@ -7,19 +9,33 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    metadata::{Media, media_sample},
+    metadata::{Media, media_sample, recording_objects},
     recordings::{Clip, time_xml, uid},
     wire::Device,
 };
 
 const LIMIT: usize = 512 * 1024 * 1024;
 
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingMetadata {
+    pub frames: Vec<RecordingFrame>,
+    pub truncated: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingFrame {
+    pub offset_ms: u64,
+    pub objects: Vec<Object>,
+}
+
 pub async fn download(
     device: &Device,
     clip: &Clip,
     output: &mut (impl AsyncWrite + Unpin),
     stop: &CancellationToken,
-) -> Result<()> {
+) -> Result<RecordingMetadata> {
     let mut session = device.connect().await?;
     let uid = uid(&mut session).await?;
     let channel = device.channel;
@@ -40,6 +56,9 @@ pub async fn download(
     let mut last_ticks = 0;
     let mut audio_pts = 90_000u64;
     let mut frames = 0;
+    let mut metadata = RecordingMetadata::default();
+    let mut dimensions = None;
+    let mut metadata_bytes = 0;
     let result = async {
         loop {
             let part = match packet.take() {
@@ -74,12 +93,13 @@ pub async fn download(
             pending.extend_from_slice(&data);
             while let Some((consumed, sample)) = media_sample(&pending)? {
                 match sample {
+                    Media::Info(width, height) => dimensions = Some((width, height)),
                     Media::Video {
                         iframe,
                         ticks,
                         codec,
                         data,
-                        ..
+                        extra,
                     } => {
                         if start.is_none() && !iframe {
                             pending.advance(consumed);
@@ -99,6 +119,24 @@ pub async fn download(
                             let value = Mux::new(codec);
                             output.write_all(&value.header()).await?;
                             mux = Some(value);
+                        }
+                        let offset_ms = u64::from(ticks.wrapping_sub(base)) / 1000;
+                        if !metadata.truncated
+                            && metadata
+                                .frames
+                                .last()
+                                .is_none_or(|frame| offset_ms >= frame.offset_ms + 200)
+                            && let Some(mut objects) =
+                                recording_objects(extra, iframe, &mut dimensions)
+                        {
+                            objects.truncate(32);
+                            let frame = RecordingFrame { offset_ms, objects };
+                            metadata_bytes += serde_json::to_vec(&frame)?.len();
+                            if metadata.frames.len() >= 4096 || metadata_bytes > 4 * 1024 * 1024 {
+                                metadata.truncated = true;
+                            } else {
+                                metadata.frames.push(frame);
+                            }
                         }
                         let pts = 90_000 + u64::from(ticks.wrapping_sub(base)) * 9 / 100;
                         output
@@ -139,7 +177,7 @@ pub async fn download(
             "recording has no complete video"
         );
         output.flush().await?;
-        Ok(())
+        Ok(metadata)
     }
     .await;
     let _ = session.command(144, Some(channel), "").await;
@@ -245,6 +283,15 @@ fn psi(pid: u16, table: u8, body: &[u8]) -> Vec<u8> {
 }
 
 pub async fn cover(device: &Device, clip: &Clip) -> Result<(&'static str, Vec<u8>)> {
+    frame(device, clip, true).await
+}
+
+/// Read only the first keyframe, then stop the download. Older cameras lack CoverPreview.
+pub async fn download_frame(device: &Device, clip: &Clip) -> Result<(&'static str, Vec<u8>)> {
+    frame(device, clip, false).await
+}
+
+async fn frame(device: &Device, clip: &Clip, cover: bool) -> Result<(&'static str, Vec<u8>)> {
     let mut session = device.connect().await?;
     let uid = uid(&mut session).await?;
     let end = clip.end.min(clip.start + chrono::Duration::seconds(10));
@@ -255,28 +302,48 @@ pub async fn cover(device: &Device, clip: &Clip) -> Result<(&'static str, Vec<u8
         time_xml("startTime", clip.start),
         time_xml("endTime", end)
     );
-    let first = session.cover_start(&body).await?;
+    let first = if cover {
+        session.cover_start(&body).await?
+    } else {
+        let sub = u8::from(clip.stream == "sub");
+        let body = format!(
+            r#"<body><FileInfoList version="1.1"><FileInfo><uid>{uid}</uid><logicChnBitmap>255</logicChnBitmap><channelId>{}</channelId><supportSub>{sub}</supportSub><streamType>{}Stream</streamType>{}{}</FileInfo></FileInfoList></body>"#,
+            device.channel,
+            clip.stream,
+            time_xml("startTime", clip.start),
+            time_xml("endTime", end)
+        );
+        session.recording_start(device.channel, &body).await?
+    };
+    let command = if cover { 298 } else { 143 };
     let sequence = first.sequence;
     let mut next = Some(first);
     let mut buffer = BytesMut::new();
+    let mut total = 0;
     let result = async {
         loop {
             let packet = match next.take() {
                 Some(packet) => packet,
                 None => session.read().await?,
             };
-            if packet.command != 298 || packet.sequence != sequence {
+            if packet.command != command || packet.sequence != sequence {
                 continue;
             }
             ensure!(
-                matches!(packet.status, 200 | 201) && !packet.payload_finished(&session),
-                "recording preview ended without a frame"
+                matches!(packet.status, 200 | 201),
+                "recording frame command {command} returned status {}",
+                packet.status
+            );
+            ensure!(
+                !packet.payload_finished(&session),
+                "recording frame command {command} ended without a frame"
             );
             let Some(data) = packet.binary(&session) else {
                 continue;
             };
+            total += data.len();
             ensure!(
-                buffer.len() + data.len() <= 16 * 1024 * 1024,
+                total <= 16 * 1024 * 1024,
                 "recording preview exceeds size limit"
             );
             buffer.extend_from_slice(&data);
@@ -300,6 +367,9 @@ pub async fn cover(device: &Device, clip: &Clip) -> Result<(&'static str, Vec<u8
         }
     }
     .await;
+    if !cover {
+        let _ = session.command(144, Some(device.channel), "").await;
+    }
     session.logout().await;
     result
 }

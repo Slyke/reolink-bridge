@@ -6,7 +6,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes, to_bytes},
     extract::{
         DefaultBodyLimit, Path, Request as HttpRequest, State, WebSocketUpgrade,
         rejection::{BytesRejection, JsonRejection},
@@ -77,7 +77,7 @@ pub fn router(app: Arc<App>, ws_path: &str) -> Router {
         .with_state(app.clone());
     routes
         .merge(crate::api::router(app.api.clone()))
-        .layer(middleware::from_fn(correlate))
+        .layer(middleware::from_fn_with_state(app.hub.clone(), correlate))
 }
 
 const CORRELATION_HEADER: &str = "x-correlation-id";
@@ -85,7 +85,7 @@ const CORRELATION_HEADER: &str = "x-correlation-id";
 #[derive(Clone)]
 pub(crate) struct CorrelationId(pub(crate) String);
 
-async fn correlate(mut request: HttpRequest, next: Next) -> Response {
+async fn correlate(State(hub): State<Arc<Hub>>, mut request: HttpRequest, next: Next) -> Response {
     let id = request
         .headers()
         .get(CORRELATION_HEADER)
@@ -95,7 +95,34 @@ async fn correlate(mut request: HttpRequest, next: Next) -> Response {
         .unwrap_or_else(Uuid::new_v4);
     let id = id.to_string();
     request.extensions_mut().insert(CorrelationId(id.clone()));
+    let method = request.method().as_str().to_owned();
+    let readiness = request.uri().path() == "/readyz";
     let mut response = next.run(request).await;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        let status = response.status().as_u16();
+        let (mut parts, body) = response.into_parts();
+        let bytes = to_bytes(body, 16_384).await.unwrap_or_default();
+        parts.headers.remove("content-length");
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let key = value["errorKey"]
+            .as_str()
+            .filter(|key| hub.diagnostics.knows(key))
+            .unwrap_or(if readiness {
+                "HTTP_READINESS_FAILED"
+            } else {
+                "HTTP_REQUEST_REJECTED"
+            });
+        if !hub.diagnostics.already_reported(&id, key) {
+            hub.diagnostics.error(
+                "http::request",
+                key,
+                Some(id.clone()),
+                json!({"httpStatus":status,"method":method}),
+                None,
+            );
+        }
+        response = Response::from_parts(parts, Body::from(bytes));
+    }
     response.headers_mut().insert(
         CORRELATION_HEADER,
         HeaderValue::from_str(&id).expect("valid UUID header"),
