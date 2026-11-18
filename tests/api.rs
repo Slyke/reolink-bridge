@@ -746,6 +746,29 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         ensure!(Instant::now() < until, "API failure was not logged");
         sleep(Duration::from_millis(20)).await;
     }
+    // Correlation IDs connect traces; reusing one must not suppress a later failed request.
+    let repeated = Uuid::new_v4().to_string();
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .get(&storage)
+                .bearer_auth("wrong")
+                .header("x-correlation-id", &repeated)
+                .send()
+                .await?
+                .status(),
+            401
+        );
+    }
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let logs = std::fs::read_to_string(&log_file).unwrap_or_default();
+        if logs.lines().filter(|line| line.contains(&repeated)).count() == 2 {
+            break;
+        }
+        ensure!(Instant::now() < until, "repeated failures were suppressed");
+        sleep(Duration::from_millis(20)).await;
+    }
     let search = format!("{origin}/api/cameras/fixture/recordings?date=2026-11-17&stream=sub");
     let clips = response(&client, &search, SERVICE, None).await;
     assert_eq!(clips.0, 200, "{clips:?}");

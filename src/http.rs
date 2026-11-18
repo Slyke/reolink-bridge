@@ -85,7 +85,13 @@ const CORRELATION_HEADER: &str = "x-correlation-id";
 #[derive(Clone)]
 pub(crate) struct CorrelationId(pub(crate) String);
 
-async fn correlate(State(hub): State<Arc<Hub>>, mut request: HttpRequest, next: Next) -> Response {
+async fn correlate(State(hub): State<Arc<Hub>>, request: HttpRequest, next: Next) -> Response {
+    crate::diagnostics::REQUEST_ERRORS
+        .scope(Default::default(), correlate_request(hub, request, next))
+        .await
+}
+
+async fn correlate_request(hub: Arc<Hub>, mut request: HttpRequest, next: Next) -> Response {
     let id = request
         .headers()
         .get(CORRELATION_HEADER)
@@ -112,7 +118,7 @@ async fn correlate(State(hub): State<Arc<Hub>>, mut request: HttpRequest, next: 
             } else {
                 "HTTP_REQUEST_REJECTED"
             });
-        if !hub.diagnostics.already_reported(&id, key) {
+        if !hub.diagnostics.already_reported(key) {
             hub.diagnostics.error(
                 "http::request",
                 key,

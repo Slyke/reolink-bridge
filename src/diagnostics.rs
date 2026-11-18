@@ -1,7 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -14,6 +15,10 @@ use styleguide_logger::{
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
+
+tokio::task_local! {
+    pub(crate) static REQUEST_ERRORS: RefCell<BTreeSet<String>>;
+}
 
 pub const SERVICE: &str = "reolink-bridge";
 pub struct BuildInfo {
@@ -54,7 +59,6 @@ pub struct Diagnostics {
     codes: Arc<ErrorCodeMap>,
     startup_runtime: Option<Value>,
     queue_full_reported: Arc<AtomicBool>,
-    reported: Arc<Mutex<BTreeMap<(String, String), std::time::Instant>>>,
 }
 
 enum Record {
@@ -129,7 +133,6 @@ impl Diagnostics {
                 codes: Arc::new(codes),
                 startup_runtime,
                 queue_full_reported: Arc::new(AtomicBool::new(false)),
-                reported: Arc::default(),
             },
             task,
         ))
@@ -166,18 +169,9 @@ impl Diagnostics {
         context: Value,
         cause: Option<anyhow::Error>,
     ) -> Value {
-        if let Some(id) = &correlation_id {
-            let mut reported = self.reported.lock().unwrap();
-            if reported.len() >= 1024
-                && let Some(oldest) = reported
-                    .iter()
-                    .min_by_key(|(_, time)| *time)
-                    .map(|(key, _)| key.clone())
-            {
-                reported.remove(&oldest);
-            }
-            reported.insert((id.clone(), key.into()), std::time::Instant::now());
-        }
+        let _ = REQUEST_ERRORS.try_with(|keys| {
+            keys.borrow_mut().insert(key.into());
+        });
         let options = error_options(caller, key, correlation_id, context, cause);
         let code = self
             .codes
@@ -195,11 +189,10 @@ impl Diagnostics {
         reply
     }
 
-    pub fn already_reported(&self, id: &str, key: &str) -> bool {
-        self.reported
-            .lock()
-            .unwrap()
-            .contains_key(&(id.into(), key.into()))
+    pub fn already_reported(&self, key: &str) -> bool {
+        REQUEST_ERRORS
+            .try_with(|keys| keys.borrow().contains(key))
+            .unwrap_or(false)
     }
 
     pub fn knows(&self, key: &str) -> bool {
