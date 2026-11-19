@@ -473,6 +473,9 @@ pub fn parse(mut document: Value, environment: &impl Fn(&str) -> Option<String>)
         }
     }
     validate_callbacks(&config.callbacks, &ids)?;
+    if let Some(api) = &config.api {
+        api.validate_initial_passwords(raw.get("api").unwrap_or(&raw["wui"]))?;
+    }
     Ok(config)
 }
 
@@ -640,6 +643,34 @@ pub fn write_callbacks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_initial_password_must_resolve_and_satisfy_the_camera_password_rules() {
+        let mut doc = document(include_str!("../bridge.example.json5")).unwrap();
+        doc["api"] = serde_json::json!({"targets":{"staging":{
+            "host":"192.168.2.2","cameraId":"new-camera","initialPassword":"${NEW_CAMERA_PASSWORD}"
+        }}});
+        let parse_with = |secret: Option<&str>| {
+            parse(doc.clone(), &|name| match name {
+                "NEW_CAMERA_PASSWORD" => secret.map(str::to_owned),
+                _ => Some("fixture-password".into()),
+            })
+        };
+        assert!(parse_with(Some("Valid<&123>")).is_ok());
+        for value in [
+            None,
+            Some(""),
+            Some("short"),
+            Some("password\ncontrol"),
+            Some("01234567890123456789012345678901"),
+        ] {
+            let error = parse_with(value)
+                .err()
+                .expect("invalid configured password")
+                .to_string();
+            assert!(error.contains("api.targets.staging.initialPassword"));
+        }
+    }
 
     #[test]
     fn example_validates_and_callback_edit_preserves_environment_references() {

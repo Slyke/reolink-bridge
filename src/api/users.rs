@@ -140,9 +140,10 @@ async fn edit(
         || body.username.trim().is_empty()
         || body.username.len() > 64
         || body.username.chars().any(char::is_control)
-        || body.password.as_ref().is_some_and(|p| {
-            !(8..=31).contains(&p.len()) || !p.bytes().all(|b| (0x20..=0x7e).contains(&b))
-        })
+        || body
+            .password
+            .as_deref()
+            .is_some_and(|p| !credentials::valid_new_password(p))
     {
         return error(StatusCode::UNPROCESSABLE_ENTITY, invalid, &correlation);
     }

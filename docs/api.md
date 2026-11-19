@@ -92,7 +92,26 @@ To enable HTTP callback administration set `api.callbackDestinations` to a list 
 
 The former `wui` config key is accepted as an alias for `api` during upgrades. Clients should use the paths in the table.
 
-The password protocol is gated to the verified Lumus E430 revision and firmware. First-password setup checks the complete UID and the factory admin user list. For other devices set the password with Reolink Client on the LAN, configure `targets.<name>.importPassword` privately, and resume as an import. Existing non-enrolled cameras require a configured `api.rotationIds.<cameraId>` object with a printed UID and/or serial. The bridge checks that binding again with fresh authenticated reads before a change.
+### Set the first admin password over the LAN
+
+Configure a factory-new camera under `api.targets`. Its public camera ID belongs in `cameras[]` after enrollment. For example, this entry inside `api.targets` takes the desired first password from the bridge environment.
+
+```json
+{
+  "e1-pro": {
+    "cameraId": "e1-pro",
+    "host": "192.168.1.12",
+    "port": 9000,
+    "initialPassword": "${REO_CAM_PASSWORD}"
+  }
+}
+```
+
+Use the camera's wired or wireless LAN address. Omitting `initialPassword` lets the bridge generate the password. An explicitly configured value must resolve to 8–31 printable ASCII characters. Use `importPassword` to verify a password already set on the camera.
+
+Initialization supports Lumus E430 (`IPC_NT1NO24MP`, `v3.1.0.6198_2604102075`) and E1 Pro E330 (`IPC_NT1NA45MP`, `v3.1.0.4417_2412122130`). It runs only on a confirmed enrollment request. The bridge signs in to the factory admin account, matches the full printed UID, checks the firmware and sole administrator, stages the credential in its private vault, and verifies a fresh login and device identity after setting the password.
+
+The E1 Pro support covers first-password setup. Camera account management and rotation support the Lumus revision above. For other revisions, use the device's supported initialization method, configure the target's `importPassword`, and resume enrollment as an import. Rotation on a statically configured camera without a vault binding requires `api.rotationIds.<cameraId>` with a printed UID or serial.
 
 `restart-required` means the bridge verified a stored credential. Restart the private bridge to start the new workers or switch existing ones to the verified credential. Do not add a duplicate static camera entry for a vault-managed camera. Read inventory after the restart for the active camera IDs. MQTT clients also need broker ACLs for the new camera topics.
 

@@ -326,6 +326,101 @@ async fn background_previews_are_authenticated_and_wait_for_each_image() -> Resu
 }
 
 #[tokio::test]
+async fn e1_pro_factory_enrollment_uses_configured_password_and_hands_off_to_static_config()
+-> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let vault = directory.path().join("vault");
+    std::fs::create_dir(&vault)?;
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o700))?;
+    let version = "<body><VersionInfo><name>E1 Pro</name><itemNo>E Series E330</itemNo><hardwareVersion>IPC_NT1NA45MP</hardwareVersion><firmwareVersion>v3.1.0.4417_2412122130</firmwareVersion><serialNumber>FIXTURE-SERIAL</serialNumber></VersionInfo></body>";
+    let camera = Arc::new(baichuan::Camera {
+        version_info: Some(version.replace("4417", "9999")).into(),
+        password: Some(String::new()).into(),
+        ..Default::default()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let camera_port = listener.local_addr()?.port();
+    tokio::spawn(camera.clone().serve(listener));
+
+    let port = free_port()?;
+    let origin = format!("http://127.0.0.1:{port}");
+    let config = directory.path().join("bridge.json5");
+    let first_password = "Fixture<Pass&123>";
+    let mut body = json!({
+        "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
+        "mqtt":{"url":"mqtt://127.0.0.1:1","baseTopic":"fixture"},
+        "cameras":[],
+        "api":{"storageDirectory":vault,"targets":{"e1-pro":{
+            "cameraId":"e1-pro","host":"127.0.0.1","port":camera_port,"initialPassword":first_password
+        }}}
+    });
+    std::fs::write(&config, body.to_string())?;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let mut bridge = start(&config, &client, &origin).await?;
+    let targets = response(
+        &client,
+        &format!("{origin}/api/enrollment-targets"),
+        PRIMARY,
+        None,
+    )
+    .await
+    .1;
+    assert_eq!(targets["targets"], json!(["e1-pro"]));
+    assert!(!targets.to_string().contains(first_password));
+    let id = Uuid::new_v4();
+    let enrollments = format!("{origin}/api/enrollments");
+    let resume = format!("{enrollments}/{id}/resume");
+    let request =
+        json!({"id":id,"target":"e1-pro","method":"initialize","uid":UID,"confirmation":true});
+    let unsupported = response(&client, &enrollments, PRIMARY, Some(request.clone())).await;
+    assert_eq!(unsupported.1["status"], "local-setup-required");
+    assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 0);
+    *camera.version_info.lock().unwrap() = Some(version.into());
+    camera
+        .users
+        .lock()
+        .unwrap()
+        .insert("existing".into(), (false, "fixture".into()));
+    let configured = response(&client, &resume, PRIMARY, Some(json!({}))).await;
+    assert_eq!(configured.1["status"], "local-setup-required");
+    assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 0);
+    camera.users.lock().unwrap().clear();
+    let initialized = response(&client, &resume, PRIMARY, Some(json!({}))).await;
+    assert_eq!(initialized.1["status"], "restart-required");
+    assert!(!initialized.1.to_string().contains(first_password));
+    assert_eq!(
+        camera.password.lock().unwrap().as_deref(),
+        Some(first_password)
+    );
+    let replay = response(&client, &enrollments, PRIMARY, Some(request)).await;
+    assert_eq!(replay.1["status"], "restart-required");
+    assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 1);
+    bridge.kill().await?;
+
+    body["api"]["targets"] = json!({});
+    body["cameras"] = json!([{"id":"e1-pro","host":"127.0.0.1","username":"admin","password":first_password,
+        "channel":0,"baichuanPort":camera_port,"onvifPort":null,"eventTransport":"auto","ptz":"auto"}]);
+    std::fs::write(&config, body.to_string())?;
+    let _bridge = start(&config, &client, &origin).await?;
+    let status = response(&client, &format!("{enrollments}/{id}"), PRIMARY, None).await;
+    assert_eq!(status.1["status"], "active");
+    let accounts = response(
+        &client,
+        &format!("{origin}/api/cameras/e1-pro/users"),
+        PRIMARY,
+        None,
+    )
+    .await;
+    assert_eq!(accounts.1["users"][0]["username"], "admin");
+    assert_eq!(accounts.1["manageAccounts"], false);
+    assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires Mosquitto on PATH"]
 async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() -> Result<()> {
     let directory = tempfile::tempdir()?;

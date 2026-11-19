@@ -41,6 +41,7 @@ pub struct Camera {
     pub snapshot_requests: Mutex<Vec<tokio::time::Instant>>,
     pub snapshot_delay: std::time::Duration,
     pub reject_snapshots: AtomicBool,
+    pub version_info: Mutex<Option<String>>,
     pub password: Mutex<Option<String>>,
     pub users: Mutex<BTreeMap<String, (bool, String)>>,
     pub schedule_xml: Mutex<Option<String>>,
@@ -367,7 +368,7 @@ impl Camera {
             }
             433 => "<body><PtzCurPos><channelId>0</channelId><pPos>725</pPos><tPos>110</tPos></PtzCurPos></body>".into(),
             58 => {
-                let mut list = String::from("<body><UserList><User><userName>admin</userName><userLevel>1</userLevel><userId>1</userId><loginState>1</loginState><password>fixture-hidden</password></User>");
+                let mut list = String::from("<body><UserList version=\"1.1\"><User><userName>admin</userName><userLevel>1</userLevel><userId>1</userId><loginState>1</loginState><password>fixture-hidden</password></User>");
                 for (index,(name,(admin,_))) in self.users.lock().unwrap().iter().enumerate() {
                     let name = name.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
                     list.push_str(&format!("<User><userName>{name}</userName><userLevel>{}</userLevel><userId>{}</userId></User>", u8::from(*admin), index + 2));
@@ -383,7 +384,7 @@ impl Camera {
                 self.writes.fetch_add(1,Ordering::SeqCst);
                 String::new()
             }
-            80 => "<body><VersionInfo><name>Test Camera</name><itemNo>CAM-001</itemNo><hardwareVersion>IPC_NT1NO24MP</hardwareVersion><firmwareVersion>v3.1.0.6198_2604102075</firmwareVersion><serialNumber>FIXTURE-SERIAL</serialNumber></VersionInfo></body>".into(),
+            80 => self.version_info.lock().unwrap().clone().unwrap_or_else(|| "<body><VersionInfo><name>Test Camera</name><itemNo>CAM-001</itemNo><hardwareVersion>IPC_NT1NO24MP</hardwareVersion><firmwareVersion>v3.1.0.6198_2604102075</firmwareVersion><serialNumber>FIXTURE-SERIAL</serialNumber></VersionInfo></body>".into()),
             114 => "<body><Uid><uid>952700FIXTURE0001</uid></Uid></body>".into(),
             208 => {
                 let state = if self.led.load(Ordering::SeqCst) { "open" } else { "close" };

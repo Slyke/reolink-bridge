@@ -24,6 +24,7 @@ pub struct Target {
     pub host: Ipv4Addr,
     #[serde(default = "port")]
     pub port: u16,
+    pub initial_password: Option<String>,
     pub import_password: Option<String>,
 }
 
@@ -469,14 +470,17 @@ impl Vault {
             return self.save(data);
         }
         let mut replacement = old.clone();
-        replacement.password = generated_password();
+        replacement.password = target
+            .initial_password
+            .clone()
+            .unwrap_or_else(generated_password);
         let Ok(payload) = account_payload(
             &mut session,
             &old.username,
             &old.username,
             UserAction::Password,
             Some(&replacement.password),
-            true,
+            AccountUse::FirstPassword,
         )
         .await
         else {
@@ -554,7 +558,7 @@ impl Vault {
             &old.username,
             UserAction::Password,
             Some(&next.password),
-            false,
+            AccountUse::Management,
         )
         .await?;
         data.rotations.insert(
@@ -609,7 +613,7 @@ impl Vault {
                 username,
                 action,
                 password,
-                false,
+                AccountUse::Management,
             )
             .await?;
             let mut data = self.data.clone();
@@ -728,12 +732,32 @@ async fn identified(session: &mut Session, expected: &Identifiers) -> bool {
     expected.valid()
 }
 
-async fn password_protocol(session: &mut Session) -> Result<bool> {
+pub(super) fn valid_new_password(password: &str) -> bool {
+    (8..=31).contains(&password.len()) && password.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccountUse {
+    FirstPassword,
+    Management,
+}
+
+async fn password_protocol(session: &mut Session, purpose: AccountUse) -> Result<bool> {
     let info = session.command(80, None, "").await?;
     let info = xml::document(&info)?;
+    let root = info.root_element();
     Ok(
-        xml::value(info.root_element(), "hardwareVersion") == Some("IPC_NT1NO24MP")
-            && xml::value(info.root_element(), "firmwareVersion") == Some("v3.1.0.6198_2604102075"),
+        match (
+            xml::value(root, "hardwareVersion"),
+            xml::value(root, "firmwareVersion"),
+        ) {
+            (Some("IPC_NT1NO24MP"), Some("v3.1.0.6198_2604102075")) => true,
+            (Some("IPC_NT1NA45MP"), Some("v3.1.0.4417_2412122130")) => {
+                purpose == AccountUse::FirstPassword
+                    && xml::value(root, "itemNo") == Some("E Series E330")
+            }
+            _ => false,
+        },
     )
 }
 
@@ -788,7 +812,9 @@ pub async fn list_users(device: &Device) -> Result<(Vec<CameraUser>, bool)> {
         })
         .collect();
     let writable = users.iter().any(|u| u.bridge_login && u.administrator)
-        && password_protocol(&mut session).await.unwrap_or(false);
+        && password_protocol(&mut session, AccountUse::Management)
+            .await
+            .unwrap_or(false);
     session.logout().await;
     Ok((users, writable))
 }
@@ -835,10 +861,10 @@ async fn account_payload(
     target_name: &str,
     action: UserAction,
     password: Option<&str>,
-    factory: bool,
+    purpose: AccountUse,
 ) -> Result<String> {
     ensure!(
-        password_protocol(session).await?,
+        password_protocol(session, purpose).await?,
         "unsupported device account protocol"
     );
     let raw = session.user_list(operator).await?;
@@ -877,7 +903,8 @@ async fn account_payload(
         UserAction::Password => {
             ensure!(target.is_some(), "unknown device user");
             ensure!(
-                !factory || (users.len() == 1 && operator == "admin" && target_name == operator),
+                purpose != AccountUse::FirstPassword
+                    || (users.len() == 1 && operator == "admin" && target_name == operator),
                 "factory state not verified"
             );
         }

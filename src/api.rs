@@ -63,6 +63,24 @@ pub struct Config {
     recordings: recordings::Config,
 }
 
+impl Config {
+    pub(crate) fn validate_initial_passwords(&self, input: &Value) -> Result<()> {
+        for (name, target) in &self.targets {
+            if !input["targets"][name]["initialPassword"].is_null() {
+                let field = format!("api.targets.{name}.initialPassword");
+                let Some(password) = &target.initial_password else {
+                    anyhow::bail!("set the environment variable for {field}");
+                };
+                ensure!(
+                    credentials::valid_new_password(password),
+                    "{field} must contain 8 to 31 printable ASCII characters"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct Api {
     pub config: Config,
     http_token: String,
