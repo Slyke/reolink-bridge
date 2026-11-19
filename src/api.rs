@@ -8,6 +8,7 @@ mod users;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::Ipv4Addr,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -16,7 +17,7 @@ use std::{
 use anyhow::{Result, ensure};
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -41,6 +42,7 @@ use crate::{
         wire::Device,
     },
 };
+pub(crate) use credentials::factory_setup_pending;
 use credentials::{
     Credential, EnrollmentMethod, EnrollmentRequest, Identifiers, Status, Target, Vault,
 };
@@ -85,7 +87,8 @@ pub struct Api {
     pub config: Config,
     http_token: String,
     vault: Option<Mutex<Vault>>,
-    configured: BTreeSet<String>,
+    enrollment_cameras: BTreeMap<String, Target>,
+    enrollment_gates: BTreeMap<String, CancellationToken>,
     pub registered: BTreeSet<String>,
     identities: BTreeMap<String, String>,
     inactive_identities: BTreeMap<String, crate::identity::HardwareId>,
@@ -103,7 +106,7 @@ pub struct Api {
 
 impl Api {
     pub fn prepare(
-        config: Config,
+        mut config: Config,
         cameras: &mut Vec<Camera>,
         http_token: &str,
         snapshot_slot: Arc<Semaphore>,
@@ -120,6 +123,20 @@ impl Api {
             .map(|c| (c.id.clone(), c.identity().to_owned()))
             .collect();
         let stable_ids: BTreeSet<_> = identities.values().cloned().collect();
+        let mut configured_aliases = BTreeMap::new();
+        for (name, target) in &config.targets {
+            for camera in cameras.iter().filter(|cam| {
+                cam.channel == 0
+                    && cam.baichuan_port == Some(target.port)
+                    && cam.host.parse::<Ipv4Addr>().ok() == Some(target.host)
+            }) {
+                ensure!(
+                    camera.username == "admin" && camera.identity() == target.camera_id,
+                    "named enrollment target conflicts with a configured camera on the same endpoint"
+                );
+                configured_aliases.insert(name.clone(), camera.id.clone());
+            }
+        }
         let mut addresses = BTreeSet::new();
         let mut target_ids = BTreeSet::new();
         ensure!(
@@ -127,8 +144,9 @@ impl Api {
                 && config.targets.iter().all(|(id, target)| {
                     valid_id(id)
                         && valid_id(&target.camera_id)
-                        && !configured.contains(&target.camera_id)
-                        && !stable_ids.contains(&target.camera_id)
+                        && (configured_aliases.contains_key(id)
+                            || (!configured.contains(&target.camera_id)
+                                && !stable_ids.contains(&target.camera_id)))
                         && target_ids.insert(target.camera_id.clone())
                         && target.port != 0
                         && (target.host.is_private()
@@ -188,7 +206,10 @@ impl Api {
         let mut registered = configured.clone();
         if let Some(vault) = &vault {
             identities.extend(vault.configure(cameras, &config.targets)?);
-            for stable in vault.registered().filter(|id| target_ids.contains(*id)) {
+            for stable in vault
+                .registered()
+                .filter(|id| target_ids.contains(*id) && !stable_ids.contains(*id))
+            {
                 ensure!(
                     registered.insert(stable.clone()),
                     "configured camera ID collides with a vaulted camera"
@@ -226,6 +247,32 @@ impl Api {
                 ))
             })
             .collect();
+        let enrollment_cameras: BTreeMap<_, _> = cameras
+            .iter()
+            .filter(|cam| vault.is_some() && configured.contains(&cam.id))
+            .filter_map(|cam| {
+                Some((
+                    cam.id.clone(),
+                    Target::from_camera(cam, config.rotation_ids.get(&cam.id))?,
+                ))
+            })
+            .collect();
+        for (alias, public_id) in configured_aliases {
+            if let Some(camera) = enrollment_cameras.get(&public_id) {
+                config.targets.insert(alias, camera.clone());
+            } else {
+                config.targets.remove(&alias);
+            }
+        }
+        let enrollment_gates = enrollment_cameras
+            .iter()
+            .filter(|(_, target)| {
+                vault
+                    .as_ref()
+                    .is_some_and(|v| v.credential(&target.camera_id).is_none())
+            })
+            .map(|(id, _)| (id.clone(), CancellationToken::new()))
+            .collect();
         let store = preview::store(&config.previews)?;
         let previews = preview::prepare(
             &config.previews,
@@ -243,7 +290,8 @@ impl Api {
             config,
             http_token: http_token.to_owned(),
             vault: vault.map(Mutex::new),
-            configured: configured.iter().map(|id| identities[id].clone()).collect(),
+            enrollment_cameras,
+            enrollment_gates,
             registered,
             identities,
             inactive_identities,
@@ -261,11 +309,22 @@ impl Api {
         })
     }
 
+    pub fn enrollment_gate(&self, id: &str) -> Option<CancellationToken> {
+        self.enrollment_gates.get(id).cloned()
+    }
+
     fn enrollment_progress(&self, vault: &Vault, id: Uuid) -> Option<(Status, Option<String>)> {
         vault.progress(id, |stable| {
             self.active
                 .iter()
-                .find(|public| self.identities[*public] == stable)
+                .find(|public| {
+                    self.identities[*public] == stable
+                        && self.devices.get(*public).is_some_and(|device| {
+                            vault
+                                .credential(stable)
+                                .is_some_and(|credential| credential.password == device.password)
+                        })
+                })
                 .cloned()
         })
     }
@@ -368,6 +427,10 @@ pub fn router(api: Arc<Api>) -> Router {
         .route("/api/cameras/{id}/media/{stream}", get(media::get))
         .route("/api/cameras/{id}/preview", get(preview::get))
         .route("/api/enrollment-targets", get(targets))
+        .route(
+            "/api/enrollment-targets/identify",
+            get(identify_enrollment_camera),
+        )
         .route("/api/enrollments", post(enroll))
         .route("/api/enrollments/{id}", get(enrollment_status))
         .route("/api/enrollments/{id}/resume", post(resume))
@@ -651,7 +714,75 @@ async fn targets(
     if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    Json(json!({"targets":api.config.targets.keys().collect::<Vec<_>>(),"correlation_id":correlation.0})).into_response()
+    Json(json!({"addressLookup":api.vault.is_some(),"targets":api.config.targets.keys().collect::<Vec<_>>(),"correlation_id":correlation.0})).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentifyCamera {
+    address: Ipv4Addr,
+    port: Option<u16>,
+    method: EnrollmentMethod,
+}
+
+async fn identify_enrollment_camera(
+    State(api): State<Arc<Api>>,
+    headers: HeaderMap,
+    Extension(correlation): Extension<CorrelationId>,
+    Query(query): Query<IdentifyCamera>,
+) -> Response {
+    if !api.authenticated(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
+    }
+    if api.vault.is_none() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "API_ENROLLMENT_DISABLED",
+            &correlation,
+        );
+    }
+    let (name, target) =
+        match credentials::camera_at(&api.enrollment_cameras, query.address, query.port) {
+            Ok(camera) => camera,
+            Err(credentials::AddressError::Unknown) => {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    "API_ENROLLMENT_ADDRESS_UNKNOWN",
+                    &correlation,
+                );
+            }
+            Err(credentials::AddressError::Ambiguous) => {
+                return error(
+                    StatusCode::CONFLICT,
+                    "API_ENROLLMENT_ADDRESS_AMBIGUOUS",
+                    &correlation,
+                );
+            }
+        };
+    if query.method == EnrollmentMethod::Initialize
+        && !target
+            .initial_password
+            .as_deref()
+            .is_some_and(credentials::valid_new_password)
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "API_ENROLLMENT_PASSWORD_INVALID",
+            &correlation,
+        );
+    }
+    let Ok(_slot) = api.settings_slots.try_acquire() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "API_VAULT_BUSY",
+            &correlation,
+        );
+    };
+    match timeout(Duration::from_secs(15), target.identify(query.method)).await {
+        Ok(Ok((identity, model))) => Json(json!({"target": name, "address":target.host, "port":target.port,
+            "uid":identity.uid,"serial":identity.serial,"model":model,"correlation_id":correlation.0})).into_response(),
+        _ => error(StatusCode::BAD_GATEWAY, "API_ENROLLMENT_IDENTIFY_FAILED", &correlation),
+    }
 }
 
 async fn enroll(
@@ -679,7 +810,7 @@ async fn enroll(
     };
     let id = body.id;
     if vault
-        .start(body, &api.config.targets, &api.configured)
+        .start(body, &api.config.targets, &api.enrollment_cameras)
         .is_err()
     {
         return error(
@@ -770,7 +901,7 @@ async fn finish_enrollment(
     if !matches!(
         timeout(
             Duration::from_secs(53),
-            vault.resume(id, &api.config.targets, import)
+            vault.resume(id, &api.config.targets, &api.enrollment_cameras, import)
         )
         .await,
         Ok(Ok(()))
@@ -782,6 +913,22 @@ async fn finish_enrollment(
         );
     }
     let (status, camera) = api.enrollment_progress(vault, id).unwrap();
+    if status == Status::Active
+        && let Some(name) = camera.as_deref()
+        && let Some(gate) = api.enrollment_gates.get(name)
+        && !gate.is_cancelled()
+    {
+        if let Some(credential) = api.vault_key(name).and_then(|key| vault.credential(key))
+            && let Some(serial) = credential
+                .identifiers
+                .serial
+                .as_deref()
+                .and_then(crate::identity::HardwareId::serial)
+        {
+            api.hub().identify(name, Some(serial));
+        }
+        gate.cancel();
+    }
     progress(status, camera, correlation)
 }
 

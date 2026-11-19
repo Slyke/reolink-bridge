@@ -43,8 +43,9 @@ Replace the documentation address with a private IPv4 target from the installati
 | GET `/cameras/{id}/recordings/{recordingId}/metadata` | `http.token` | Timestamped object coordinates from the prepared recording, when embedded by the camera. Shares the video download/cache. |
 | GET `/cameras/{id}/recordings/{recordingId}/preview` | `http.token` | JPEG keyframe preview. Optional offsetMs selects a position within the clip (0–86400000, one-second buckets). Search first to obtain the ID. Does not require a writable recording workspace. |
 | GET `/cameras/{id}/media/{stream}` | `http.token` | Bounded multipart MJPEG stream from configured H.264 RTSP/TCP. FFmpeg is required in the private bridge environment. The RTSP client owns credentials; FFmpeg receives elementary video bytes. |
-| GET `/enrollment-targets` | `http.token` | Allowlisted target names. |
-| POST `/enrollments` | `http.token` | Reserve and begin a UUID operation with target, separate `uid` and/or `serial`, `method` (`initialize` or `import`), and `confirmation: true`. First-password flow requires a UID. |
+| GET `/enrollment-targets` | `http.token` | Named targets and `addressLookup`, which advertises lookup of cameras declared in `cameras[]`. |
+| GET `/enrollment-targets/identify?address=<IPv4>&method=initialize` | `http.token` | Match the configured camera, sign in and read its UID, reported serial and model. An optional `port` selects its Baichuan port. Use `method=import` for an initialized camera. |
+| POST `/enrollments` | `http.token` | Reserve and begin a UUID operation with target, separate `uid` and/or `serial`, `method` (`initialize` or `import`), and `confirmation: true`. First-password setup requires a UID. For a configured camera, also send its returned `address` and `port`. |
 | GET `/enrollments/{id}` and POST `/enrollments/{id}/resume` | `http.token` | Read or continue the persisted operation. Use `{"method":"import"}` after the local setup fallback. |
 | GET/POST `/cameras/{id}/rotation` and POST `/cameras/{id}/rotation/reconcile` | `http.token` | Check status, stage and submit one verified-device change, or verify the staged and previous credentials. POST requires UUID `id` and `confirmation: true`. |
 
@@ -74,7 +75,7 @@ The stream reads the bridge's event hub. Connections share its existing camera s
 
 The bridge authenticates HTTP and WebSocket clients with one PSK, `http.token`. A client holding that PSK can call the enabled operations for every configured camera. Applications manage user accounts and per-camera permissions. MQTT uses the broker's credentials and ACLs. When upgrading, point clients at the existing `http.token` and remove the retired `api.serviceToken`, `api.adminToken`, `api.cameraIds`, `api.commands`, and `api.events` fields.
 
-`api.storageDirectory` holds verified camera credentials and recoverable enrollment and password-rotation operations. Configure it when using `api.targets` or `api.rotationIds`. Generating a Wi-Fi QR in a client and using statically configured camera credentials needs no vault. Keep the directory after bridge-managed provisioning if it supplies the camera password. `api.recordings.temporaryDirectory` is the disposable video cache.
+`api.storageDirectory` holds verified camera credentials and recoverable enrollment and password-rotation operations. Configure it for camera enrollment or credential rotation. Generating a Wi-Fi QR in a client and using statically configured camera credentials needs no vault. Keep the directory after bridge-managed provisioning if it supplies the camera password. `api.recordings.temporaryDirectory` is the disposable video cache.
 
 Recording metadata is paginated within the prepared recording cache. Read the initial `/metadata` response and follow `?page=<nextPage>` until `nextPage` is null. Each page contains timestamped detections from the same clip. Video and metadata files share the configured byte and age limits.
 
@@ -94,26 +95,31 @@ The former `wui` config key is accepted as an alias for `api` during upgrades. C
 
 ### Set the first admin password over the LAN
 
-Configure a factory-new camera under `api.targets`. Its public camera ID belongs in `cameras[]` after enrollment. For example, this entry inside `api.targets` takes the desired first password from the bridge environment.
+Add the camera to `cameras[]` with its wired or wireless LAN IP, administrator username, and desired first password. Keep the private vault at `api.storageDirectory`. A minimal example follows.
 
 ```json
 {
-  "e1-pro": {
-    "cameraId": "e1-pro",
+  "api": { "storageDirectory": "/bridge-vault" },
+  "cameras": [{
+    "id": "e1-pro",
     "host": "192.168.1.12",
-    "port": 9000,
-    "initialPassword": "${REO_CAM_PASSWORD}"
-  }
+    "username": "admin",
+    "password": "${REO_CAM_PASSWORD}",
+    "baichuanPort": 9000,
+    "channel": 0
+  }]
 }
 ```
 
-Use the camera's wired or wireless LAN address. Omitting `initialPassword` lets the bridge generate the password. An explicitly configured value must resolve to 8–31 printable ASCII characters. Use `importPassword` to verify a password already set on the camera.
+Apply the camera configuration once. In **Settings → Enrollment**, choose the bridge and **Set first admin password**, enter the IP and select **Identify camera**. Leave the port blank to use the unique configured endpoint. Lookup is read-only and returns the camera’s full UID. Check it against the label and confirm **Start enrollment**. The bridge rechecks the identity, sets the configured password (8–31 printable ASCII characters), verifies a fresh login and starts the camera workers immediately. The client receives only identity and enrollment status. For a camera that already uses its configured password, select **Use an existing password** to verify it.
+
+Address lookup supports private IPv4, link-local or loopback entries using `admin`, channel zero and an enabled Baichuan port. Separately declared `api.targets` remain available by name. An existing named target matching the camera ID (or configured stable ID), address and port can stay as an alias and uses the camera entry’s password. A named target can supply `initialPassword`, omit it to generate a password, or specify `importPassword` for an existing login.
 
 Initialization supports Lumus E430 (`IPC_NT1NO24MP`, `v3.1.0.6198_2604102075`) and E1 Pro E330 (`IPC_NT1NA45MP`, `v3.1.0.4417_2412122130`). It runs only on a confirmed enrollment request. The bridge signs in to the factory admin account, matches the full printed UID, checks the firmware and sole administrator, stages the credential in its private vault, and verifies a fresh login and device identity after setting the password.
 
-The E1 Pro support covers first-password setup. Camera account management and rotation support the Lumus revision above. For other revisions, use the device's supported initialization method, configure the target's `importPassword`, and resume enrollment as an import. Rotation on a statically configured camera without a vault binding requires `api.rotationIds.<cameraId>` with a printed UID or serial.
+The E1 Pro support covers first-password setup. Camera account management and rotation support the Lumus revision above. For other revisions, use the device's supported initialization method, set the existing password in the camera configuration, and enroll using `import`. Rotation on a statically configured camera without a vault binding requires `api.rotationIds.<cameraId>` with a printed UID or serial.
 
-`restart-required` means the bridge verified a stored credential. Restart the private bridge to start the new workers or switch existing ones to the verified credential. Do not add a duplicate static camera entry for a vault-managed camera. Read inventory after the restart for the active camera IDs. MQTT clients also need broker ACLs for the new camera topics.
+A configured camera returns `active` once its running credential is verified. A named target awaiting its workers, or an existing worker using a different credential, returns `restart-required`. Restart the bridge in that case. MQTT clients need broker ACLs for the camera topics.
 
 After interruption use the existing enrollment status and resume, or rotation reconciliation, to test credentials without resending a password write. If the bridge reports `recovery-required`, use the printed ID and the bridge vault on the host to check current and staged credentials in a private maintenance session. Stop the bridge before restoring or repairing its vault, verify successful authentication to the same printed identifier, and restart it only after the credential reference is consistent. Avoid resetting or repeating a password change until you know which credential works.
 

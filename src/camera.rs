@@ -86,7 +86,10 @@ impl ControlHandle {
 }
 
 impl CameraTask {
-    pub fn start(self) -> (ControlHandle, impl Future<Output = ()> + Send) {
+    pub fn start(
+        self,
+        enrollment: Option<CancellationToken>,
+    ) -> (ControlHandle, impl Future<Output = ()> + Send) {
         let (commands, rx) = mpsc::channel(12);
         let (stops, stop_rx) = mpsc::channel(4);
         let controller = ControlHandle {
@@ -95,6 +98,18 @@ impl CameraTask {
             movement: Arc::new(SyncMutex::new(CancellationToken::new())),
         };
         let task = async move {
+            if let (Some(activation), Some(device)) = (&enrollment, &self.baichuan) {
+                tokio::select! {
+                    _ = self.stop.cancelled() => return,
+                    _ = activation.cancelled() => (),
+                    _ = async {
+                        if crate::api::factory_setup_pending(device).await {
+                            self.hub.availability(&self.config.id, None, "awaiting_enrollment");
+                            activation.cancelled().await;
+                        }
+                    } => (),
+                }
+            }
             let settings_lock = Mutex::new(());
             let capabilities = SyncMutex::new(ptz::Capabilities::new(
                 if self.baichuan.is_none() || self.config.ptz == PtzMode::Disabled {

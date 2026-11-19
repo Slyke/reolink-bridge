@@ -1,4 +1,8 @@
 {
+  "reolink-bridge-API_ENROLLMENT_ADDRESS_UNKNOWN": "No configured enrollment camera matches this IP address and port.",
+  "reolink-bridge-API_ENROLLMENT_ADDRESS_AMBIGUOUS": "More than one configured camera matches the enrollment address.",
+  "reolink-bridge-API_ENROLLMENT_PASSWORD_INVALID": "The configured first camera password must contain 8–31 printable ASCII characters.",
+  "reolink-bridge-API_ENROLLMENT_IDENTIFY_FAILED": "The bridge could not read the camera identity with the selected enrollment method.",
   "reolink-bridge-API_NETWORK_UNSUPPORTED": "This camera does not report configurable Wi-Fi.",
   "reolink-bridge-API_NETWORK_INVALID": "The Wi-Fi settings are invalid.",
   "reolink-bridge-API_NETWORK_BUSY": "A Wi-Fi change is already in progress for this camera.",

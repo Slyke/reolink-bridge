@@ -326,6 +326,206 @@ async fn background_previews_are_authenticated_and_wait_for_each_image() -> Resu
 }
 
 #[tokio::test]
+async fn configured_camera_enrolls_in_place_by_address() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let vault = directory.path().join("vault");
+    std::fs::create_dir(&vault)?;
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o700))?;
+    let version = "<body><VersionInfo><name>E1 Pro</name><itemNo>E Series E330</itemNo><hardwareVersion>IPC_NT1NA45MP</hardwareVersion><firmwareVersion>v3.1.0.4417_2412122130</firmwareVersion><serialNumber>FIXTURE-SERIAL</serialNumber></VersionInfo></body>";
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut jpeg).encode(
+        &[91; 48],
+        4,
+        4,
+        image::ExtendedColorType::Rgb8,
+    )?;
+    let camera = Arc::new(baichuan::Camera {
+        version_info: Some(version.into()).into(),
+        password: Some(String::new()).into(),
+        jpeg: Some(jpeg),
+        ..Default::default()
+    });
+    let socket = TcpListener::bind("127.0.0.1:0").await?;
+    let port = socket.local_addr()?.port();
+    tokio::spawn(camera.clone().serve(socket));
+    let http = free_port()?;
+    let origin = format!("http://127.0.0.1:{http}");
+    let configured_password = "Fixture!Desired22";
+    let config = directory.path().join("bridge.json5");
+    let mut body = json!({
+        "mqtt":{"url":"mqtt://127.0.0.1:1","baseTopic":"fixture"},
+        "http":{"listen":format!("127.0.0.1:{http}"),"token":PRIMARY},
+        "api":{"storageDirectory":vault,"previews":{"cameras":{"e1-pro":{"intervalMs":500}}}},
+        "cameras":[{"id":"e1-pro","stableId":"previous-name","host":"127.0.0.1","username":"admin","password":configured_password,
+            "onvifPort":null,"baichuanPort":port}]
+    });
+    std::fs::write(&config, body.to_string())?;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(12))
+        .build()?;
+    let mut bridge = start(&config, &client, &origin).await?;
+    let targets = format!("{origin}/api/enrollment-targets");
+    let lookup = format!("{targets}/identify?address=127.0.0.1&method=initialize");
+    let enroll = format!("{origin}/api/enrollments");
+    let available = response(&client, &targets, PRIMARY, None).await.1;
+    assert_eq!(available["targets"], json!([]));
+    assert_eq!(available["addressLookup"], true);
+    assert_eq!(response(&client, &lookup, "wrong", None).await.0, 401);
+    assert_eq!(
+        response(
+            &client,
+            &format!("{targets}/identify?address=127.0.0.2&method=initialize"),
+            PRIMARY,
+            None
+        )
+        .await
+        .0,
+        404
+    );
+    assert_eq!(
+        response(&client, &format!("{lookup}&port=0"), PRIMARY, None)
+            .await
+            .0,
+        404
+    );
+    let found = response(&client, &lookup, PRIMARY, None).await.1;
+    assert_eq!(found["target"], "e1-pro");
+    assert_eq!(found["port"], port);
+    assert_eq!(found["uid"], UID);
+    assert_eq!(found["serial"], "FIXTURE-SERIAL");
+    assert_eq!(found["model"], "E1 Pro");
+    assert!(!found.to_string().contains(configured_password));
+    let id = Uuid::new_v4();
+    let mut intent = json!({"id":id,"target":"e1-pro","address":"127.0.0.1","port":port,
+        "method":"initialize","uid":UID,"serial":"FIXTURE-SERIAL","confirmation":false});
+    assert_eq!(
+        response(&client, &enroll, PRIMARY, Some(intent.clone()))
+            .await
+            .0,
+        422
+    );
+    intent["confirmation"] = true.into();
+    let mut wrong = intent.clone();
+    wrong["address"] = "127.0.0.2".into();
+    assert_eq!(
+        response(&client, &enroll, PRIMARY, Some(wrong)).await.0,
+        422
+    );
+    let mut mismatch = intent.clone();
+    let old_id = Uuid::new_v4();
+    mismatch["id"] = json!(old_id);
+    mismatch["uid"] = "WRONGFULLUID".into();
+    assert_eq!(
+        response(&client, &enroll, PRIMARY, Some(mismatch)).await.1["status"],
+        "identity-mismatch"
+    );
+    assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 0);
+    let enrolled = response(&client, &enroll, PRIMARY, Some(intent.clone()))
+        .await
+        .1;
+    assert_eq!(enrolled["camera_id"], "e1-pro");
+    assert_eq!(enrolled["status"], "active");
+    assert!(!enrolled.to_string().contains(configured_password));
+    assert_eq!(
+        camera.password.lock().unwrap().as_deref(),
+        Some(configured_password)
+    );
+    assert_eq!(
+        response(&client, &enroll, PRIMARY, Some(intent)).await.1["status"],
+        "active"
+    );
+    assert_eq!(
+        response(
+            &client,
+            &format!("{enroll}/{old_id}/resume"),
+            PRIMARY,
+            Some(json!({}))
+        )
+        .await
+        .1["status"],
+        "identity-mismatch"
+    );
+    assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 1);
+    let inventory = response(&client, &format!("{origin}/api/inventory"), PRIMARY, None)
+        .await
+        .1;
+    assert_eq!(inventory["cameras"][0]["stableId"], "FIXTURE-SERIAL");
+    assert_eq!(
+        response(
+            &client,
+            &format!("{origin}/api/cameras/e1-pro/users"),
+            PRIMARY,
+            None
+        )
+        .await
+        .1["users"][0]["username"],
+        "admin"
+    );
+    let until = Instant::now() + Duration::from_secs(6);
+    while camera.snapshot_requests.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() < until,
+            "camera preview worker did not activate after enrollment"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+    bridge.kill().await?;
+    // An ordinary later restart retains the verified binding. An optional port now disambiguates two cameras on one address.
+    let other = Arc::new(baichuan::Camera {
+        version_info: Some(version.replace("FIXTURE-SERIAL", "FIXTURE-OTHER")).into(),
+        ..Default::default()
+    });
+    let other_socket = TcpListener::bind("127.0.0.1:0").await?;
+    let other_port = other_socket.local_addr()?.port();
+    body["api"]["rotationIds"] = json!({"already-set":{"serial":"FIXTURE-OTHER"}});
+    body["api"]["targets"] =
+        json!({"existing-name":{"cameraId":"previous-name","host":"127.0.0.1","port":port}});
+    tokio::spawn(other.clone().serve(other_socket));
+    body["cameras"].as_array_mut().unwrap().push(
+        json!({"id":"already-set","host":"127.0.0.1","username":"admin",
+        "password":baichuan::PASSWORD,"baichuanPort":other_port,"onvifPort":null}),
+    );
+    std::fs::write(&config, body.to_string())?;
+    let _bridge = start(&config, &client, &origin).await?;
+    assert_eq!(
+        response(&client, &format!("{enroll}/{id}"), PRIMARY, None)
+            .await
+            .1["status"],
+        "active"
+    );
+    assert_eq!(
+        response(&client, &targets, PRIMARY, None).await.1["targets"],
+        json!(["existing-name"])
+    );
+    let lookup = format!("{targets}/identify?address=127.0.0.1&method=import");
+    assert_eq!(response(&client, &lookup, PRIMARY, None).await.0, 409);
+    let found = response(
+        &client,
+        &format!("{lookup}&port={other_port}"),
+        PRIMARY,
+        None,
+    )
+    .await
+    .1;
+    assert_eq!(found["target"], "already-set");
+    let imported = response(
+        &client,
+        &enroll,
+        PRIMARY,
+        Some(
+            json!({"id":Uuid::new_v4(),"target":"already-set","address":"127.0.0.1",
+        "port":other_port,"uid":found["uid"],"method":"import","confirmation":true}),
+        ),
+    )
+    .await
+    .1;
+    assert_eq!(imported["status"], "active");
+    assert_eq!(other.credential_writes.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn e1_pro_factory_enrollment_uses_configured_password_and_hands_off_to_static_config()
 -> Result<()> {
     let directory = tempfile::tempdir()?;

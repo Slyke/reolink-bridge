@@ -314,7 +314,7 @@ async fn run(
             hub: hub.clone(),
             stop: stop.clone(),
         }
-        .start();
+        .start(api.enrollment_gate(&id));
         workers.spawn(worker);
         let services = control_device.map(|device| {
             controls.insert(id.clone(), controller.clone());

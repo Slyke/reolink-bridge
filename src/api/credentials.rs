@@ -26,6 +26,118 @@ pub struct Target {
     pub port: u16,
     pub initial_password: Option<String>,
     pub import_password: Option<String>,
+    #[serde(skip)]
+    binding: Option<Identifiers>,
+}
+
+pub(super) enum AddressError {
+    Unknown,
+    Ambiguous,
+}
+
+pub(super) fn camera_at(
+    cameras: &BTreeMap<String, Target>,
+    address: Ipv4Addr,
+    port: Option<u16>,
+) -> std::result::Result<(&str, &Target), AddressError> {
+    let mut matches = cameras.iter().filter(|(_, camera)| {
+        camera.host == address && port.is_none_or(|port| port == camera.port)
+    });
+    let (name, camera) = matches.next().ok_or(AddressError::Unknown)?;
+    if matches.next().is_some() {
+        return Err(AddressError::Ambiguous);
+    }
+    Ok((name, camera))
+}
+
+impl Target {
+    pub(super) fn from_camera(camera: &Camera, binding: Option<&Identifiers>) -> Option<Self> {
+        let host: Ipv4Addr = camera.host.parse().ok()?;
+        if camera.username != "admin"
+            || camera.channel != 0
+            || !(host.is_private() || host.is_link_local() || host.is_loopback())
+        {
+            return None;
+        }
+        let password = camera.password.clone()?;
+        Some(Self {
+            host,
+            port: camera.baichuan_port?,
+            camera_id: camera.identity().to_owned(),
+            initial_password: Some(password.clone()),
+            import_password: Some(password),
+            binding: binding.cloned(),
+        })
+    }
+
+    pub(super) async fn identify(
+        &self,
+        method: EnrollmentMethod,
+    ) -> Result<(Identifiers, Option<String>)> {
+        let password = match method {
+            EnrollmentMethod::Initialize => String::new(),
+            EnrollmentMethod::Import => self
+                .import_password
+                .clone()
+                .context("missing camera credential")?,
+        };
+        let device = Device {
+            host: self.host.to_string(),
+            port: self.port,
+            channel: 0,
+            username: "admin".into(),
+            password,
+        };
+        let mut session = device.connect().await?;
+        let result = reported_identity(&mut session).await;
+        session.logout().await;
+        result
+    }
+}
+
+async fn reported_identity(session: &mut Session) -> Result<(Identifiers, Option<String>)> {
+    let raw = session.command(114, None, "").await?;
+    let doc = xml::document(&raw)?;
+    let uid = xml::value(doc.root_element(), "uid")
+        .context("camera omitted its UID")?
+        .to_owned();
+    let mut identity = Identifiers {
+        uid: Some(uid),
+        serial: None,
+    };
+    ensure!(identity.valid(), "camera reported an invalid UID");
+    let mut model = None;
+    if let Ok(raw) = session.command(80, None, "").await
+        && let Ok(doc) = xml::document(&raw)
+    {
+        let root = doc.root_element();
+        identity.serial = ["serialNumber", "serialNo"]
+            .iter()
+            .find_map(|key| {
+                crate::identity::HardwareId::serial(xml::value(root, key)?)
+                    .map(|serial| serial.value)
+            })
+            .filter(|s| s.len() >= 4);
+        model = xml::value(root, "name")
+            .filter(|s| !s.is_empty() && s.len() <= 96 && !s.chars().any(char::is_control))
+            .map(str::to_owned);
+    }
+    Ok((identity, model))
+}
+
+pub(crate) async fn factory_setup_pending(device: &Device) -> bool {
+    if let Ok(mut session) = device.connect().await {
+        session.logout().await;
+        return false;
+    }
+    let mut factory = device.clone();
+    factory.password.clear();
+    let Ok(mut session) = factory.connect().await else {
+        return false;
+    };
+    let identified = reported_identity(&mut session).await.is_ok();
+    session.logout().await;
+    identified
 }
 
 fn port() -> u16 {
@@ -40,6 +152,18 @@ pub struct Identifiers {
 }
 
 impl Identifiers {
+    fn matches(&self, reported: &Identifiers) -> bool {
+        [(&self.uid, &reported.uid), (&self.serial, &reported.serial)]
+            .into_iter()
+            .all(|(expected, actual)| {
+                expected.as_ref().is_none_or(|expected| {
+                    actual
+                        .as_ref()
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+                })
+            })
+    }
+
     pub fn valid(&self) -> bool {
         (self.uid.is_some() || self.serial.is_some())
             && self.uid.as_ref().is_none_or(|id| {
@@ -66,11 +190,31 @@ pub struct EnrollmentRequest {
     pub uid: Option<String>,
     pub serial: Option<String>,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<Ipv4Addr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     pub method: EnrollmentMethod,
     pub confirmation: bool,
 }
 
 impl EnrollmentRequest {
+    fn resolve<'a>(
+        &self,
+        named: &'a BTreeMap<String, Target>,
+        cameras: &'a BTreeMap<String, Target>,
+    ) -> Result<&'a Target> {
+        match (self.address, self.port) {
+            (Some(address), Some(port)) => camera_at(cameras, address, Some(port))
+                .ok()
+                .filter(|(name, _)| *name == self.target)
+                .map(|(_, camera)| camera),
+            (None, None) => named.get(&self.target),
+            _ => None,
+        }
+        .context("unknown enrollment target")
+    }
+
     fn identifiers(&self) -> Identifiers {
         Identifiers {
             uid: self.uid.clone(),
@@ -120,6 +264,8 @@ struct Job {
     request: EnrollmentRequest,
     #[serde(default)]
     import_requested: bool,
+    #[serde(default)]
+    superseded: bool,
     camera: String,
     host: String,
     port: u16,
@@ -324,7 +470,7 @@ impl Vault {
         &mut self,
         request: EnrollmentRequest,
         targets: &BTreeMap<String, Target>,
-        configured: &BTreeSet<String>,
+        cameras: &BTreeMap<String, Target>,
     ) -> Result<()> {
         ensure!(
             request.confirmation
@@ -337,21 +483,33 @@ impl Vault {
             ensure!(request == existing.request, "enrollment conflict");
             return Ok(());
         }
-        let target = targets
-            .get(&request.target)
-            .context("unknown private target")?;
+        let target = request.resolve(targets, cameras)?;
+        if request.method == EnrollmentMethod::Initialize
+            && let Some(password) = &target.initial_password
+        {
+            ensure!(valid_new_password(password), "invalid first admin password");
+        }
         ensure!(
-            self.data.jobs.len() < 256
-                && !configured.contains(&target.camera_id)
-                && !self.data.devices.contains_key(&target.camera_id)
-                && !self
-                    .data
-                    .jobs
-                    .values()
-                    .any(|job| job.camera == target.camera_id),
+            self.data.jobs.len() < 256 && !self.data.devices.contains_key(&target.camera_id),
             "target already registered"
         );
         let mut data = self.data.clone();
+        for job in data
+            .jobs
+            .values_mut()
+            .filter(|job| job.camera == target.camera_id && !job.superseded)
+        {
+            ensure!(
+                request.address.is_some()
+                    && job.staged.is_none()
+                    && matches!(
+                        job.status,
+                        Status::IdentityMismatch | Status::LocalSetupRequired | Status::Waiting
+                    ),
+                "camera already has a pending enrollment"
+            );
+            job.superseded = true;
+        }
         data.jobs.insert(
             request.id,
             Job {
@@ -360,6 +518,7 @@ impl Vault {
                 port: target.port,
                 request,
                 import_requested: false,
+                superseded: false,
                 status: Status::Waiting,
                 staged: None,
             },
@@ -373,7 +532,8 @@ impl Vault {
         public_id: impl FnOnce(&str) -> Option<String>,
     ) -> Option<(Status, Option<String>)> {
         let job = self.data.jobs.get(&id)?;
-        let verified = self.data.devices.contains_key(&job.camera);
+        let verified =
+            job.status == Status::Verified && self.data.devices.contains_key(&job.camera);
         let active = public_id(&job.camera);
         let status = if verified {
             if active.is_some() {
@@ -394,16 +554,15 @@ impl Vault {
         &mut self,
         id: Uuid,
         targets: &BTreeMap<String, Target>,
+        cameras: &BTreeMap<String, Target>,
         import: bool,
     ) -> Result<()> {
         let mut data = self.data.clone();
         let job = data.jobs.get_mut(&id).context("unknown enrollment")?;
-        if data.devices.contains_key(&job.camera) {
+        if job.superseded || data.devices.contains_key(&job.camera) {
             return Ok(());
         }
-        let target = targets
-            .get(&job.request.target)
-            .context("unknown private target")?;
+        let target = job.request.resolve(targets, cameras)?;
         ensure!(
             job.host == target.host.to_string()
                 && job.port == target.port
@@ -449,9 +608,15 @@ impl Vault {
             };
             return self.save(data);
         };
-        if !identified(&mut session, &old.identifiers).await {
-            job.status = Status::IdentityMismatch;
-            return self.save(data);
+        let binding = target
+            .binding
+            .as_ref()
+            .filter(|binding| !binding.matches(&old.identifiers));
+        for expected in std::iter::once(&old.identifiers).chain(binding) {
+            if !identified(&mut session, expected).await {
+                job.status = Status::IdentityMismatch;
+                return self.save(data);
+            }
         }
         // Keep the verified serial available for recovery when a credential change pauses this camera.
         if old.identifiers.serial.is_none()
@@ -474,6 +639,10 @@ impl Vault {
             .initial_password
             .clone()
             .unwrap_or_else(generated_password);
+        ensure!(
+            valid_new_password(&replacement.password),
+            "invalid first admin password"
+        );
         let Ok(payload) = account_payload(
             &mut session,
             &old.username,
