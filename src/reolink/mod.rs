@@ -5,6 +5,7 @@ pub mod metadata;
 pub mod orientation;
 pub mod ptz;
 pub mod recording_media;
+pub mod recording_settings;
 pub mod recordings;
 pub mod wire;
 
@@ -71,6 +72,8 @@ pub async fn discover(
         Settings::Spotlight,
         Settings::Motion,
         Settings::Image,
+        Settings::RecordingSchedule,
+        Settings::TimeLapse,
     ];
     settings.extend(
         ai_types

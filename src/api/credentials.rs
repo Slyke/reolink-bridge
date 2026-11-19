@@ -153,6 +153,15 @@ struct Data {
     rotations: BTreeMap<String, Rotation>,
     #[serde(default)]
     spent_rotations: BTreeSet<Uuid>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    user_changes: BTreeMap<Uuid, UserChange>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct UserChange {
+    camera: String,
+    username: String,
+    status: Status,
 }
 
 pub struct Vault {
@@ -411,22 +420,24 @@ impl Vault {
             job.status = Status::Verified;
             return self.save(data);
         }
-        let Ok(payload) = change_payload(&mut session, &old.username, true).await else {
+        let mut replacement = old.clone();
+        replacement.password = generated_password();
+        let Ok(payload) = change_payload(
+            &mut session,
+            &old.username,
+            &old.username,
+            &replacement.password,
+            true,
+        )
+        .await
+        else {
             job.status = Status::LocalSetupRequired;
             return self.save(data);
         };
-        let mut replacement = old;
-        replacement.password = generated_password();
         job.status = Status::InProgress;
         job.staged = Some(replacement.clone());
         self.save(data)?;
-        let _ = session
-            .command(
-                59,
-                Some(0),
-                &payload.replace("{{API_PASSWORD}}", &replacement.password),
-            )
-            .await;
+        let _ = session.command(59, Some(0), &payload).await;
         drop(session);
         let mut data = self.data.clone();
         let job = data.jobs.get_mut(&id).unwrap();
@@ -457,7 +468,13 @@ impl Vault {
             })
     }
 
-    pub async fn rotate(&mut self, camera: &str, id: Uuid, old: Credential) -> Result<()> {
+    pub async fn rotate(
+        &mut self,
+        camera: &str,
+        id: Uuid,
+        old: Credential,
+        password: Option<String>,
+    ) -> Result<()> {
         if let Some(rotation) = self.data.rotations.get(camera) {
             if rotation.id == id {
                 return Ok(());
@@ -478,9 +495,16 @@ impl Vault {
             identified(&mut session, &old.identifiers).await,
             "rotation identity mismatch"
         );
-        let payload = change_payload(&mut session, &old.username, false).await?;
         let mut next = old.clone();
-        next.password = generated_password();
+        next.password = password.unwrap_or_else(generated_password);
+        let payload = change_payload(
+            &mut session,
+            &old.username,
+            &old.username,
+            &next.password,
+            false,
+        )
+        .await?;
         data.rotations.insert(
             camera.into(),
             Rotation {
@@ -491,15 +515,73 @@ impl Vault {
         );
         data.spent_rotations.insert(id);
         self.save(data)?;
-        let _ = session
-            .command(
-                59,
-                Some(0),
-                &payload.replace("{{API_PASSWORD}}", &next.password),
-            )
-            .await;
+        let _ = session.command(59, Some(0), &payload).await;
         drop(session);
         self.reconcile(camera).await
+    }
+
+    pub async fn change_other_user(
+        &mut self,
+        camera: &str,
+        id: Uuid,
+        operator: &Credential,
+        username: &str,
+        password: String,
+    ) -> Result<Status> {
+        ensure!(
+            username != operator.username,
+            "bridge login requires credential rotation"
+        );
+        let verify = Device {
+            username: username.into(),
+            password: password.clone(),
+            ..operator.device()
+        };
+        if let Some(previous) = self.data.user_changes.get(&id) {
+            ensure!(
+                previous.camera == camera && previous.username == username,
+                "operation ID conflict"
+            );
+            if previous.status == Status::Verified {
+                return Ok(previous.status);
+            }
+            // An interrupted write may have reached the camera. Only re-check the supplied login.
+        } else {
+            ensure!(
+                self.data.user_changes.len() < 4096,
+                "device password operation limit reached"
+            );
+            let mut session = operator.device().connect().await?;
+            ensure!(
+                identified(&mut session, &operator.identifiers).await,
+                "camera identity mismatch"
+            );
+            let payload =
+                change_payload(&mut session, &operator.username, username, &password, false)
+                    .await?;
+            let mut data = self.data.clone();
+            data.user_changes.insert(
+                id,
+                UserChange {
+                    camera: camera.into(),
+                    username: username.into(),
+                    status: Status::RecoveryRequired,
+                },
+            );
+            self.save(data)?;
+            let _ = session.command(59, Some(0), &payload).await;
+            drop(session);
+        }
+        let status = if let Ok(mut session) = verify.connect().await {
+            session.logout().await;
+            Status::Verified
+        } else {
+            Status::RecoveryRequired
+        };
+        let mut data = self.data.clone();
+        data.user_changes.get_mut(&id).unwrap().status = status;
+        self.save(data)?;
+        Ok(status)
     }
 
     pub async fn reconcile(&mut self, camera: &str) -> Result<()> {
@@ -521,6 +603,18 @@ impl Vault {
             rotation.status = Status::RecoveryRequired;
         }
         self.save(data)
+    }
+
+    pub fn user_write_pending(&self, camera: &str, id: Uuid) -> bool {
+        self.data
+            .rotations
+            .get(camera)
+            .is_some_and(|op| op.id == id && op.staged.is_some())
+            || self
+                .data
+                .user_changes
+                .get(&id)
+                .is_some_and(|op| op.camera == camera && op.status == Status::RecoveryRequired)
     }
 
     pub fn registered(&self) -> impl Iterator<Item = &String> {
@@ -578,16 +672,23 @@ async fn identified(session: &mut Session, expected: &Identifiers) -> bool {
     expected.valid()
 }
 
-async fn change_payload(session: &mut Session, username: &str, factory: bool) -> Result<String> {
+async fn password_protocol(session: &mut Session) -> Result<bool> {
     let info = session.command(80, None, "").await?;
     let info = xml::document(&info)?;
-    ensure!(
+    Ok(
         xml::value(info.root_element(), "hardwareVersion") == Some("IPC_NT1NO24MP")
             && xml::value(info.root_element(), "firmwareVersion") == Some("v3.1.0.6198_2604102075"),
-        "unsupported device password protocol"
-    );
-    let raw = session.user_list(username).await?;
-    let doc = xml::document(&raw)?;
+    )
+}
+
+#[derive(Serialize)]
+pub struct CameraUser {
+    username: String,
+    administrator: bool,
+    bridge_login: bool,
+}
+
+fn user_nodes<'a, 'i>(doc: &'a roxmltree::Document<'i>) -> Result<Vec<roxmltree::Node<'a, 'i>>> {
     let list = xml::find(doc.root_element(), "UserList").context("camera omitted local users")?;
     let users: Vec<_> = list
         .children()
@@ -597,38 +698,98 @@ async fn change_payload(session: &mut Session, username: &str, factory: bool) ->
         !users.is_empty() && users.len() <= 32,
         "invalid device user list"
     );
-    let mut output = String::from(r#"<body><UserList version="1.1">"#);
     let mut names = BTreeSet::new();
-    let mut admin = false;
     for user in &users {
-        let name = xml::child(*user, "userName")
-            .and_then(xml::text)
-            .context("missing device user name")?;
+        let name = field(*user, "userName").context("missing device username")?;
         ensure!(
-            !name.is_empty() && names.insert(name),
-            "invalid device user"
+            !name.is_empty()
+                && name.len() <= 64
+                && !name.chars().any(char::is_control)
+                && names.insert(name),
+            "invalid device username"
         );
-        let target = name == username;
-        if target {
-            admin = xml::child(*user, "userLevel").and_then(xml::text) == Some("1");
-        }
+    }
+    Ok(users)
+}
+
+fn field<'a>(node: roxmltree::Node<'a, '_>, name: &str) -> Option<&'a str> {
+    xml::child(node, name).and_then(xml::text)
+}
+
+pub async fn list_users(device: &Device) -> Result<(Vec<CameraUser>, bool)> {
+    let mut session = device.connect().await?;
+    let raw = session.user_list(&device.username).await?;
+    let doc = xml::document(&raw)?;
+    let users: Vec<_> = user_nodes(&doc)?
+        .into_iter()
+        .map(|node| {
+            let username = field(node, "userName").unwrap().to_owned();
+            CameraUser {
+                bridge_login: username == device.username,
+                administrator: field(node, "userLevel") == Some("1"),
+                username,
+            }
+        })
+        .collect();
+    let writable = users.iter().any(|u| u.bridge_login && u.administrator)
+        && password_protocol(&mut session).await.unwrap_or(false);
+    session.logout().await;
+    Ok((users, writable))
+}
+
+async fn change_payload(
+    session: &mut Session,
+    operator: &str,
+    target_name: &str,
+    password: &str,
+    factory: bool,
+) -> Result<String> {
+    ensure!(
+        password_protocol(session).await?,
+        "unsupported device password protocol"
+    );
+    let raw = session.user_list(operator).await?;
+    password_payload(&raw, operator, target_name, password, factory)
+}
+fn password_payload(
+    raw: &str,
+    operator: &str,
+    target_name: &str,
+    password: &str,
+    factory: bool,
+) -> Result<String> {
+    let doc = xml::document(raw)?;
+    let users = user_nodes(&doc)?;
+    ensure!(users.iter().any(|u| field(*u, "userName") == Some(operator) && field(*u, "userLevel") == Some("1")), "administrator required");
+    ensure!(
+        users
+            .iter()
+            .any(|u| field(*u, "userName") == Some(target_name)),
+        "unknown device user"
+    );
+    ensure!(
+        !factory || (users.len() == 1 && operator == "admin" && target_name == operator),
+        "factory state not verified"
+    );
+    let mut output = String::from(r#"<body><UserList version="1.1">"#);
+    for user in &users {
+        let target = field(*user, "userName") == Some(target_name);
         output.push_str("<User>");
         for field in ["userName", "userLevel", "userId", "loginState"] {
             if let Some(value) = xml::child(*user, field).and_then(xml::text) {
                 output.push_str(&format!("<{field}>{}</{field}>", xml::escape(value)));
             }
         }
-        output.push_str(if target {
-            "<userSetState>modify</userSetState><password>{{API_PASSWORD}}</password>"
+        if target {
+            output.push_str(&format!(
+                "<userSetState>modify</userSetState><password>{}</password>",
+                xml::escape(password)
+            ));
         } else {
-            "<userSetState>none</userSetState>"
-        });
+            output.push_str("<userSetState>none</userSetState>");
+        }
         output.push_str("</User>");
     }
-    ensure!(
-        admin && (!factory || (users.len() == 1 && username == "admin")),
-        "device admin state not verified"
-    );
     output.push_str("</UserList></body>");
     Ok(output)
 }

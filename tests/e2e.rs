@@ -525,6 +525,34 @@ async fn local_broker_http_websocket_and_camera_controls() {
     assert_eq!(failure["errorKey"], "CONTROL_VALIDATION_FAILED");
     assert_code(&failure);
     assert!(!failure.to_string().contains("cause"));
+    let scheduled = request(&mut websocket, json!({"id":"schedule", "op":"control", "camera_id":"lab",
+        "command":{"setting":"recording_schedule","schedule":{"kind":"continuous","enable_hours":[32,167],"disable_hours":[]}}})).await;
+    assert_eq!(scheduled["ok"], true, "{scheduled}");
+    assert_eq!(scheduled["verified"], true);
+    let saved = mock.schedule_xml.lock().unwrap().clone().unwrap();
+    assert!(saved.contains("<vendor>keep</vendor>"));
+    let doc = roxmltree::Document::parse(&saved).unwrap();
+    let hours = doc
+        .descendants()
+        .find(|node| node.has_tag_name("valueTable"))
+        .unwrap()
+        .text()
+        .unwrap()
+        .as_bytes();
+    assert_eq!(hours.iter().filter(|b| **b == b'1').count(), 2);
+    assert_eq!((hours[32], hours[167]), (b'1', b'1'));
+    let lapse = request(&mut websocket, json!({"id":"time-lapse", "op":"control", "camera_id":"lab",
+        "command":{"setting":"time_lapse","enabled":true,"interval_seconds":12,"format":"jpeg","stream":"sub"}})).await;
+    assert_eq!(lapse["ok"], true, "{lapse}");
+    assert_eq!(lapse["verified"], true);
+    assert!(
+        mock.time_lapse_xml
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .contains("<neverEnd>1</neverEnd>")
+    );
 
     publisher
         .publish(

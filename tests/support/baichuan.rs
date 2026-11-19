@@ -40,6 +40,9 @@ pub struct Camera {
     pub snapshot_delay: std::time::Duration,
     pub reject_snapshots: AtomicBool,
     pub password: Mutex<Option<String>>,
+    pub guest_password: Mutex<Option<String>>,
+    pub schedule_xml: Mutex<Option<String>>,
+    pub time_lapse_xml: Mutex<Option<String>>,
     pub credential_writes: AtomicUsize,
     pub block_after_write: AtomicBool,
     pub block_login: AtomicBool,
@@ -63,8 +66,7 @@ impl Camera {
             .unwrap()
             .clone()
             .unwrap_or_else(|| PASSWORD.into());
-        let hash = format!("{:X}", md5::compute(format!("{NONCE}-{password}")));
-        let key: &[u8; 16] = hash.as_bytes()[..16].try_into()?;
+        let mut key = [0u8; 16];
         let mut logged_in = false;
         loop {
             let mut header = [0u8; 20];
@@ -87,7 +89,19 @@ impl Camera {
                 )
             } else if command == 1 {
                 xor(&mut body, header[12]);
-                let expected = format!("{:X}", md5::compute(format!("{password}{NONCE}")));
+                let raw = std::str::from_utf8(&body)?;
+                let guest_user = format!("{:X}", md5::compute(format!("guest{NONCE}")));
+                let guest_password = self.guest_password.lock().unwrap().clone();
+                let login_password = if raw.contains(&guest_user[..31]) {
+                    guest_password
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("unknown fixture user"))?
+                } else {
+                    &password
+                };
+                let expected = format!("{:X}", md5::compute(format!("{login_password}{NONCE}")));
+                let hash = format!("{:X}", md5::compute(format!("{NONCE}-{login_password}")));
+                key.copy_from_slice(&hash.as_bytes()[..16]);
                 ensure!(
                     !self.block_login.load(Ordering::SeqCst)
                         && std::str::from_utf8(&body)?.contains(&expected[..31])
@@ -96,16 +110,30 @@ impl Camera {
                 (200, String::new())
             } else {
                 ensure!(logged_in);
-                cfb_mode::Decryptor::<Aes128>::new(key.into(), IV.into())
+                cfb_mode::Decryptor::<Aes128>::new((&key).into(), IV.into())
                     .decrypt(&mut body[offset..]);
                 if command == 59 {
                     let raw = roxmltree::Document::parse(std::str::from_utf8(&body[offset..])?)?;
-                    ensure!(
-                        field(&raw, "userName") == Some("admin")
-                            && field(&raw, "userSetState") == Some("modify")
-                    );
-                    *self.password.lock().unwrap() =
-                        Some(field(&raw, "password").unwrap().to_owned());
+                    let user = raw
+                        .descendants()
+                        .find(|n| {
+                            n.has_tag_name("User")
+                                && n.children().any(|f| {
+                                    f.has_tag_name("userSetState") && f.text() == Some("modify")
+                                })
+                        })
+                        .unwrap();
+                    let field = |name| {
+                        user.children()
+                            .find(|f| f.has_tag_name(name))
+                            .and_then(|f| f.text())
+                    };
+                    let account = match field("userName") {
+                        Some("admin") => &self.password,
+                        Some("guest") => &self.guest_password,
+                        _ => anyhow::bail!("unknown fixture user"),
+                    };
+                    *account.lock().unwrap() = Some(field("password").unwrap().to_owned());
                     self.credential_writes.fetch_add(1, Ordering::SeqCst);
                     if self.block_after_write.swap(false, Ordering::SeqCst) {
                         self.block_login.store(true, Ordering::SeqCst);
@@ -128,7 +156,7 @@ impl Camera {
             if legacy {
                 xor(&mut reply, header[12]);
             } else {
-                cfb_mode::Encryptor::<Aes128>::new(key.into(), IV.into()).encrypt(&mut reply);
+                cfb_mode::Encryptor::<Aes128>::new((&key).into(), IV.into()).encrypt(&mut reply);
             }
             header[8..12].copy_from_slice(&(reply.len() as u32).to_le_bytes());
             socket.write_all(&header).await?;
@@ -169,9 +197,9 @@ impl Camera {
                     ).into_bytes();
                     let mut payload = chunk.to_vec();
                     let encrypt_len = payload.len().min(16);
-                    cfb_mode::Encryptor::<Aes128>::new(key.into(), IV.into())
+                    cfb_mode::Encryptor::<Aes128>::new((&key).into(), IV.into())
                         .encrypt(&mut extension);
-                    cfb_mode::Encryptor::<Aes128>::new(key.into(), IV.into())
+                    cfb_mode::Encryptor::<Aes128>::new((&key).into(), IV.into())
                         .encrypt(&mut payload[..encrypt_len]);
                     header[8..12]
                         .copy_from_slice(&((extension.len() + payload.len()) as u32).to_le_bytes());
@@ -274,7 +302,19 @@ impl Camera {
                 String::new()
             }
             433 => "<body><PtzCurPos><channelId>0</channelId><pPos>725</pPos><tPos>110</tPos></PtzCurPos></body>".into(),
-            58 => r#"<body><UserList><User><userName>admin</userName><userLevel>1</userLevel><userId>1</userId><loginState>1</loginState></User></UserList></body>"#.into(),
+            58 => {
+                let guest = if self.guest_password.lock().unwrap().is_some() { "<User><userName>guest</userName><userLevel>0</userLevel><userId>2</userId></User>" } else { "" };
+                format!("<body><UserList><User><userName>admin</userName><userLevel>1</userLevel><userId>1</userId><loginState>1</loginState><password>fixture-hidden</password></User>{guest}</UserList></body>")
+            },
+            81 => self.schedule_xml.lock().unwrap().clone().unwrap_or_else(||format!("<body><Record><channelId>0</channelId><enable>1</enable><typeScheduleList><item><type>Normal,</type><valueTable>{}</valueTable></item></typeScheduleList><vendor>keep</vendor></Record></body>","0".repeat(168))),
+            319 => self.time_lapse_xml.lock().unwrap().clone().unwrap_or_else(||"<body><timelapseCfg><channelId>0</channelId><overwrite>0</overwrite></timelapseCfg></body>".into()),
+            82 | 320 => {
+                let target = if command == 82 { &self.schedule_xml } else { &self.time_lapse_xml };
+                let doc = roxmltree::Document::parse(body)?;
+                *target.lock().unwrap() = Some(body[doc.root_element().range()].to_owned());
+                self.writes.fetch_add(1,Ordering::SeqCst);
+                String::new()
+            }
             80 => "<body><VersionInfo><name>Test Camera</name><itemNo>CAM-001</itemNo><hardwareVersion>IPC_NT1NO24MP</hardwareVersion><firmwareVersion>v3.1.0.6198_2604102075</firmwareVersion><serialNumber>FIXTURE-SERIAL</serialNumber></VersionInfo></body>".into(),
             114 => "<body><Uid><uid>952700FIXTURE0001</uid></Uid></body>".into(),
             208 => {

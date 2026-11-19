@@ -723,6 +723,33 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
         404
     );
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 2);
+    *camera.guest_password.lock().unwrap() = Some("fixture-guest-before".into());
+    let accounts = url("/cameras/garage/users");
+    let listed = response(&client, &accounts, PRIMARY, None).await;
+    assert_eq!(listed.0, 200);
+    assert_eq!(listed.1["writable"], true);
+    assert_eq!(
+        listed.1["users"][0],
+        json!({"username":"admin","administrator":true,"bridge_login":true})
+    );
+    assert_eq!(listed.1["users"][1]["username"], "guest");
+    assert!(!listed.1.to_string().contains("fixture-hidden"));
+    assert_eq!(response(&client, &accounts, SERVICE, None).await.0, 401);
+    for (name, status, writes) in [("guest", "verified", 3), ("admin", "restart-required", 4)] {
+        let password = format!("fixture-{name}<&>99");
+        let change =
+            json!({"id":Uuid::new_v4(),"username":name,"password":password,"confirmation":true});
+        let result = response(
+            &client,
+            &format!("{accounts}/password"),
+            PRIMARY,
+            Some(change),
+        )
+        .await;
+        assert_eq!(result.1["status"], status, "{result:?}");
+        assert!(!result.1.to_string().contains(&password));
+        assert_eq!(camera.credential_writes.load(Ordering::SeqCst), writes);
+    }
     Ok(())
 }
 

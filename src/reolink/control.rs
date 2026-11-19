@@ -39,6 +39,8 @@ pub enum Control {
         sensitivity: Option<u8>,
         delay_seconds: Option<u8>,
     },
+    RecordingSchedule(super::recording_settings::ScheduleChange),
+    TimeLapse(super::recording_settings::LapseChange),
     ImageOrientation {
         action: super::orientation::Action,
     },
@@ -151,6 +153,8 @@ impl Control {
                     "delay_seconds must be 0–8"
                 );
             }
+            Self::RecordingSchedule(change) => change.validate()?,
+            Self::TimeLapse(change) => change.validate()?,
             Self::Ptz { action } => action.validate()?,
             Self::StatusLed { .. } | Self::IrLed { .. } | Self::ImageOrientation { .. } => {}
         }
@@ -165,6 +169,8 @@ pub enum Settings {
     Motion,
     Ai(AiClass),
     Image,
+    RecordingSchedule,
+    TimeLapse,
 }
 
 impl Settings {
@@ -174,12 +180,17 @@ impl Settings {
             Self::Spotlight => "spotlight",
             Self::Motion => "motion_detection",
             Self::Image => "image",
+            Self::TimeLapse => "time_lapse",
+            Self::RecordingSchedule => "recording_schedule",
             Self::Ai(class) => class.topic(),
         }
     }
 
     async fn read(self, session: &mut Session, channel: u8) -> Result<String> {
         let (id, query) = match self {
+            Self::TimeLapse | Self::RecordingSchedule => {
+                unreachable!("recording settings use their native codec")
+            }
             Self::Leds => (208, String::new()),
             Self::Spotlight => (289, String::new()),
             Self::Motion => (46, String::new()),
@@ -197,6 +208,9 @@ impl Settings {
 
     fn root<'a, 'input>(self, doc: &'a Document<'input>, channel: u8) -> Result<Node<'a, 'input>> {
         let (tag, channel_tag) = match self {
+            Self::TimeLapse | Self::RecordingSchedule => {
+                unreachable!("recording settings use their native codec")
+            }
             Self::Leds => ("LedState", "channelId"),
             Self::Spotlight => ("FloodlightTask", "channel"),
             Self::Motion => ("MD", "channelId"),
@@ -225,6 +239,9 @@ impl Settings {
         let get = |name| xml::child(node, name).and_then(xml::text);
         let num = |name| get(name).and_then(|value| value.parse::<u8>().ok());
         let mut result = match self {
+            Self::TimeLapse | Self::RecordingSchedule => {
+                unreachable!("recording settings use their native codec")
+            }
             Self::Leds => json!({
                 "status_led": get("lightState").and_then(boolean),
                 "ir_mode": match get("state") { Some("auto") => Some("auto"), Some("close") => Some("off"), _ => None },
@@ -252,6 +269,12 @@ impl Settings {
     }
 
     pub async fn inspect(self, session: &mut Session, channel: u8) -> Option<(Value, Value)> {
+        use super::recording_settings::Group;
+        match self {
+            Self::RecordingSchedule => return Group::Schedule.inspect(session, channel).await,
+            Self::TimeLapse => return Group::Lapse.inspect(session, channel).await,
+            _ => {}
+        }
         if matches!(self, Self::Image) {
             return super::orientation::inspect(session, channel).await;
         }
@@ -261,6 +284,9 @@ impl Settings {
         let status = self.status(node);
         let supported = |field| !status[field].is_null();
         let controls = match self {
+            Self::TimeLapse | Self::RecordingSchedule => {
+                unreachable!("recording settings use their native codec")
+            }
             Self::Leds => {
                 json!({"status_led": supported("status_led"), "ir_led": supported("ir_mode")})
             }
@@ -293,6 +319,12 @@ async fn apply_connected(
     channel: u8,
     command: &Control,
 ) -> Result<(&'static str, Value, bool)> {
+    if matches!(
+        command,
+        Control::RecordingSchedule(_) | Control::TimeLapse(_)
+    ) {
+        return super::recording_settings::apply(session, channel, command).await;
+    }
     if let Control::ImageOrientation { action } = command {
         return super::orientation::apply(session, channel, *action).await;
     }
@@ -394,7 +426,10 @@ async fn apply_connected(
             }
             (Settings::Ai(*class), 343, edits)
         }
-        Control::Spotlight { .. } | Control::ImageOrientation { .. } => unreachable!(),
+        Control::Spotlight { .. }
+        | Control::ImageOrientation { .. }
+        | Control::RecordingSchedule(_)
+        | Control::TimeLapse(_) => unreachable!(),
         Control::Ptz { .. } => anyhow::bail!("PTZ uses the PTZ command worker"),
     };
     let raw = settings.read(session, channel).await?;

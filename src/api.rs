@@ -2,6 +2,7 @@ mod credentials;
 mod media;
 mod preview;
 mod recordings;
+mod users;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -308,6 +309,8 @@ pub fn router(api: Arc<Api>) -> Router {
     Router::new()
         .route("/api/contract", get(contract))
         .route("/api/inventory", get(inventory))
+        .route("/api/cameras/{id}/users", get(users::list))
+        .route("/api/cameras/{id}/users/password", post(users::change))
         .route("/api/cameras/{id}/storage", get(recordings::storage))
         .route("/api/cameras/{id}/recordings", get(recordings::list))
         .route(
@@ -375,13 +378,14 @@ async fn contract(
         Vec::new()
     };
     Json(json!({"version":1,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
+       "userCameras":api.devices.keys().collect::<Vec<_>>(),
        "storageCameras":api.devices.keys().collect::<Vec<_>>(),
        "recordingPreviewCameras":api.devices.keys().collect::<Vec<_>>(),
        "recordingMetadataCameras":recordings,
        "recordingsCameras":recordings,
        "previewNotifications":true,
        "previewCameras":api.previews.keys().collect::<Vec<_>>(),
-       "enrollment":api.vault.is_some(),"inventory":true,"callbacks":api.callback_allowed(None),"settings":["leds","spotlight","motion","ai","image"],"alerts":["motion"],
+       "enrollment":api.vault.is_some(),"inventory":true,"callbacks":api.callback_allowed(None),"settings":["leds","spotlight","motion","ai","image","recording_schedule","time_lapse"],"alerts":["motion"],
        "correlation_id":correlation.0})).into_response()
 }
 
@@ -528,6 +532,8 @@ async fn settings(
         "spotlight" => vec![Settings::Spotlight],
         "motion" => vec![Settings::Motion],
         "image" => vec![Settings::Image],
+        "recording_schedule" => vec![Settings::RecordingSchedule],
+        "time_lapse" => vec![Settings::TimeLapse],
         "ai" => [
             AiClass::Person,
             AiClass::Vehicle,
@@ -840,7 +846,11 @@ async fn rotate(
         );
     };
     if !matches!(
-        timeout(Duration::from_secs(53), vault.rotate(stable, body.id, old)).await,
+        timeout(
+            Duration::from_secs(53),
+            vault.rotate(stable, body.id, old, None)
+        )
+        .await,
         Ok(Ok(()))
     ) {
         let status = vault.rotation_progress(stable, api.devices.get(&id));

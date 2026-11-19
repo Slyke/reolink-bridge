@@ -112,6 +112,28 @@ Recording thumbnails use read-only Baichuan CoverPreview (command 298) to fetch 
 
 Native recording downloads accept camera completion statuses 300 and 331. A playback preparation failure returns `API_RECORDING_PREPARE_FAILED`, a correlation ID and a safe `stage`: `camera-download`, `conversion`, `cache-limit`, `busy`, `timeout`, `temporary-storage` or `preparation`. The server logs the underlying cause with the same correlation ID. Oversized cached clips return HTTP 413, busy preparations return 503 and preparation timeouts return 504. Other preparation failures return 502.
 
+## Recording schedule and time lapse
+
+Authenticated GET requests to `/api/cameras/{id}/settings/recording_schedule` and `/api/cameras/{id}/settings/time_lapse` return native camera settings when the camera advertises those controls. The regular control API accepts these changes and reads the values back from the camera.
+
+```json
+{"setting":"recording_schedule","enabled":true,"schedule":{"kind":"continuous","enable_hours":[32],"disable_hours":[]}}
+```
+
+Recording hours use the camera’s local week, starting with Sunday at 00:00 (slot 0). Monday at 08:00 is slot 32. Supply the hours to change for one advertised recording type. The bridge preserves other schedules and camera-specific rules.
+
+```json
+{"setting":"time_lapse","enabled":true,"interval_seconds":10,"format":"jpeg","stream":"main"}
+```
+
+Time lapse supports JPEG or MP4, main or sub stream, and an optional overwrite switch when the camera reports it. Newly initialized tasks use the camera clock and run daily until stopped. Changes to an existing task preserve its dates and daily windows.
+
+## Camera accounts
+
+`GET /api/cameras/{id}/users` returns local camera usernames, administrator flags, the account used by the bridge, and whether password changes are available. The contract lists native endpoints in `userCameras`. Password changes require a verified device password protocol and a credential vault.
+
+`POST /api/cameras/{id}/users/password` accepts a version-4 UUID in `id`, `username`, `password` and `confirmation: true`. If the list returns `requiresUid: true`, include the printed `uid`. The bridge verifies identity before writing and verifies the new login afterward. A change to its own account uses the rotation journal. Restart the bridge when the response reports `restart-required`. Keep the credential vault when restarting.
+
 ## Image orientation
 
 The `image_orientation` typed setting accepts `action: "hflip"`, `"vflip"`, `"clockwise"`, or `"counterclockwise"`. Each update reads current image settings, changes the supported orientation field, preserves other image settings, and verifies readback.

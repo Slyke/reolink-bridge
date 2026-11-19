@@ -129,6 +129,8 @@
   "reolink-bridge-API_MEDIA_START_FAILED": "The private relay could not start.",
   "reolink-bridge-API_PREVIEW_UNAVAILABLE": "The camera preview is unavailable.",
   "reolink-bridge-API_ENROLLMENT_DISABLED": "Enrollment is disabled.",
+  "reolink-bridge-API_CAMERA_PASSWORD_INVALID": "The camera password request is invalid.",
+  "reolink-bridge-API_CAMERA_USERS_UNAVAILABLE": "The camera account list could not be read.",
   "reolink-bridge-API_VAULT_BUSY": "A credential operation is in progress.",
   "reolink-bridge-API_ENROLLMENT_INVALID": "The enrollment could not be reserved.",
   "reolink-bridge-API_ENROLLMENT_UNKNOWN": "This enrollment is not in the vault.",
