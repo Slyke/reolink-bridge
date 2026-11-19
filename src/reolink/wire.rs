@@ -33,6 +33,22 @@ pub struct Device {
     pub channel: u8,
 }
 
+#[derive(Debug)]
+pub struct Rejected {
+    command: u32,
+    status: u16,
+}
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Baichuan command {} returned status {}",
+            self.command, self.status
+        )
+    }
+}
+impl std::error::Error for Rejected {}
+
 pub struct Session {
     socket: TcpStream,
     buffer: BytesMut,
@@ -279,8 +295,10 @@ impl Session {
                         matches!(packet.status, 200 | 201)
                             || (packet.status == 300 && !matches!(command, 18 | 19 | 295))
                             || (challenge && packet.status & 0xff00 == 0xdd00),
-                        "Baichuan command {command} returned status {}",
-                        packet.status
+                        Rejected {
+                            command,
+                            status: packet.status
+                        }
                     );
                     return Ok(packet);
                 }

@@ -44,6 +44,7 @@ pub struct Camera {
     pub password: Mutex<Option<String>>,
     pub users: Mutex<BTreeMap<String, (bool, String)>>,
     pub schedule_xml: Mutex<Option<String>>,
+    pub wifi_xml: Mutex<Option<String>>,
     pub time_lapse_xml: Mutex<Option<String>>,
     pub credential_writes: AtomicUsize,
     pub block_after_write: AtomicBool,
@@ -259,6 +260,13 @@ impl Camera {
             return Ok((405, String::new()));
         }
         let response = match command {
+            76 => "<body><Ip><ip>192.0.2.7</ip><mask>255.255.255.0</mask><gateway>192.0.2.1</gateway></Ip><Dhcp><enable>1</enable></Dhcp></body>".into(),
+            116 => self.wifi_xml.lock().unwrap().clone().unwrap_or_else(|| "<body><Wifi><ssid>Fixture network</ssid><key>fixture-old-wifi</key><udidList><udid><name>Other network</name></udid></udidList></Wifi></body>".into()),
+            117 => {
+                let doc = roxmltree::Document::parse(body)?;
+                *self.wifi_xml.lock().unwrap() = Some(body[doc.root_element().range()].to_owned());
+                String::new()
+            }
             2 | 16 | 31 | 93 | 144 => String::new(),
             102=>"<body><HddInfoList><HddInfo><number>0</number><storageType>2</storageType><mount>1</mount><format>1</format><capacity>63</capacity><capacityM>500</capacityM><remainSize>23</remainSize><remainSizeM>800</remainSizeM></HddInfo></HddInfoList></body>".into(),
             104=>"<body><SystemGeneral><year>2026</year><month>11</month><day>17</day><hour>12</hour><minute>30</minute><second>00</second></SystemGeneral></body>".into(),

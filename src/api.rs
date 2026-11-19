@@ -1,5 +1,6 @@
 mod credentials;
 mod media;
+mod network;
 mod photos;
 mod preview;
 mod recordings;
@@ -78,6 +79,7 @@ pub struct Api {
     hub: Option<Arc<Hub>>,
     media_slots: Arc<Semaphore>,
     settings_slots: Semaphore,
+    network_writes: BTreeMap<String, Mutex<()>>,
     stop: CancellationToken,
 }
 
@@ -228,6 +230,10 @@ impl Api {
             identities,
             inactive_identities,
             active,
+            network_writes: devices
+                .keys()
+                .map(|id| (id.clone(), Mutex::new(())))
+                .collect(),
             devices,
             previews,
             hub: None,
@@ -316,6 +322,10 @@ pub fn router(api: Arc<Api>) -> Router {
             "/api/cameras/{id}/users",
             get(users::list).post(users::manage),
         )
+        .route(
+            "/api/cameras/{id}/network",
+            get(network::get).put(network::set),
+        )
         .route("/api/cameras/{id}/users/password", post(users::change))
         .route("/api/cameras/{id}/time-lapse/photos", get(photos::list))
         .route(
@@ -389,6 +399,7 @@ async fn contract(
         Vec::new()
     };
     Json(json!({"version":1,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
+       "networkCameras":api.devices.keys().collect::<Vec<_>>(),
        "userCameras":api.devices.keys().collect::<Vec<_>>(),
        "storageCameras":api.devices.keys().collect::<Vec<_>>(),
        "timeLapsePhotoCameras":api.devices.keys().collect::<Vec<_>>(),

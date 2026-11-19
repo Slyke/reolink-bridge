@@ -33,6 +33,8 @@ Replace the documentation address with a private IPv4 target from the installati
 | PUT/DELETE `/callbacks/{id}` | `http.token` | Update or delete a rule. Use the same ID in the URL and the update body. |
 | GET `/cameras/{id}/settings/{group}` | `http.token` | Fresh allowlisted setting values for `leds`, `spotlight`, `motion`, or `ai` and `image`, without raw vendor XML. Writes use the existing typed command interface. |
 | GET/HEAD `/cameras/{id}/preview` | `http.token` | Latest cached JPEG or its headers. Supports `If-None-Match` and returns `304` when the image is unchanged. |
+| GET `/cameras/{id}/network` | `http.token` | Read camera-reported IP configuration and Wi-Fi SSID. A camera may also report nearby network names. Passwords are write-only. |
+| PUT `/cameras/{id}/network` | `http.token` | Configure Wi-Fi on a registered camera using `ssid`, `password`, `open` and `confirmation: true`. For an open network send an empty password. The response reports whether readback verified the settings or only the SSID (`ssidVerified`). Check wireless association separately. |
 | GET `/cameras/{id}/time-lapse/photos` | `http.token` | List saved time-lapse photos for a camera-local `date`. Optional inclusive `from` and `to` use HH:mm:ss. Returns an opaque ID and capture time when available. |
 | GET `/cameras/{id}/time-lapse/photos/{photo}` | `http.token` | Download the original JPEG converted to a full-resolution PNG. Repeat the search when its ten-minute reference expires. |
 | GET `/cameras/{id}/storage` | `http.token` | Card capacity, used/free bytes, readiness, and the camera's local clock. |

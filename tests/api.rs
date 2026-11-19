@@ -728,6 +728,73 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
         .lock()
         .unwrap()
         .insert("guest".into(), (false, "fixture-guest-before".into()));
+    let network = url("/cameras/garage/network");
+    let before = response(&client, &network, PRIMARY, None).await;
+    assert_eq!(before.0, 200);
+    assert_eq!(before.1["link"]["address"], "192.0.2.7");
+    assert_eq!(before.1["wifi"]["ssid"], "Fixture network");
+    assert!(!before.1.to_string().contains("fixture-old-wifi"));
+    let change = json!({"ssid":"Wi-Fi & <Lab>","password":"fixture<&>pass","open":false,"confirmation":true});
+    assert_eq!(
+        client
+            .put(&network)
+            .header("content-type", "application/json")
+            .body(change.to_string())
+            .send()
+            .await?
+            .status(),
+        401
+    );
+    let rejected = client
+        .put(&network)
+        .bearer_auth(PRIMARY)
+        .header("content-type", "application/json")
+        .body(json!({"ssid":"Test","password":"","open":false,"confirmation":true}).to_string())
+        .send()
+        .await?;
+    assert_eq!(rejected.status(), 422);
+    assert!(camera.wifi_xml.lock().unwrap().is_none());
+    camera.reject_read_command.store(116, Ordering::SeqCst);
+    assert!(response(&client, &network, PRIMARY, None).await.1["wifi"].is_null());
+    assert_eq!(
+        client
+            .put(&network)
+            .bearer_auth(PRIMARY)
+            .header("content-type", "application/json")
+            .body(change.to_string())
+            .send()
+            .await?
+            .status(),
+        422
+    );
+    camera.reject_read_command.store(117, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .put(&network)
+            .bearer_auth(PRIMARY)
+            .header("content-type", "application/json")
+            .body(change.to_string())
+            .send()
+            .await?
+            .status(),
+        422
+    );
+    camera.reject_read_command.store(0, Ordering::SeqCst);
+    let saved = client
+        .put(&network)
+        .bearer_auth(PRIMARY)
+        .header("content-type", "application/json")
+        .body(change.to_string())
+        .send()
+        .await?;
+    assert_eq!(saved.status(), 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&saved.text().await?)?["outcome"],
+        "confirmed"
+    );
+    let after = response(&client, &network, PRIMARY, None).await.1;
+    assert_eq!(after["wifi"]["ssid"], change["ssid"]);
+    assert!(!after.to_string().contains("fixture<&>pass"));
     let accounts = url("/cameras/garage/users");
     let listed = response(&client, &accounts, PRIMARY, None).await;
     assert_eq!(listed.0, 200);
