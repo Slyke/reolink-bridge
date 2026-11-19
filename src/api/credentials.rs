@@ -980,7 +980,7 @@ enum AccountUse {
     Management,
 }
 
-async fn password_protocol(session: &mut Session, purpose: AccountUse) -> Result<bool> {
+async fn password_protocol(session: &mut Session) -> Result<bool> {
     let info = session.command(80, None, "").await?;
     let info = xml::document(&info)?;
     let root = info.root_element();
@@ -991,8 +991,7 @@ async fn password_protocol(session: &mut Session, purpose: AccountUse) -> Result
         ) {
             (Some("IPC_NT1NO24MP"), Some("v3.1.0.6198_2604102075")) => true,
             (Some("IPC_NT1NA45MP"), Some("v3.1.0.4417_2412122130")) => {
-                purpose == AccountUse::FirstPassword
-                    && xml::value(root, "itemNo") == Some("E Series E330")
+                xml::value(root, "itemNo") == Some("E Series E330")
             }
             _ => false,
         },
@@ -1002,8 +1001,8 @@ async fn password_protocol(session: &mut Session, purpose: AccountUse) -> Result
 #[derive(Serialize)]
 pub struct CameraUser {
     username: String,
-    administrator: bool,
-    bridge_login: bool,
+    pub(super) administrator: bool,
+    pub(super) bridge_login: bool,
 }
 
 fn user_nodes<'a, 'i>(doc: &'a roxmltree::Document<'i>) -> Result<Vec<roxmltree::Node<'a, 'i>>> {
@@ -1050,9 +1049,7 @@ pub async fn list_users(device: &Device) -> Result<(Vec<CameraUser>, bool)> {
         })
         .collect();
     let writable = users.iter().any(|u| u.bridge_login && u.administrator)
-        && password_protocol(&mut session, AccountUse::Management)
-            .await
-            .unwrap_or(false);
+        && password_protocol(&mut session).await.unwrap_or(false);
     session.logout().await;
     Ok((users, writable))
 }
@@ -1102,7 +1099,7 @@ async fn account_payload(
     purpose: AccountUse,
 ) -> Result<String> {
     ensure!(
-        password_protocol(session, purpose).await?,
+        password_protocol(session).await?,
         "unsupported device account protocol"
     );
     let raw = session.user_list(operator).await?;

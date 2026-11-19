@@ -119,7 +119,7 @@ Address lookup supports private IPv4, link-local or loopback entries using `admi
 
 Initialization supports Lumus E430 (`IPC_NT1NO24MP`, `v3.1.0.6198_2604102075`) and E1 Pro E330 (`IPC_NT1NA45MP`, `v3.1.0.4417_2412122130`). It runs only on a confirmed enrollment request. The bridge signs in to the factory admin account, matches the full printed UID, checks the firmware and sole administrator, stages the credential in its private vault, and verifies a fresh login and device identity after setting the password.
 
-The E1 Pro support covers first-password setup. Camera account management and rotation support the Lumus revision above. For other revisions, use the device's supported initialization method, set the existing password in the camera configuration, and enroll using `import`. Rotation on a statically configured camera without a vault binding requires `api.rotationIds.<cameraId>` with a printed UID or serial.
+Camera account management and credential rotation support both hardware and firmware revisions listed above. For other revisions, use the device's supported initialization method, set the existing password in the camera configuration, and enroll using `import`. Rotation on a statically configured camera without a vault binding requires `api.rotationIds.<cameraId>` with a printed UID or serial.
 
 A configured camera returns `active` once its running credential is verified. A named target awaiting its workers, or an existing worker using a different credential, returns `restart-required`. Restart the bridge in that case. MQTT clients need broker ACLs for the camera topics.
 

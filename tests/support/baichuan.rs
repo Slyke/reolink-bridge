@@ -386,6 +386,7 @@ impl Camera {
                 let id = field(&doc, "id").unwrap().parse()?;
                 match field(&doc,"command") {
                     Some("setPos") => { self.saved_presets.lock().unwrap().insert(id,field(&doc,"name").unwrap().to_owned()); }
+                    Some("delPos") => { self.saved_presets.lock().unwrap().remove(&id); }
                     Some("toPos") => self.motions.lock().unwrap().push(("toPos".into(),Some(id))),
                     _ => anyhow::bail!("unexpected fixture preset command"),
                 }

@@ -792,6 +792,17 @@ async fn check_ptz(
     )
     .await;
     assert_eq!(replaced["verified"], true, "{replaced}");
+    assert_eq!(replaced["result"]["position"]["pan"], 725);
+    let (_, removed) = http_ptz(
+        http,
+        address,
+        "lab",
+        "delete-preset",
+        json!({"op":"delete_preset","preset_id":3}),
+    )
+    .await;
+    assert_eq!(removed["verified"], true, "{removed}");
+    assert_eq!(removed["result"]["presets"].as_array().unwrap().len(), 1);
     let preset = json!({"id":"mqtt-preset","command":{"setting":"ptz","action":{"op":"goto_preset","preset_id":1}}});
     publisher
         .publish(

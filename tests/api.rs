@@ -615,8 +615,20 @@ async fn e1_pro_factory_enrollment_uses_configured_password_and_hands_off_to_sta
     )
     .await;
     assert_eq!(accounts.1["users"][0]["username"], "admin");
-    assert_eq!(accounts.1["manageAccounts"], false);
+    assert_eq!(accounts.1["manageAccounts"], true);
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 1);
+    let users = format!("{origin}/api/cameras/e1-pro/users");
+    let add = json!({"id":Uuid::new_v4(),"action":"add","role":"user","username":"viewer","password":"Fixture-user-123","confirmation":true});
+    assert_eq!(
+        response(&client, &users, PRIMARY, Some(add)).await.1["status"],
+        "verified"
+    );
+    let remove =
+        json!({"id":Uuid::new_v4(),"action":"remove","username":"viewer","confirmation":true});
+    assert_eq!(
+        response(&client, &users, PRIMARY, Some(remove)).await.1["status"],
+        "verified"
+    );
     Ok(())
 }
 

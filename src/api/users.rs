@@ -54,8 +54,29 @@ pub(super) async fn list(
         );
     };
     match timeout(Duration::from_secs(18), credentials::list_users(device)).await {
-        Ok(Ok((users, supported))) => Json(json!({"users":users,"writable":ready && supported,"manageAccounts":ready && supported,"requiresUid":!bound,"correlation_id":correlation.0})).into_response(),
-        _ => error(StatusCode::BAD_GATEWAY, "API_CAMERA_USERS_UNAVAILABLE", &correlation),
+        Ok(Ok((users, supported))) => {
+            let blocked = if api.vault.is_none() {
+                Some("vault")
+            } else if !ready {
+                Some("rotation")
+            } else if !users
+                .iter()
+                .any(|user| user.bridge_login && user.administrator)
+            {
+                Some("administrator")
+            } else if !supported {
+                Some("firmware")
+            } else {
+                None
+            };
+            Json(json!({"users":users,"writable":blocked.is_none(),"manageAccounts":blocked.is_none(),
+                "writeBlockReason":blocked,"requiresUid":!bound,"correlation_id":correlation.0})).into_response()
+        }
+        _ => error(
+            StatusCode::BAD_GATEWAY,
+            "API_CAMERA_USERS_UNAVAILABLE",
+            &correlation,
+        ),
     }
 }
 

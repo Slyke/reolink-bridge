@@ -29,6 +29,9 @@ pub enum Action {
     GotoPreset {
         preset_id: u32,
     },
+    DeletePreset {
+        preset_id: u8,
+    },
     SavePreset {
         preset_id: u8,
         name: String,
@@ -160,6 +163,7 @@ impl Capabilities {
         value["source"] = json!("baichuan");
         value["supported"] = json!(self.has_motors());
         value["save_presets"] = json!(self.presets);
+        value["delete_presets"] = json!(self.presets);
         if self.pan || self.tilt || self.directional_zoom {
             value["duration_ms"] = json!({"min":MIN_MOVE_MS,"max":MAX_MOVE_MS});
         }
@@ -183,9 +187,10 @@ impl Capabilities {
             Action::Move { direction, .. } => direction.supported(self),
             Action::Stop => false,
             Action::Status => self.pan || self.tilt || self.zoom_range.is_some(),
-            Action::ListPresets | Action::GotoPreset { .. } | Action::SavePreset { .. } => {
-                self.presets
-            }
+            Action::ListPresets
+            | Action::GotoPreset { .. }
+            | Action::SavePreset { .. }
+            | Action::DeletePreset { .. } => self.presets,
             Action::SetZoom { .. } => self.zoom_range.is_some(),
         };
         if !supported {
@@ -462,9 +467,37 @@ async fn execute(
             let listed = presets
                 .iter()
                 .any(|preset| preset.id == u32::from(*preset_id) && preset.name == *name);
+            let mut saved = json!({"action":"save_preset","preset_id":preset_id,"presets":presets});
+            if listed && let Ok(position) = read_status(session, channel, capabilities).await {
+                saved["position"] = position;
+            }
+            Ok(result(saved, listed))
+        }
+        Action::DeletePreset { preset_id } => {
+            let before = read_presets(session, channel)
+                .await
+                .map_err(|e| ("PTZ_PRESET_LOOKUP_FAILED", e))?;
+            let id = u32::from(*preset_id);
+            if !before.iter().any(|preset| preset.id == id) {
+                return Ok(result(
+                    json!({"action":"delete_preset","preset_id":id,"presets":before}),
+                    true,
+                ));
+            }
+            let payload = format!(
+                r#"<body><PtzPreset version="1.1"><channelId>{channel}</channelId><presetList><preset><id>{id}</id><command>delPos</command></preset></presetList></PtzPreset></body>"#
+            );
+            session
+                .command(19, Some(channel), &payload)
+                .await
+                .map_err(|e| ("PTZ_PRESET_DELETE_FAILED", e))?;
+            let presets = read_presets(session, channel)
+                .await
+                .map_err(|e| ("PTZ_PRESETS_FAILED", e))?;
+            let removed = presets.iter().all(|preset| preset.id != id);
             Ok(result(
-                json!({"action":"save_preset","preset_id":preset_id,"presets":presets}),
-                listed,
+                json!({"action":"delete_preset","preset_id":id,"presets":presets}),
+                removed,
             ))
         }
         Action::GotoPreset { preset_id } => {
