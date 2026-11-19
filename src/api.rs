@@ -67,6 +67,7 @@ pub struct Api {
     configured: BTreeSet<String>,
     pub registered: BTreeSet<String>,
     identities: BTreeMap<String, String>,
+    inactive_identities: BTreeMap<String, crate::identity::HardwareId>,
     active: BTreeSet<String>,
     devices: BTreeMap<String, Device>,
     previews: preview::Previews,
@@ -163,7 +164,7 @@ impl Api {
             .transpose()?;
         let mut registered = configured.clone();
         if let Some(vault) = &vault {
-            vault.configure(cameras, &config.targets)?;
+            identities.extend(vault.configure(cameras, &config.targets)?);
             for stable in vault.registered().filter(|id| target_ids.contains(*id)) {
                 ensure!(
                     registered.insert(stable.clone()),
@@ -176,7 +177,17 @@ impl Api {
             cameras.iter().all(|camera| camera.password.is_some()),
             "camera requires cameras[].password or a matching verified vault credential"
         );
-        let active = cameras.iter().map(|cam| cam.id.clone()).collect();
+        let active: BTreeSet<_> = cameras.iter().map(|cam| cam.id.clone()).collect();
+        let inactive_identities = registered
+            .difference(&active)
+            .filter_map(|id| {
+                let credential = vault.as_ref()?.credential(&identities[id])?;
+                Some((
+                    id.clone(),
+                    crate::identity::HardwareId::serial(credential.identifiers.serial.as_deref()?)?,
+                ))
+            })
+            .collect();
         let devices: BTreeMap<String, Device> = cameras
             .iter()
             .filter_map(|cam| {
@@ -196,7 +207,6 @@ impl Api {
         let previews = preview::prepare(
             &config.previews,
             &devices,
-            &identities,
             snapshot_slot,
             stop.clone(),
             store.clone(),
@@ -209,9 +219,10 @@ impl Api {
             config,
             http_token: http_token.to_owned(),
             vault: vault.map(Mutex::new),
-            configured: stable_ids,
+            configured: configured.iter().map(|id| identities[id].clone()).collect(),
             registered,
             identities,
+            inactive_identities,
             active,
             devices,
             previews,
@@ -231,7 +242,25 @@ impl Api {
         })
     }
 
-    pub fn camera_identity(&self, id: &str) -> Option<&str> {
+    pub fn camera_identity(&self, id: &str) -> Option<String> {
+        self.hardware(id).map(|v| v.value)
+    }
+
+    fn hardware(&self, id: &str) -> Option<crate::identity::HardwareId> {
+        self.hub
+            .as_ref()?
+            .identity(id)
+            .or_else(|| self.inactive_identities.get(id).cloned())
+    }
+
+    fn recording_scope(&self, camera: &str) -> String {
+        format!(
+            "{camera}/{}",
+            self.camera_identity(camera).unwrap_or_default()
+        )
+    }
+
+    fn vault_key(&self, id: &str) -> Option<&str> {
         self.identities.get(id).map(String::as_str)
     }
 
@@ -364,7 +393,11 @@ async fn inventory(
     if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    Json(json!({"cameras":api.registered.iter().map(|id| json!({"id":id,"stableId":api.identities[id],"active":api.active.contains(id)})).collect::<Vec<_>>(), "correlation_id":correlation.0})).into_response()
+    Json(json!({"cameras":api.registered.iter().map(|id| {
+        let hardware = api.hardware(id);
+        json!({"id":id,"stableId":hardware.as_ref().map(|v| &v.value),"identitySource":hardware.as_ref().map(|v| v.source),
+            "previousId":api.identities[id],"active":api.active.contains(id)})
+    }).collect::<Vec<_>>(), "correlation_id":correlation.0})).into_response()
 }
 
 async fn callbacks(
@@ -721,7 +754,7 @@ async fn rotation_status(
     if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    let Some(stable) = api.camera_identity(&id) else {
+    let Some(stable) = api.vault_key(&id) else {
         return error(
             StatusCode::NOT_FOUND,
             "API_ROTATION_UNSUPPORTED",
@@ -762,7 +795,7 @@ async fn rotate(
             &correlation,
         );
     }
-    let Some(stable) = api.camera_identity(&id) else {
+    let Some(stable) = api.vault_key(&id) else {
         return error(
             StatusCode::NOT_FOUND,
             "API_ROTATION_UNSUPPORTED",
@@ -844,7 +877,7 @@ async fn reconcile_rotation(
             &correlation,
         );
     }
-    let Some(stable) = api.camera_identity(&id) else {
+    let Some(stable) = api.vault_key(&id) else {
         return error(
             StatusCode::NOT_FOUND,
             "API_ROTATION_UNSUPPORTED",

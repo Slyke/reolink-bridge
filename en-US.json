@@ -114,6 +114,7 @@
   "reolink-bridge-SNAPSHOT_ENCODE_FAILED": "The bridge could not encode the PNG snapshot.",
   "reolink-bridge-SNAPSHOT_IMAGE_INVALID": "The camera snapshot is invalid or exceeds the decode limits.",
   "reolink-bridge-SNAPSHOT_PAYLOAD_TOO_SMALL": "The MQTT payload budget is too small for the snapshot.",
+  "reolink-bridge-CAMERA_HARDWARE_ID_UNAVAILABLE": "The bridge could not establish a unique camera serial number or MAC address.",
   "reolink-bridge-API_CAMERA_IDENTITY_CHANGED": "The camera identity at this route has changed. Refresh the bridge inventory.",
   "reolink-bridge-CALLBACK_DESTINATION_DENIED": "The callback URL must be listed in api.callbackDestinations.",
   "reolink-bridge-API_SCOPE_DENIED": "The bridge rejected the credential or camera filter.",

@@ -215,16 +215,19 @@ impl Vault {
         &self,
         cameras: &mut Vec<Camera>,
         targets: &BTreeMap<String, Target>,
-    ) -> Result<()> {
+    ) -> Result<BTreeMap<String, String>> {
         for device in self.data.devices.values() {
-            if let Some(camera) = cameras
-                .iter_mut()
-                .find(|camera| camera.identity() == device.id)
-            {
+            if let Some(camera) = cameras.iter_mut().find(|camera| {
+                camera.identity() == device.id
+                    || (camera.stable_id.is_none()
+                        && camera.password.is_none()
+                        && device.matches(camera))
+            }) {
                 ensure!(
                     device.matches(camera),
                     "API vault camera binding differs from configured device"
                 );
+                camera.stable_id = Some(device.id.clone());
                 camera.password = Some(device.password.clone());
             } else if device.enrolled
                 && let Some(target) = targets
@@ -246,13 +249,17 @@ impl Vault {
             }
         }
         // A transport must not repeatedly try an old credential after an interrupted rotation.
+        let keys = cameras
+            .iter()
+            .map(|camera| (camera.id.clone(), camera.identity().to_owned()))
+            .collect();
         cameras.retain(|camera| {
             self.data
                 .rotations
                 .get(camera.identity())
                 .is_none_or(|rotation| rotation.staged.is_none())
         });
-        Ok(())
+        Ok(keys)
     }
 
     pub fn start(
@@ -366,7 +373,7 @@ impl Vault {
             job.status = Status::LocalSetupRequired;
             return self.save(data);
         };
-        let old = Credential {
+        let mut old = Credential {
             id: job.camera.clone(),
             host: job.host.clone(),
             port: job.port,
@@ -387,6 +394,16 @@ impl Vault {
         if !identified(&mut session, &old.identifiers).await {
             job.status = Status::IdentityMismatch;
             return self.save(data);
+        }
+        // Keep the verified serial available for recovery when a credential change pauses this camera.
+        if old.identifiers.serial.is_none()
+            && let Ok(raw) = session.command(80, None, "").await
+            && let Ok(doc) = xml::document(&raw)
+            && let Some(id) = ["serialNumber", "serialNo"].iter().find_map(|field| {
+                xml::value(doc.root_element(), field).and_then(crate::identity::HardwareId::serial)
+            })
+        {
+            old.identifiers.serial = Some(id.value);
         }
         if !factory {
             let _ = session.logout().await;

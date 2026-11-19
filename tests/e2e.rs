@@ -241,21 +241,35 @@ async fn local_broker_http_websocket_and_camera_controls() {
         http.get(&inventory_url).send().await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
-    let inventory = http
-        .get(inventory_url)
-        .bearer_auth(WS_TOKEN)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let inventory: Value = serde_json::from_str(&inventory).unwrap();
+    let until_identity = tokio::time::Instant::now() + Duration::from_secs(8);
+    let inventory = loop {
+        let raw = http
+            .get(&inventory_url)
+            .bearer_auth(WS_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let inventory: Value = serde_json::from_str(&raw).unwrap();
+        if inventory["cameras"]
+            .as_array()
+            .is_some_and(|cameras| cameras.iter().all(|c| !c["stableId"].is_null()))
+        {
+            break inventory;
+        }
+        assert!(
+            tokio::time::Instant::now() < until_identity,
+            "identity discovery timed out: {inventory}"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    };
     assert_eq!(
         inventory["cameras"],
-        json!([{"id":"fixed","stableId":"fixed","active":true},{"id":"lab","stableId":"lab","active":true}])
+        json!([{"id":"fixed","stableId":"FIXTURE-CHANNEL-1","identitySource":"serial","previousId":"fixed","active":true},{"id":"lab","stableId":"FIXTURE-SERIAL","identitySource":"serial","previousId":"lab","active":true}])
     );
     let (status, live) = probe(&http, address, "/livez").await;
     assert_eq!(status, StatusCode::OK);

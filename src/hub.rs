@@ -70,7 +70,9 @@ impl LiveEvent {
 
 #[derive(Default)]
 struct CameraState {
-    stable_id: String,
+    identified: bool,
+    claim: Option<crate::identity::HardwareId>,
+    identity: Option<crate::identity::HardwareId>,
     snapshots: BTreeMap<String, Arc<Snapshot>>,
     online: bool,
     mqtt_ready: bool,
@@ -81,6 +83,7 @@ struct CameraState {
 pub struct Hub {
     cameras: Mutex<BTreeMap<String, CameraState>>,
     updates: broadcast::Sender<Update>,
+    pub identity_changes: tokio::sync::watch::Sender<()>,
     pub callbacks: Arc<Callbacks>,
     pub diagnostics: Diagnostics,
     secrets: Vec<String>,
@@ -88,7 +91,7 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(
-        identities: BTreeMap<String, String>,
+        camera_ids: BTreeSet<String>,
         callbacks: Arc<Callbacks>,
         secrets: Vec<String>,
         diagnostics: Diagnostics,
@@ -96,24 +99,88 @@ impl Hub {
         let (updates, _) = broadcast::channel(256);
         Arc::new(Self {
             cameras: Mutex::new(
-                identities
+                camera_ids
                     .into_iter()
-                    .map(|(id, stable_id)| {
-                        (
-                            id,
-                            CameraState {
-                                stable_id,
-                                ..CameraState::default()
-                            },
-                        )
-                    })
+                    .map(|id| (id, CameraState::default()))
                     .collect(),
             ),
             updates,
+            identity_changes: tokio::sync::watch::channel(()).0,
             callbacks,
             diagnostics,
             secrets,
         })
+    }
+
+    pub fn identified(&self, id: &str) -> bool {
+        self.cameras
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|c| c.identified)
+    }
+
+    pub fn identity(&self, id: &str) -> Option<crate::identity::HardwareId> {
+        self.cameras.lock().unwrap().get(id)?.identity.clone()
+    }
+
+    pub fn identify(&self, id: &str, claim: Option<crate::identity::HardwareId>) {
+        let mut cameras = self.cameras.lock().unwrap();
+        if cameras[id].identified && cameras[id].claim == claim {
+            return;
+        }
+        let camera = cameras.get_mut(id).unwrap();
+        if claim.is_none() {
+            self.diagnostics.error(
+                "camera::identity",
+                "CAMERA_HARDWARE_ID_UNAVAILABLE",
+                None,
+                json!({"cameraId":id,"reason":"no-usable-identifier"}),
+                None,
+            );
+        }
+        camera.identified = true;
+        camera.claim = claim;
+        let mut counts = BTreeMap::new();
+        for claim in cameras.values().filter_map(|camera| camera.claim.as_ref()) {
+            *counts.entry(claim.value.clone()).or_insert(0) += 1;
+        }
+        for (id, camera) in &mut *cameras {
+            let unique = camera
+                .claim
+                .as_ref()
+                .filter(|claim| counts[&claim.value] == 1)
+                .cloned();
+            if camera.claim.is_some() && unique.is_none() {
+                self.diagnostics.error(
+                    "camera::identity",
+                    "CAMERA_HARDWARE_ID_UNAVAILABLE",
+                    None,
+                    json!({"cameraId":id,"reason":"duplicate-identifier"}),
+                    None,
+                );
+            }
+            if camera.identity == unique {
+                continue;
+            }
+            if camera.identity.is_some() {
+                camera.snapshots.clear();
+                camera.observed.clear();
+                camera.properties.clear();
+            }
+            camera.identity = unique;
+            let mut snapshots: BTreeMap<_, _> = std::mem::take(&mut camera.snapshots)
+                .into_iter()
+                .map(|(topic, old)| (topic, old.payload.clone()))
+                .collect();
+            snapshots
+                .entry("info".into())
+                .or_insert_with(|| json!({"camera_id":id}));
+            for (topic, payload) in snapshots {
+                self.store(camera, id, &topic, payload);
+            }
+        }
+        self.identity_changes.send_replace(());
     }
 
     pub fn redacted(&self, mut value: Value) -> Value {
@@ -148,7 +215,8 @@ impl Hub {
 
     fn store(&self, camera: &mut CameraState, id: &str, topic: &str, mut payload: Value) {
         xml::redact(&mut payload, &self.secrets);
-        payload["stable_id"] = json!(camera.stable_id);
+        payload["stable_id"] = json!(camera.identity.as_ref().map(|v| &v.value));
+        payload["identity_source"] = json!(camera.identity.as_ref().map(|v| v.source));
         let snapshot = Arc::new(Snapshot {
             camera_id: id.into(),
             topic: topic.into(),
@@ -217,7 +285,8 @@ impl Hub {
         {
             let mut all = self.cameras.lock().unwrap();
             let camera = all.get_mut(id).unwrap();
-            payload["stable_id"] = json!(camera.stable_id);
+            payload["stable_id"] = json!(camera.identity.as_ref().map(|v| &v.value));
+            payload["identity_source"] = json!(camera.identity.as_ref().map(|v| v.source));
             if camera.observed.len() < 256 && !camera.observed.contains_key(&vendor_topic) {
                 camera
                     .observed

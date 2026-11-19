@@ -18,6 +18,7 @@ use tokio::{
 };
 
 use super::{Api, Media, Recordings, SEARCH_TTL, error};
+use crate::reolink::recordings::Clip;
 use crate::{
     http::CorrelationId,
     reolink::{recording_media, wire::Device},
@@ -28,6 +29,7 @@ const CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 pub(super) struct Thumbnail {
     jpeg: Bytes,
+    offset_ms: u64,
     accessed: Instant,
 }
 
@@ -49,15 +51,9 @@ impl Recordings {
         device: &Device,
         api: &Api,
         correlation: &CorrelationId,
-    ) -> Result<Bytes> {
-        let catalog_key = format!("{camera}/{id}");
-        let _camera = self
-            .cameras
-            .get(camera)
-            .ok_or_else(|| anyhow!("unknown camera"))?
-            .lock()
-            .await;
-        let (mut clip, media) = self.lookup(&catalog_key).await?;
+    ) -> Result<(Bytes, u64)> {
+        let catalog_key = format!("{}/{id}", api.recording_scope(camera));
+        let (clip, _) = self.lookup(&catalog_key).await?;
         // One-second buckets make neighbouring timeline positions share the same frame.
         let offset_ms = (offset_ms / 1000 * 1000).min(
             (clip.end - clip.start)
@@ -78,72 +74,99 @@ impl Recordings {
             let mut cache = self.thumbnails.lock().await;
             if let Some(item) = cache.get_mut(&key) {
                 item.accessed = Instant::now();
-                return Ok(item.jpeg.clone());
+                return Ok((item.jpeg.clone(), item.offset_ms));
             }
         }
         let ttl = self.cache_ttl.min(SEARCH_TTL);
         if let Some(store) = &self.thumbnail_store
-            && let Some(jpeg) = store.recording(&key, None, ttl).await
+            && let Some((jpeg, offset)) = store.recording(&key, None, ttl).await
         {
-            self.cache_thumbnail(key, jpeg.clone()).await;
-            return Ok(jpeg);
+            self.cache_thumbnail(key, jpeg.clone(), offset).await;
+            return Ok((jpeg, offset));
         }
-        let _slot = self.slots.try_acquire()?;
-        let jpeg = if let Some(media) = media {
-            convert(None, Some(media), offset_ms).await?
-        } else {
-            clip.start += chrono::Duration::milliseconds(offset_ms as i64);
-            // CoverPreview is optional. The ordinary read-only recording download works
-            // on older models too; stop it as soon as the first keyframe arrives.
-            let until = self.cover_unavailable.lock().await.get(camera).copied();
-            let jpeg = if until.is_none_or(|until| Instant::now() >= until) {
-                let cover = timeout(Duration::from_secs(5), async {
-                    let frame = recording_media::cover(device, &clip).await?;
-                    convert(Some(frame), None, 0).await
-                })
-                .await;
-                match cover {
-                    Ok(Ok(jpeg)) => Some(jpeg),
-                    failure => {
-                        self.cover_unavailable
-                            .lock()
-                            .await
-                            .insert(camera.into(), Instant::now() + Duration::from_secs(300));
-                        if let Some(hub) = &api.hub {
-                            let cause = match failure {
-                                Ok(Err(error)) => error,
-                                _ => anyhow!("CoverPreview command timed out"),
-                            };
-                            hub.diagnostics.error(
-                                "api::recordings::preview",
-                                "API_RECORDING_PREVIEW_FALLBACK",
-                                Some(correlation.0.clone()),
-                                json!({"cameraId":camera,"recordingId":id,"stage":"cover-preview"}),
-                                Some(cause),
-                            );
-                        }
-                        None
-                    }
-                }
+        let _camera = self
+            .cameras
+            .get(camera)
+            .ok_or_else(|| anyhow!("unknown camera"))?
+            .lock()
+            .await;
+        if let Some(item) = self.thumbnails.lock().await.get_mut(&key) {
+            item.accessed = Instant::now();
+            return Ok((item.jpeg.clone(), item.offset_ms));
+        }
+        let (mut clip, media) = self.lookup(&catalog_key).await?;
+        let _slot = self.slots.acquire().await?;
+        let start = clip.start;
+        let mut offset = offset_ms;
+        let (jpeg, selected) = loop {
+            let attempt = if let Some(media) = &media {
+                convert(None, Some(media.clone()), offset).await
             } else {
-                None
+                clip.start = start + chrono::Duration::milliseconds(offset as i64);
+                self.camera_jpeg(camera, &clip, device, api, correlation)
+                    .await
             };
-            match jpeg {
-                Some(jpeg) => jpeg,
-                None => {
-                    let frame = recording_media::download_frame(device, &clip).await?;
-                    convert(Some(frame), None, 0).await?
+            match attempt {
+                Ok(jpeg) => break (jpeg, offset),
+                Err(reason)
+                    if reason.is::<recording_media::EmptyPreview>()
+                        && offset > 0
+                        && offset_ms - offset < 8000 =>
+                {
+                    let back = if offset == offset_ms { 2000 } else { 8000 };
+                    offset = offset_ms.saturating_sub(back);
                 }
+                Err(reason) => return Err(reason),
             }
         };
-        self.cache_thumbnail(key.clone(), jpeg.clone()).await;
+        self.cache_thumbnail(key.clone(), jpeg.clone(), selected)
+            .await;
         if let Some(store) = &self.thumbnail_store {
-            store.recording(&key, Some(&jpeg), ttl).await;
+            store.recording(&key, Some((&jpeg, selected)), ttl).await;
         }
-        Ok(jpeg)
+        Ok((jpeg, selected))
     }
 
-    async fn cache_thumbnail(&self, key: String, jpeg: Bytes) {
+    async fn camera_jpeg(
+        &self,
+        camera: &str,
+        clip: &Clip,
+        device: &Device,
+        api: &Api,
+        correlation: &CorrelationId,
+    ) -> Result<Bytes> {
+        let until = self.cover_unavailable.lock().await.get(camera).copied();
+        if until.is_none_or(|until| Instant::now() >= until) {
+            let cover = timeout(Duration::from_secs(5), async {
+                let frame = recording_media::cover(device, clip).await?;
+                convert(Some(frame), None, 0).await
+            })
+            .await;
+            match cover {
+                Ok(Ok(jpeg)) => return Ok(jpeg),
+                // An empty tail window is specific to this clip. Keep CoverPreview enabled.
+                Ok(Err(reason)) if reason.is::<recording_media::EmptyPreview>() => {}
+                failure => {
+                    self.cover_unavailable
+                        .lock()
+                        .await
+                        .insert(camera.into(), Instant::now() + Duration::from_secs(300));
+                    if let Some(hub) = &api.hub {
+                        let cause = match failure {
+                            Ok(Err(reason)) => reason,
+                            _ => anyhow!("CoverPreview command timed out"),
+                        };
+                        hub.diagnostics.error("api::recordings::preview","API_RECORDING_PREVIEW_FALLBACK",Some(correlation.0.clone()),
+                            json!({"cameraId":camera,"recordingId":clip.id,"stage":"cover-preview"}),Some(cause));
+                    }
+                }
+            }
+        }
+        let frame = recording_media::download_frame(device, clip).await?;
+        convert(Some(frame), None, 0).await
+    }
+
+    async fn cache_thumbnail(&self, key: String, jpeg: Bytes, offset_ms: u64) {
         let mut cache = self.thumbnails.lock().await;
         let mut size: usize = cache.values().map(|item| item.jpeg.len()).sum();
         while size + jpeg.len() > CACHE_BYTES || cache.len() >= 128 {
@@ -160,6 +183,7 @@ impl Recordings {
             key,
             Thumbnail {
                 jpeg,
+                offset_ms,
                 accessed: Instant::now(),
             },
         );
@@ -228,6 +252,9 @@ async fn convert(
         Ok::<_, std::io::Error>(jpeg)
     };
     let (_, jpeg, status) = tokio::try_join!(write, read, child.wait())?;
+    if status.success() && jpeg.is_empty() {
+        return Err(recording_media::EmptyPreview.into());
+    }
     ensure!(
         status.success()
             && jpeg.len() <= MAX_JPEG
@@ -267,7 +294,7 @@ pub(in crate::api) async fn get(
     {
         let mut entries = api.recordings.entries.lock().await;
         api.recordings.prune(&mut entries, Instant::now());
-        if !entries.contains_key(&format!("{camera}/{id}")) {
+        if !entries.contains_key(&format!("{}/{id}", api.recording_scope(&camera))) {
             return error(StatusCode::NOT_FOUND, "API_MEDIA_UNSUPPORTED", &correlation);
         }
     }
@@ -276,8 +303,9 @@ pub(in crate::api) async fn get(
         result = timeout(Duration::from_secs(35),api.recordings.thumbnail(&camera,&id,query.offset_ms,device,&api,&correlation)) => result,
     };
     match result {
-        Ok(Ok(jpeg)) => (
+        Ok(Ok((jpeg, offset))) => (
             [
+                ("x-preview-offset-ms", offset.to_string().as_str()),
                 ("content-type", "image/jpeg"),
                 ("cache-control", "private, no-store"),
                 ("x-content-type-options", "nosniff"),
@@ -299,11 +327,15 @@ pub(in crate::api) async fn get(
                     Some(failure),
                 );
             }
-            error(
+            let mut response = error(
                 StatusCode::BAD_GATEWAY,
                 "API_MEDIA_START_FAILED",
                 &correlation,
-            )
+            );
+            response
+                .headers_mut()
+                .insert("x-preview-offset-ms", query.offset_ms.into());
+            response
         }
     }
 }

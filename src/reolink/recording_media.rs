@@ -16,11 +16,47 @@ use super::{
 
 const LIMIT: usize = 512 * 1024 * 1024;
 
-#[derive(Default, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct RecordingMetadata {
-    pub frames: Vec<RecordingFrame>,
-    pub truncated: bool,
+    pub bytes: u64,
+    page_starts: Vec<u64>,
+    page_frames: usize,
+}
+
+impl RecordingMetadata {
+    async fn append(
+        &mut self,
+        writer: &mut (impl AsyncWrite + Unpin),
+        frame: &RecordingFrame,
+    ) -> Result<()> {
+        let mut data = serde_json::to_vec(frame)?;
+        data.push(b'\n');
+        if self.page_starts.is_empty()
+            || self.page_frames >= 256
+            || self.bytes - self.page_starts.last().copied().unwrap_or(0) + data.len() as u64
+                > 1_048_576
+        {
+            self.page_starts.push(self.bytes);
+            self.page_frames = 0;
+        }
+        ensure!(
+            self.bytes + data.len() as u64 <= LIMIT as u64,
+            "recording metadata exceeds transfer limit"
+        );
+        writer.write_all(&data).await?;
+        self.bytes += data.len() as u64;
+        self.page_frames += 1;
+        Ok(())
+    }
+
+    pub fn page(&self, number: usize) -> Option<(std::ops::Range<u64>, Option<usize>)> {
+        if number == 0 && self.page_starts.is_empty() {
+            return Some((0..0, None));
+        }
+        let start = *self.page_starts.get(number)?;
+        let next = self.page_starts.get(number + 1).copied();
+        Some((start..next.unwrap_or(self.bytes), next.map(|_| number + 1)))
+    }
 }
 
 #[derive(Serialize)]
@@ -34,6 +70,7 @@ pub async fn download(
     device: &Device,
     clip: &Clip,
     output: &mut (impl AsyncWrite + Unpin),
+    detections: &mut (impl AsyncWrite + Unpin),
     stop: &CancellationToken,
 ) -> Result<RecordingMetadata> {
     let mut session = device.connect().await?;
@@ -52,13 +89,12 @@ pub async fn download(
     let mut pending = BytesMut::new();
     let mut total = 0;
     let mut mux = None;
-    let mut start = None;
+    let mut elapsed_ticks = 0u64;
     let mut last_ticks = 0;
     let mut audio_pts = 90_000u64;
     let mut frames = 0;
     let mut metadata = RecordingMetadata::default();
     let mut dimensions = None;
-    let mut metadata_bytes = 0;
     let result = async {
         loop {
             let part = match packet.take() {
@@ -101,14 +137,18 @@ pub async fn download(
                         data,
                         extra,
                     } => {
-                        if start.is_none() && !iframe {
+                        if frames == 0 && !iframe {
                             pending.advance(consumed);
                             continue;
                         }
-                        let base = *start.get_or_insert(ticks);
-                        if frames > 0 && ticks.wrapping_sub(last_ticks) > 0x8000_0000 {
-                            pending.advance(consumed);
-                            continue;
+                        if frames > 0 {
+                            // The camera's microsecond clock wraps roughly every 72 minutes.
+                            let delta = ticks.wrapping_sub(last_ticks);
+                            if delta > 0x8000_0000 {
+                                pending.advance(consumed);
+                                continue;
+                            }
+                            elapsed_ticks += u64::from(delta);
                         }
                         if mux.is_none() {
                             let codec = match codec {
@@ -120,25 +160,15 @@ pub async fn download(
                             output.write_all(&value.header()).await?;
                             mux = Some(value);
                         }
-                        let offset_ms = u64::from(ticks.wrapping_sub(base)) / 1000;
-                        if !metadata.truncated
-                            && metadata
-                                .frames
-                                .last()
-                                .is_none_or(|frame| offset_ms >= frame.offset_ms + 200)
-                            && let Some(mut objects) =
-                                recording_objects(extra, iframe, &mut dimensions)
+                        let offset_ms = elapsed_ticks / 1000;
+                        if let Some(mut objects) = recording_objects(extra, iframe, &mut dimensions)
                         {
                             objects.truncate(32);
-                            let frame = RecordingFrame { offset_ms, objects };
-                            metadata_bytes += serde_json::to_vec(&frame)?.len();
-                            if metadata.frames.len() >= 4096 || metadata_bytes > 4 * 1024 * 1024 {
-                                metadata.truncated = true;
-                            } else {
-                                metadata.frames.push(frame);
-                            }
+                            metadata
+                                .append(detections, &RecordingFrame { offset_ms, objects })
+                                .await?;
                         }
-                        let pts = 90_000 + u64::from(ticks.wrapping_sub(base)) * 9 / 100;
+                        let pts = 90_000 + elapsed_ticks * 9 / 100;
                         output
                             .write_all(&mux.as_mut().unwrap().pes(0x100, 0xe0, pts, data))
                             .await?;
@@ -146,8 +176,7 @@ pub async fn download(
                         frames += 1;
                     }
                     Media::Audio { aac: true, data } if frames > 0 => {
-                        let video_pts =
-                            90_000 + u64::from(last_ticks.wrapping_sub(start.unwrap())) * 9 / 100;
+                        let video_pts = 90_000 + elapsed_ticks * 9 / 100;
                         if video_pts > audio_pts + 90_000 {
                             audio_pts = video_pts;
                         }
@@ -177,6 +206,7 @@ pub async fn download(
             "recording has no complete video"
         );
         output.flush().await?;
+        detections.flush().await?;
         Ok(metadata)
     }
     .await;
@@ -286,6 +316,16 @@ pub async fn cover(device: &Device, clip: &Clip) -> Result<(&'static str, Vec<u8
     frame(device, clip, true).await
 }
 
+#[derive(Debug)]
+pub struct EmptyPreview;
+
+impl std::fmt::Display for EmptyPreview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the recording interval ended before a decodable frame was returned")
+    }
+}
+impl std::error::Error for EmptyPreview {}
+
 /// Read only the first keyframe, then stop the download. Older cameras lack CoverPreview.
 pub async fn download_frame(device: &Device, clip: &Clip) -> Result<(&'static str, Vec<u8>)> {
     frame(device, clip, false).await
@@ -329,14 +369,13 @@ async fn frame(device: &Device, clip: &Clip, cover: bool) -> Result<(&'static st
             if packet.command != command || packet.sequence != sequence {
                 continue;
             }
+            if matches!(packet.status, 300 | 331) || packet.payload_finished(&session) {
+                return Err(EmptyPreview.into());
+            }
             ensure!(
                 matches!(packet.status, 200 | 201),
                 "recording frame command {command} returned status {}",
                 packet.status
-            );
-            ensure!(
-                !packet.payload_finished(&session),
-                "recording frame command {command} ended without a frame"
             );
             let Some(data) = packet.binary(&session) else {
                 continue;
@@ -372,4 +411,48 @@ async fn frame(device: &Device, clip: &Clip, cover: bool) -> Result<(&'static st
     }
     session.logout().await;
     result
+}
+
+#[cfg(test)]
+mod recording_index_tests {
+    use super::*;
+    #[tokio::test]
+    async fn all_detection_samples_survive_pagination() {
+        let mut index = RecordingMetadata::default();
+        let mut data = vec![];
+        for offset_ms in 0..4201 {
+            index
+                .append(
+                    &mut data,
+                    &RecordingFrame {
+                        offset_ms,
+                        objects: vec![],
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut offsets = vec![];
+        let mut page = 0;
+        loop {
+            let (range, next) = index.page(page).unwrap();
+            for line in data[range.start as usize..range.end as usize]
+                .split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+            {
+                offsets.push(
+                    serde_json::from_slice::<serde_json::Value>(line).unwrap()["offsetMs"]
+                        .as_u64()
+                        .unwrap(),
+                );
+            }
+            if let Some(n) = next {
+                page = n;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(offsets, (0..4201).collect::<Vec<_>>());
+        assert!(index.page(page + 1).is_none());
+    }
 }

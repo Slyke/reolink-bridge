@@ -99,7 +99,7 @@ async fn check_camera_identity(
         && api.authenticated(request.headers())
         && !expected
             .to_str()
-            .is_ok_and(|value| api.camera_identity(camera) == Some(value))
+            .is_ok_and(|value| api.camera_identity(camera).as_deref() == Some(value))
     {
         let correlation = request
             .extensions()

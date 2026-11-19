@@ -84,6 +84,7 @@ impl Diagnostics {
             "ONVIF_UNSUBSCRIBE_FAILED",
             "BAICHUAN_EVENTS_ENDED",
             "BAICHUAN_DISCOVERY_FAILED",
+            "CAMERA_HARDWARE_ID_UNAVAILABLE",
             "BAICHUAN_METADATA_ENDED",
             "ONVIF_METADATA_ENDED",
             "MQTT_DISCONNECTED",

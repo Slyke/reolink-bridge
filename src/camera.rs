@@ -191,6 +191,11 @@ impl CameraTask {
                 _ = self.stop.cancelled() => return,
                 _ = refresh.tick() => {},
             }
+            let identity = tokio::select! {
+                _ = self.stop.cancelled() => return,
+                result = crate::identity::read(self.onvif.as_ref(), self.baichuan.as_ref(), self.config.channel) => result,
+            };
+            self.hub.identify(&self.config.id, identity);
             let onvif = async {
                 if let Some(onvif) = &self.onvif {
                     let discovery = onvif.discover().await;

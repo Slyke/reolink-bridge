@@ -113,7 +113,11 @@ impl Camera {
                     // The device can apply the write and close the connection without replying.
                     return Ok(());
                 }
-                self.handle(command, std::str::from_utf8(&body[offset..])?)?
+                if command == 318 && header[12] == 2 {
+                    (200, "<body><ChnTypeInfo><serialNumber>FIXTURE-CHANNEL-1</serialNumber></ChnTypeInfo></body>".into())
+                } else {
+                    self.handle(command, std::str::from_utf8(&body[offset..])?)?
+                }
             };
             header[16..18].copy_from_slice(&status.to_le_bytes());
             header[18..20].copy_from_slice(&[0x14, if legacy { 0x66 } else { 0x64 }]);
@@ -202,6 +206,7 @@ impl Camera {
                 "<body><CoverPreview/></body>".into()
             }
             143=> {
+                if self.reject_recording_cover.load(Ordering::SeqCst) && body.contains("<second>01</second></startTime>") { return Ok((300,String::new())); }
                 if self.recording.is_none() {return Ok((405,String::new()))}
                 ensure!(body.contains("<streamType>subStream</streamType>"));
                 "<body><FileInfoList/></body>".into()

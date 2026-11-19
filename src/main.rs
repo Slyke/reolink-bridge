@@ -4,6 +4,7 @@ mod config;
 mod diagnostics;
 mod http;
 mod hub;
+mod identity;
 mod model;
 mod mqtt;
 mod onvif;
@@ -155,10 +156,10 @@ async fn run(
         snapshot_slot.clone(),
         stop.clone(),
     )?;
-    let identities: BTreeMap<_, _> = config
+    let camera_ids: std::collections::BTreeSet<_> = config
         .cameras
         .iter()
-        .map(|camera| (camera.id.clone(), camera.identity().to_owned()))
+        .map(|camera| camera.id.clone())
         .collect();
     let ws_path = &config
         .http
@@ -289,19 +290,19 @@ async fn run(
     let callbacks = hub::Callbacks::new(
         path,
         hub::CallbackFile::new(raw, document, config.callbacks),
-        identities.keys().cloned().collect(),
+        camera_ids.clone(),
         client,
         stop.clone(),
         diagnostics.clone(),
     );
-    let hub = hub::Hub::new(identities, callbacks, secrets, diagnostics.clone());
+    let hub = hub::Hub::new(camera_ids, callbacks, secrets, diagnostics.clone());
     let mut controls = BTreeMap::new();
     let mut workers = JoinSet::new();
     for (camera, onvif, baichuan, webhook, cgi_webhook) in devices {
         let id = camera.id.clone();
         let base = format!("{}/{id}", config.mqtt.base_topic);
         let control_device = baichuan.clone();
-        let stable_id = camera.identity().to_owned();
+
         let (controller, worker) = CameraTask {
             config: camera,
             onvif,
@@ -318,7 +319,8 @@ async fn run(
         let services = control_device.map(|device| {
             controls.insert(id.clone(), controller.clone());
             mqtt::CameraCommands {
-                stable_id,
+                camera_id: id.clone(),
+                hub: hub.clone(),
                 control: controller,
                 device,
                 snapshot_slot: snapshot_slot.clone(),

@@ -62,7 +62,8 @@ enum SnapshotSetting {
 }
 
 pub struct CameraCommands {
-    pub stable_id: String,
+    pub camera_id: String,
+    pub hub: Arc<Hub>,
     pub control: ControlHandle,
     pub device: Device,
     pub snapshot_slot: Arc<Semaphore>,
@@ -336,10 +337,14 @@ async fn run_command(
     let mut id = None;
     let mut reply = match request {
         Ok(request)
-            if request
-                .stable_id
-                .as_ref()
-                .is_some_and(|expected| *expected != services.stable_id) =>
+            if request.stable_id.as_ref().is_some_and(|expected| {
+                services
+                    .hub
+                    .identity(&services.camera_id)
+                    .as_ref()
+                    .map(|v| &v.value)
+                    != Some(expected)
+            }) =>
         {
             id = Some(request.id);
             diagnostics.error(

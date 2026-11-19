@@ -115,6 +115,30 @@ struct Media {
     size: u64,
 }
 
+impl Media {
+    fn cached_bytes(&self) -> u64 {
+        self.size + self.metadata.bytes
+    }
+
+    async fn detection_page(&self, page: usize) -> Result<Option<serde_json::Value>> {
+        let Some((range, next)) = self.metadata.page(page) else {
+            return Ok(None);
+        };
+        let mut file = File::open(self.path.with_file_name("detections.jsonl")).await?;
+        file.seek(std::io::SeekFrom::Start(range.start)).await?;
+        let mut raw = vec![0; (range.end - range.start) as usize];
+        file.read_exact(&mut raw).await?;
+        let frames = raw
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(
+            json!({"source":"recording","frames":frames,"truncated":next.is_some(),"nextPage":next}),
+        ))
+    }
+}
+
 impl Recordings {
     pub(super) fn new(config: &Config, ids: impl Iterator<Item = String>) -> Result<Self> {
         let cache_ttl = Duration::from_secs(config.cache.ttl_seconds);
@@ -222,7 +246,7 @@ impl Recordings {
     }
     async fn cache(&self, key: String, clip: Clip, media: Arc<Media>) -> Result<Arc<Media>> {
         ensure!(
-            media.size <= self.max_cache_bytes,
+            media.cached_bytes() <= self.max_cache_bytes,
             PreparationStage("cache-limit")
         );
         let mut entries = self.entries.lock().await;
@@ -234,9 +258,9 @@ impl Recordings {
         let mut bytes = entries
             .values()
             .filter_map(|entry| entry.media.as_ref())
-            .map(|cached| cached.file.size)
+            .map(|cached| cached.file.cached_bytes())
             .sum::<u64>();
-        while bytes > self.max_cache_bytes - media.size {
+        while bytes > self.max_cache_bytes - media.cached_bytes() {
             let oldest = entries
                 .iter()
                 .filter_map(|(key, entry)| entry.media.as_ref().map(|cached| (key, cached)))
@@ -247,7 +271,7 @@ impl Recordings {
                 .get_mut(&oldest)
                 .and_then(|entry| entry.media.take())
             {
-                bytes -= cached.file.size;
+                bytes -= cached.file.cached_bytes();
             }
         }
         entries.insert(
@@ -275,7 +299,7 @@ impl Recordings {
             id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid recording"
         );
-        let key = format!("{camera}/{id}");
+        let key = format!("{}/{id}", api.recording_scope(camera));
         let _camera = self
             .cameras
             .get(camera)
@@ -301,9 +325,15 @@ impl Recordings {
             let mut output = File::create(&input)
                 .await
                 .context(PreparationStage("temporary-storage"))?;
-            let metadata = recording_media::download(device, &clip, &mut output, &api.stop)
-                .await
-                .context(PreparationStage("camera-download"))?;
+            let mut detections = tokio::io::BufWriter::new(
+                File::create(directory.path().join("detections.jsonl"))
+                    .await
+                    .context(PreparationStage("temporary-storage"))?,
+            );
+            let metadata =
+                recording_media::download(device, &clip, &mut output, &mut detections, &api.stop)
+                    .await
+                    .context(PreparationStage("camera-download"))?;
             drop(output);
             let size = async {
                 let result = Command::new("ffmpeg")
@@ -379,9 +409,16 @@ impl Recordings {
     }
 }
 
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct MetadataQuery {
+    page: usize,
+}
+
 pub(super) async fn metadata(
     State(api): State<Arc<Api>>,
     Path((camera, id)): Path<(String, String)>,
+    Query(query): Query<MetadataQuery>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
@@ -400,19 +437,35 @@ pub(super) async fn metadata(
     }
     if api
         .recordings
-        .lookup(&format!("{camera}/{id}"))
+        .lookup(&format!("{}/{id}", api.recording_scope(&camera)))
         .await
         .is_err()
     {
         return error(StatusCode::NOT_FOUND, "API_MEDIA_UNSUPPORTED", &correlation);
     }
-    match api.recordings.media(&camera,&id,device,&api).await {
-        Ok(media) => Json(json!({"source":"recording","frames":media.metadata.frames,"truncated":media.metadata.truncated})).into_response(),
+    let result = async {
+        let media = api.recordings.media(&camera, &id, device, &api).await?;
+        media.detection_page(query.page).await
+    }
+    .await;
+    match result {
+        Ok(Some(page)) => Json(page).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "API_MEDIA_UNSUPPORTED", &correlation),
         Err(cause) => {
             if let Some(hub) = &api.hub {
-                hub.diagnostics.error("api::recordings::metadata","API_RECORDING_METADATA_FAILED",Some(correlation.0.clone()),json!({"cameraId":camera,"recordingId":id}),Some(cause));
+                hub.diagnostics.error(
+                    "api::recordings::metadata",
+                    "API_RECORDING_METADATA_FAILED",
+                    Some(correlation.0.clone()),
+                    json!({"cameraId":camera,"recordingId":id}),
+                    Some(cause),
+                );
             }
-            error(StatusCode::BAD_GATEWAY,"API_RECORDING_METADATA_FAILED",&correlation)
+            error(
+                StatusCode::BAD_GATEWAY,
+                "API_RECORDING_METADATA_FAILED",
+                &correlation,
+            )
         }
     }
 }
@@ -562,7 +615,9 @@ pub(super) async fn list(
     match result {
         Ok((mut clips, truncated)) => {
             clips.sort_by_key(|clip| clip.start);
-            api.recordings.retain(&camera, &clips).await;
+            api.recordings
+                .retain(&api.recording_scope(&camera), &clips)
+                .await;
             Json(json!({"recordings":clips,"truncated":truncated,"date":query.date,"stream":query.stream,"correlation_id":correlation.0})).into_response()
         }
         Err(cause) => read_failure(
@@ -598,7 +653,7 @@ pub(super) async fn video(
     {
         let mut entries = api.recordings.entries.lock().await;
         api.recordings.prune(&mut entries, Instant::now());
-        if !entries.contains_key(&format!("{camera}/{id}")) {
+        if !entries.contains_key(&format!("{}/{id}", api.recording_scope(&camera))) {
             return error(StatusCode::NOT_FOUND, "API_MEDIA_UNSUPPORTED", &correlation);
         }
     }

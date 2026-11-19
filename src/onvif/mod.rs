@@ -225,6 +225,36 @@ impl Onvif {
         }
     }
 
+    pub async fn hardware_id(&self) -> Option<crate::identity::HardwareId> {
+        use crate::identity::HardwareId;
+        let info = self
+            .call(
+                &self.device,
+                format!("{DEV}/GetDeviceInformation"),
+                "<tds:GetDeviceInformation/>",
+            )
+            .await
+            .ok()?;
+        if let Some(serial) = device_info(&info)
+            .and_then(|value| HardwareId::serial(value["serial_number"].as_str()?))
+        {
+            return Some(serial);
+        }
+        let raw = self
+            .call(
+                &self.device,
+                format!("{DEV}/GetNetworkInterfaces"),
+                "<tds:GetNetworkInterfaces/>",
+            )
+            .await
+            .ok()?;
+        let doc = xml::document(&raw).ok()?;
+        doc.descendants()
+            .filter(|n| n.has_tag_name("HwAddress"))
+            .filter_map(|n| HardwareId::mac(n.text()?))
+            .min_by(|a, b| a.value.cmp(&b.value))
+    }
+
     pub async fn discover(&self) -> Discovery {
         let (services, info) = tokio::join!(
             self.services(),

@@ -101,6 +101,24 @@ async fn start(config: &Path, client: &Client, origin: &str) -> Result<Child> {
     anyhow::bail!("fixture bridge did not start")
 }
 
+async fn discovered(client: &Client, url: &str) -> Value {
+    let until = Instant::now() + Duration::from_secs(8);
+    loop {
+        let cameras = response(client, url, PRIMARY, None).await.1["cameras"].clone();
+        if cameras.as_array().is_some_and(|list| {
+            list.iter()
+                .all(|c| c["active"] == false || !c["stableId"].is_null())
+        }) {
+            return cameras;
+        }
+        assert!(
+            Instant::now() < until,
+            "hardware identity discovery timed out"
+        );
+        sleep(Duration::from_millis(30)).await;
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires Mosquitto on PATH; BRIDGE_TEST_VALKEY_URL enables the Valkey run"]
 async fn background_previews_are_authenticated_and_wait_for_each_image() -> Result<()> {
@@ -515,8 +533,8 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
         "active"
     );
     assert_eq!(
-        response(&client, &url("/inventory"), PRIMARY, None).await.1["cameras"],
-        json!([{"id":"new","stableId":"new","active":true}])
+        discovered(&client, &url("/inventory")).await,
+        json!([{"id":"new","stableId":"FIXTURE-SERIAL","identitySource":"serial","previousId":"new","active":true}])
     );
     let until = Instant::now() + Duration::from_secs(6);
     loop {
@@ -639,8 +657,8 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     bridge.kill().await?;
     bridge = start(&config, &client, &origin).await?;
     assert_eq!(
-        response(&client, &url("/inventory"), PRIMARY, None).await.1["cameras"],
-        json!([{"id":"new","stableId":"new","active":false}])
+        discovered(&client, &url("/inventory")).await,
+        json!([{"id":"new","stableId":"FIXTURE-SERIAL","identitySource":"serial","previousId":"new","active":false}])
     );
     camera.block_login.store(false, Ordering::SeqCst);
     let recovered = response(
@@ -657,7 +675,7 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     // credential and completed rotation still live under the original stable identity.
     let mut moved = body;
     moved["cameras"] = json!([{
-        "id":"garage","stableId":"new","host":"127.0.0.1","baichuanPort":address.port(),
+        "id":"garage","host":"127.0.0.1","baichuanPort":address.port(),
         "onvifPort":null,"eventTransport":"baichuan","username":"admin"
     }]);
     moved["api"]["targets"]
@@ -668,8 +686,8 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     std::fs::write(&config, moved.to_string())?;
     let _bridge = start(&config, &client, &origin).await?;
     assert_eq!(
-        response(&client, &url("/inventory"), PRIMARY, None).await.1["cameras"],
-        json!([{"id":"garage","stableId":"new","active":true}])
+        discovered(&client, &url("/inventory")).await,
+        json!([{"id":"garage","stableId":"FIXTURE-SERIAL","identitySource":"serial","previousId":"new","active":true}])
     );
     assert_eq!(
         response(&client, &url("/cameras/garage/rotation"), PRIMARY, None)
@@ -943,8 +961,8 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     assert_eq!(metadata.0, 200);
     assert_eq!(metadata.1["source"], "recording");
     let samples = metadata.1["frames"].as_array().unwrap();
-    assert_eq!(samples.len(), 8);
-    assert_eq!(samples[1]["offsetMs"], 250);
+    assert_eq!(samples.len(), 16);
+    assert_eq!(samples[1]["offsetMs"], 125);
     assert_eq!(samples[0]["objects"][0]["class"], "person");
     assert!(
         (samples[0]["objects"][0]["bounding_box"]["top"]
@@ -1065,6 +1083,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
             .send()
             .await?;
         assert_eq!(thumbnail.status(), 200);
+        assert_eq!(thumbnail.headers()["x-preview-offset-ms"], "0");
         assert!(thumbnail.bytes().await?.starts_with(&[0xff, 0xd8]));
     }
     assert_eq!(

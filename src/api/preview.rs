@@ -106,7 +106,6 @@ pub(super) fn store(config: &Config) -> Result<Option<Arc<Valkey>>> {
 pub(super) fn prepare(
     config: &Config,
     devices: &BTreeMap<String, Device>,
-    identities: &BTreeMap<String, String>,
     slots: Arc<Semaphore>,
     stop: CancellationToken,
     store: Option<Arc<Valkey>>,
@@ -116,7 +115,6 @@ pub(super) fn prepare(
         .iter()
         .filter_map(|(id, profile)| {
             let device = devices.get(id)?.clone();
-            let stable = identities.get(id)?;
             let origin = Sha256::digest(format!(
                 "{}:{}:{}",
                 device.host, device.port, device.channel
@@ -128,7 +126,7 @@ pub(super) fn prepare(
                     camera_id: id.clone(),
                     hub: OnceLock::new(),
                     interval: Duration::from_millis(profile.interval_ms),
-                    cache_id: format!("{stable}:{origin:x}"),
+                    cache_id: format!("{origin:x}"),
                     store: store.clone(),
                     slots: slots.clone(),
                     stop: stop.clone(),
@@ -172,6 +170,7 @@ impl Frame {
 
 #[derive(Clone, Default)]
 struct StateOfPreview {
+    identity: Option<String>,
     attempt: u64,
     finished_at: Option<Instant>,
     succeeded: bool,
@@ -193,24 +192,38 @@ pub(super) struct Preview {
 
 impl Preview {
     async fn run(self: Arc<Self>, id: String, hub: Arc<Hub>) {
-        if let Some(store) = &self.store {
+        let mut updates = self.state.subscribe();
+        let mut identities = hub.identity_changes.subscribe();
+        while !hub.identified(&id) {
             tokio::select! {
                 _ = self.stop.cancelled() => return,
-                frame = store.load(&self.cache_id) => {
-                    if let Some(frame) = frame {
-                        self.state.send_if_modified(|state| {
-                            if state.frame.is_some() {
-                                return false;
-                            }
-                            state.frame = Some(frame);
-                            true
-                        });
-                    }
-                }
+                _ = identities.changed() => {}
             }
         }
-        let mut updates = self.state.subscribe();
         loop {
+            identities.borrow_and_update();
+            let identity = hub.identity(&id).map(|v| v.value);
+            let changed = self.state.borrow().identity != identity;
+            if changed {
+                let _guard = self.in_flight.lock().await;
+                if self.state.borrow().identity != identity {
+                    let frame = if let (Some(store), Some(stable)) = (&self.store, &identity) {
+                        let key = format!("{stable}:{}", self.cache_id);
+                        tokio::select! {
+                            _ = self.stop.cancelled() => return,
+                            frame = store.load(&key) => frame,
+                        }
+                    } else {
+                        None
+                    };
+                    self.state.send_modify(|state| {
+                        state.identity = identity.clone();
+                        state.frame = frame;
+                        state.finished_at = None;
+                        state.succeeded = false;
+                    });
+                }
+            }
             if let Some(frame) = &updates.borrow().frame {
                 hub.section(
                     &id,
@@ -233,6 +246,7 @@ impl Preview {
             tokio::select! {
                 _ = self.stop.cancelled() => return,
                 _ = updates.changed() => {},
+                _ = identities.changed() => {},
                 _ = sleep_until(next) => { self.refresh(previous).await; }
             }
         }
@@ -243,8 +257,12 @@ impl Preview {
             _ = self.stop.cancelled() => return None,
             lock = self.in_flight.lock() => lock,
         };
+        let identity = self.hub.get()?.identity(&self.camera_id).map(|v| v.value);
         {
             let current = self.state.borrow();
+            if current.identity != identity {
+                return None;
+            }
             if current.attempt != previous {
                 return current.succeeded.then(|| current.frame.clone()).flatten();
             }
@@ -268,6 +286,9 @@ impl Preview {
                 }
             },
         };
+        if self.hub.get()?.identity(&self.camera_id).map(|v| v.value) != identity {
+            return None;
+        }
         let finished = Instant::now();
         self.state.send_modify(|state| {
             state.attempt = state.attempt.wrapping_add(1);
@@ -277,10 +298,11 @@ impl Preview {
                 state.frame = Some(frame.clone());
             }
         });
-        if let (Some(store), Some(frame)) = (&self.store, &frame) {
+        if let (Some(store), Some(frame), Some(stable)) = (&self.store, &frame, identity) {
+            let key = format!("{stable}:{}", self.cache_id);
             tokio::select! {
                 _ = self.stop.cancelled() => return None,
-                _ = store.save(&self.cache_id, self.interval, frame) => {}
+                _ = store.save(&key, self.interval, frame) => {}
             }
         }
         frame
@@ -298,29 +320,36 @@ impl Valkey {
     pub(super) async fn recording(
         &self,
         id: &str,
-        jpeg: Option<&Bytes>,
+        frame: Option<(&Bytes, u64)>,
         ttl: Duration,
-    ) -> Option<Bytes> {
-        let key = format!("{}:recording-preview:{id}", self.prefix);
-        if let Some(jpeg) = jpeg {
+    ) -> Option<(Bytes, u64)> {
+        let key = format!("{}:recording-preview:v2:{id}", self.prefix);
+        if let Some((jpeg, offset)) = frame {
+            let mut value = Vec::with_capacity(8 + jpeg.len());
+            value.extend_from_slice(&offset.to_be_bytes());
+            value.extend_from_slice(jpeg);
             let _: Option<()> = self
                 .command(
                     redis::cmd("SET")
                         .arg(key)
-                        .arg(jpeg.as_ref())
+                        .arg(value)
                         .arg("PX")
                         .arg(ttl.as_millis().max(1) as u64),
                 )
                 .await;
             return None;
         }
-        let value: Vec<u8> = self
-            .command(redis::cmd("GETRANGE").arg(key).arg(0).arg(512 * 1024))
-            .await?;
-        (value.len() <= 512 * 1024
-            && value.starts_with(&[0xff, 0xd8])
-            && value.ends_with(&[0xff, 0xd9]))
-        .then(|| Bytes::from(value))
+        let value = Bytes::from(
+            self.command::<Vec<u8>>(redis::cmd("GETRANGE").arg(key).arg(0).arg(512 * 1024 + 8))
+                .await?,
+        );
+        let offset = u64::from_be_bytes(value.get(..8)?.try_into().ok()?);
+        let jpeg = value.slice(8..);
+        (offset <= 86_400_000
+            && jpeg.len() <= 512 * 1024
+            && jpeg.starts_with(&[0xff, 0xd8])
+            && jpeg.ends_with(&[0xff, 0xd9]))
+        .then_some((jpeg, offset))
     }
 
     fn key(&self, id: &str) -> String {
@@ -418,7 +447,10 @@ pub(super) async fn get(
         let previous = preview.state.borrow().attempt;
         preview.refresh(previous).await
     } else {
-        preview.state.borrow().frame.clone()
+        let state = preview.state.borrow();
+        (state.identity == api.camera_identity(&id))
+            .then(|| state.frame.clone())
+            .flatten()
     };
     let Some(frame) = frame else {
         return error(
