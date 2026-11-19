@@ -761,6 +761,37 @@ async fn check_ptz(
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(unknown["errorKey"], "PTZ_PRESET_UNKNOWN");
+    let (_, saved) = http_ptz(
+        http,
+        address,
+        "lab",
+        "save-preset",
+        json!({"op":"save_preset","preset_id":3,"name":"Door & hall"}),
+    )
+    .await;
+    assert_eq!(saved["verified"], true, "{saved}");
+    assert_eq!(
+        saved["result"]["presets"][1],
+        json!({"id":3,"name":"Door & hall"})
+    );
+    let (_, occupied) = http_ptz(
+        http,
+        address,
+        "lab",
+        "occupied-preset",
+        json!({"op":"save_preset","preset_id":3,"name":"Replacement"}),
+    )
+    .await;
+    assert_eq!(occupied["errorKey"], "PTZ_PRESET_OCCUPIED");
+    let (_, replaced) = http_ptz(
+        http,
+        address,
+        "lab",
+        "replace-preset",
+        json!({"op":"save_preset","preset_id":3,"name":"Replacement","replace":true}),
+    )
+    .await;
+    assert_eq!(replaced["verified"], true, "{replaced}");
     let preset = json!({"id":"mqtt-preset","command":{"setting":"ptz","action":{"op":"goto_preset","preset_id":1}}});
     publisher
         .publish(

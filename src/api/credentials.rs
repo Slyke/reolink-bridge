@@ -195,6 +195,8 @@ pub struct EnrollmentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     pub method: EnrollmentMethod,
+    #[serde(default, rename = "enableRtsp")]
+    pub enable_rtsp: bool,
     pub confirmation: bool,
 }
 
@@ -266,12 +268,23 @@ struct Job {
     import_requested: bool,
     #[serde(default)]
     superseded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rtsp: Option<EnrollmentRtsp>,
     camera: String,
     host: String,
     port: u16,
     status: Status,
     staged: Option<Credential>,
 }
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum EnrollmentRtsp {
+    Enabled,
+    Unsupported,
+    Failed,
+    Unverified,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct Rotation {
     id: Uuid,
@@ -519,6 +532,7 @@ impl Vault {
                 request,
                 import_requested: false,
                 superseded: false,
+                rtsp: None,
                 status: Status::Waiting,
                 staged: None,
             },
@@ -671,6 +685,61 @@ impl Vault {
             job.status = Status::RecoveryRequired;
         }
         self.save(data)
+    }
+
+    pub(super) fn enrollment_rtsp(&self, id: Uuid) -> Option<EnrollmentRtsp> {
+        self.data.jobs.get(&id).and_then(|job| job.rtsp)
+    }
+
+    pub(super) async fn configure_rtsp(&mut self, id: Uuid) -> Result<Option<&'static str>> {
+        use super::rtsp::Problem;
+        let Some(job) = self.data.jobs.get(&id) else {
+            return Ok(None);
+        };
+        if job.superseded
+            || !job.request.enable_rtsp
+            || job.rtsp.is_some()
+            || job.status != Status::Verified
+        {
+            return Ok(None);
+        }
+        let credential = self
+            .data
+            .devices
+            .get(&job.camera)
+            .context("missing verified enrollment")?
+            .clone();
+        // Record the attempt first so a resumed enrollment cannot undo a later manual change.
+        let mut data = self.data.clone();
+        data.jobs.get_mut(&id).unwrap().rtsp = Some(EnrollmentRtsp::Unverified);
+        self.save(data)?;
+        let operation = async {
+            let mut session = credential
+                .device()
+                .connect()
+                .await
+                .map_err(|_| Problem::Read)?;
+            let result = if identified(&mut session, &credential.identifiers).await {
+                super::rtsp::apply(&mut session, true).await.map(|_| ())
+            } else {
+                Err(Problem::Read)
+            };
+            session.logout().await;
+            result
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(18), operation)
+            .await
+            .unwrap_or(Err(Problem::Unverified));
+        let outcome = match result {
+            Ok(()) => EnrollmentRtsp::Enabled,
+            Err(Problem::Unsupported) => EnrollmentRtsp::Unsupported,
+            Err(Problem::Unverified) => EnrollmentRtsp::Unverified,
+            Err(_) => EnrollmentRtsp::Failed,
+        };
+        let mut data = self.data.clone();
+        data.jobs.get_mut(&id).unwrap().rtsp = Some(outcome);
+        self.save(data)?;
+        Ok(result.err().map(Problem::key))
     }
 
     pub fn rotation_progress(&self, camera: &str, running: Option<&Device>) -> Status {

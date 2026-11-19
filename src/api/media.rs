@@ -1,4 +1,4 @@
-use std::{process::Stdio, sync::Arc, time::Duration};
+use std::{future::Future, process::Stdio, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::{
@@ -17,7 +17,7 @@ use retina::{
 use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdout, Command},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::OwnedSemaphorePermit,
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
@@ -25,13 +25,28 @@ use tokio::{
 use url::Url;
 
 use super::{Api, error};
-use crate::{http::CorrelationId, reolink::wire::Device};
+use crate::{
+    http::CorrelationId,
+    reolink::{live_video::LiveVideo, recording_settings::Stream, wire::Device},
+};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Profile {
+    #[serde(default)]
+    transport: VideoTransport,
     pub port: u16,
     pub streams: Vec<String>,
+}
+
+#[derive(Default, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum VideoTransport {
+    #[default]
+    Auto,
+    Rtsp,
+    Baichuan,
 }
 
 impl Profile {
@@ -50,8 +65,8 @@ impl Profile {
 struct Relay {
     output: ChildStdout,
     _ffmpeg: Child,
-    feed: JoinHandle<()>,
-    _slot: OwnedSemaphorePermit,
+    feed: JoinHandle<Result<()>>,
+    _slot: Arc<OwnedSemaphorePermit>,
     deadline: Instant,
     stop: tokio_util::sync::CancellationToken,
 }
@@ -69,6 +84,9 @@ impl Relay {
             result = timeout_at(deadline,self.output.read(&mut bytes)) => result??,
         };
         if count == 0 {
+            if self.feed.is_finished() {
+                (&mut self.feed).await??;
+            }
             return Ok(None);
         }
         bytes.truncate(count);
@@ -111,34 +129,90 @@ pub async fn get(
             &correlation,
         );
     };
-    let Ok(Ok(mut relay)) = timeout(
-        Duration::from_secs(12),
-        start(device, profile, &stream, slot, api.stop.clone()),
-    )
-    .await
-    else {
-        return error(
-            StatusCode::BAD_GATEWAY,
-            "API_MEDIA_START_FAILED",
-            &correlation,
-        );
-    };
-    let Ok(Some(first)) = relay.sample().await else {
-        return error(
-            StatusCode::BAD_GATEWAY,
-            "API_MEDIA_START_FAILED",
-            &correlation,
-        );
-    };
-    let body = stream::once(async { Ok::<_, std::io::Error>(first) }).chain(stream::unfold(
-        relay,
-        |mut relay| async {
-            relay
+    let slot = Arc::new(slot);
+    let open = |transport| {
+        let slot = slot.clone();
+        let stop = api.stop.clone();
+        let quality = stream.as_str();
+        async move {
+            let mut relay = match transport {
+                VideoTransport::Rtsp => rtsp_relay(device, profile, quality, slot, stop).await?,
+                VideoTransport::Baichuan => native_relay(device, quality, slot, stop).await?,
+                VideoTransport::Auto => unreachable!(),
+            };
+            let first = relay
                 .sample()
+                .await?
+                .context("decoder exited before its first frame")?;
+            Ok::<_, anyhow::Error>((relay, first))
+        }
+    };
+    let result = match profile.transport {
+        VideoTransport::Auto => {
+            match timeout(Duration::from_secs(8), open(VideoTransport::Rtsp))
                 .await
-                .ok()
-                .flatten()
-                .map(|bytes| (Ok::<_, std::io::Error>(bytes), relay))
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r)
+            {
+                Ok(value) => Ok(value),
+                Err(rtsp_failure) => {
+                    timeout(Duration::from_secs(14), open(VideoTransport::Baichuan))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|r| r)
+                        .with_context(|| {
+                            format!("RTSP failed ({rtsp_failure}); Baichuan fallback failed")
+                        })
+                }
+            }
+        }
+        transport => timeout(Duration::from_secs(20), open(transport))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r),
+    };
+    let (relay, first) = match result {
+        Ok(value) => value,
+        Err(failure) => {
+            if let Some(hub) = &api.hub {
+                hub.diagnostics.error(
+                    "api::media::start",
+                    "API_MEDIA_START_FAILED",
+                    Some(correlation.0.clone()),
+                    serde_json::json!({"cameraId":id,"stream":stream}),
+                    Some(failure),
+                );
+            }
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "API_MEDIA_START_FAILED",
+                &correlation,
+            );
+        }
+    };
+    let hub = api.hub.clone();
+    let context = serde_json::json!({"cameraId":id,"stream":stream});
+    let body = stream::once(async { Ok::<_, std::io::Error>(first) }).chain(stream::unfold(
+        (relay, hub, context, correlation.0),
+        |(mut relay, hub, context, cid)| async move {
+            let failure = match relay.sample().await {
+                Ok(Some(bytes)) => {
+                    return Some((Ok::<_, std::io::Error>(bytes), (relay, hub, context, cid)));
+                }
+                _ if relay.stop.is_cancelled() || Instant::now() >= relay.deadline => return None,
+                Ok(None) => anyhow!("the upstream video decoder ended"),
+                Err(cause) => cause,
+            };
+            if let Some(hub) = hub {
+                hub.diagnostics.error(
+                    "api::media::stream",
+                    "API_MEDIA_STREAM_ENDED",
+                    Some(cid),
+                    context,
+                    Some(failure),
+                );
+            }
+            None
         },
     ));
     (
@@ -156,11 +230,11 @@ pub async fn get(
         .into_response()
 }
 
-async fn start(
+async fn rtsp_relay(
     device: &Device,
     profile: &Profile,
     stream: &str,
-    slot: OwnedSemaphorePermit,
+    slot: Arc<OwnedSemaphorePermit>,
     stop: tokio_util::sync::CancellationToken,
 ) -> Result<Relay> {
     // Credentials are held by the private RTSP client, never in FFmpeg arguments or environment.
@@ -180,8 +254,21 @@ async fn start(
     let index = session
         .streams()
         .iter()
-        .position(|stream| stream.encoding_name().eq_ignore_ascii_case("h264"))
+        .position(|stream| {
+            matches!(
+                stream.encoding_name().to_ascii_lowercase().as_str(),
+                "h264" | "h265" | "hevc"
+            )
+        })
         .context("no supported video track")?;
+    let format = if session.streams()[index]
+        .encoding_name()
+        .eq_ignore_ascii_case("h264")
+    {
+        "h264"
+    } else {
+        "hevc"
+    };
     session
         .setup(
             index,
@@ -197,6 +284,74 @@ async fn start(
         .map_err(|_| anyhow!("RTSP play failed"))?
         .demuxed()
         .map_err(|_| anyhow!("RTSP demux failed"))?;
+    transcode(format, slot, stop, move |mut input| async move {
+        let mut need_keyframe = true;
+        while let Some(item) = timeout(Duration::from_secs(8), session.next()).await? {
+            let CodecItem::VideoFrame(frame) = item.map_err(|_| anyhow!("invalid video frame"))?
+            else {
+                continue;
+            };
+            ensure!(
+                frame.data().len() <= 8 * 1024 * 1024,
+                "oversize video frame"
+            );
+            if frame.loss() != 0 {
+                need_keyframe = true;
+            }
+            if frame.is_random_access_point() {
+                let Some(ParametersRef::Video(video)) = session.streams()[index].parameters()
+                else {
+                    continue;
+                };
+                let (width, height) = video.pixel_dimensions();
+                ensure!(
+                    width <= 4096 && height <= 2160 && video.extra_data().len() <= 65_536,
+                    "video profile exceeds relay limits"
+                );
+                need_keyframe = false;
+            }
+            if !need_keyframe {
+                timeout(Duration::from_secs(6), input.write_all(frame.data())).await??;
+            }
+        }
+        Ok(())
+    })
+}
+
+async fn native_relay(
+    device: &Device,
+    quality: &str,
+    slot: Arc<OwnedSemaphorePermit>,
+    stop: CancellationToken,
+) -> Result<Relay> {
+    let quality = match quality {
+        "main" => Stream::Main,
+        "sub" => Stream::Sub,
+        _ => anyhow::bail!("unknown stream quality"),
+    };
+    let mut video = LiveVideo::open(device, quality)
+        .await
+        .context("open Baichuan preview")?;
+    let (format, first) = video.next_frame().await.context("read Baichuan keyframe")?;
+    transcode(format, slot, stop, move |mut input| async move {
+        input.write_all(&first).await?;
+        loop {
+            let (codec, data) = timeout(Duration::from_secs(8), video.next_frame()).await??;
+            ensure!(codec == format, "Baichuan codec changed");
+            timeout(Duration::from_secs(6), input.write_all(&data)).await??;
+        }
+    })
+}
+
+fn transcode<F>(
+    format: &str,
+    slot: Arc<OwnedSemaphorePermit>,
+    stop: CancellationToken,
+    feed: impl FnOnce(ChildStdin) -> F,
+) -> Result<Relay>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
     let mut ffmpeg = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -212,7 +367,7 @@ async fn start(
             "-analyzeduration",
             "1000000",
             "-f",
-            "h264",
+            format,
             "-i",
             "pipe:0",
             "-an",
@@ -237,44 +392,9 @@ async fn start(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
-    let mut input = ffmpeg.stdin.take().context("FFmpeg input unavailable")?;
+    let input = ffmpeg.stdin.take().context("FFmpeg input unavailable")?;
     let output = ffmpeg.stdout.take().context("FFmpeg output unavailable")?;
-    let feed = tokio::spawn(async move {
-        let _ = async {
-            let mut need_keyframe = true;
-            while let Some(item) = timeout(Duration::from_secs(8), session.next()).await? {
-                let CodecItem::VideoFrame(frame) =
-                    item.map_err(|_| anyhow!("invalid video frame"))?
-                else {
-                    continue;
-                };
-                ensure!(
-                    frame.data().len() <= 8 * 1024 * 1024,
-                    "oversize video frame"
-                );
-                if frame.loss() != 0 {
-                    need_keyframe = true;
-                }
-                if frame.is_random_access_point() {
-                    let Some(ParametersRef::Video(video)) = session.streams()[index].parameters()
-                    else {
-                        continue;
-                    };
-                    let (width, height) = video.pixel_dimensions();
-                    ensure!(
-                        width <= 4096 && height <= 2160 && video.extra_data().len() <= 65_536,
-                        "video profile exceeds relay limits"
-                    );
-                    need_keyframe = false;
-                }
-                if !need_keyframe {
-                    timeout(Duration::from_secs(6), input.write_all(frame.data())).await??;
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-    });
+    let feed = tokio::spawn(feed(input));
     Ok(Relay {
         output,
         _ffmpeg: ffmpeg,

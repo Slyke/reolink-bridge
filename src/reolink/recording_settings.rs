@@ -100,7 +100,7 @@ pub enum Stream {
     Sub,
 }
 impl Stream {
-    fn tag(self) -> &'static str {
+    pub(super) fn tag(self) -> &'static str {
         match self {
             Self::Main => "mainStream",
             Self::Sub => "subStream",

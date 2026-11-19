@@ -777,7 +777,7 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     );
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 0);
     let enrollment = Uuid::new_v4();
-    let request = json!({"id":enrollment,"target":"factory","method":"initialize","uid":UID,"confirmation":true});
+    let request = json!({"id":enrollment,"target":"factory","method":"initialize","uid":UID,"confirmation":true,"enableRtsp":true});
     let enrolled = response(
         &client,
         &url("/enrollments"),
@@ -787,6 +787,8 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     .await;
     assert_eq!(enrolled.1["status"], "restart-required", "{:?}", enrolled);
     assert_eq!(enrolled.1["camera_id"], "new");
+    assert_eq!(enrolled.1["rtsp"], "enabled");
+    assert_eq!(camera.rtsp_writes.load(Ordering::SeqCst), 1);
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 1);
     let current_password = camera.password.lock().unwrap().clone().unwrap();
     assert!(!enrolled.1.to_string().contains(&current_password));
@@ -1023,6 +1025,37 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
         .lock()
         .unwrap()
         .insert("guest".into(), (false, "fixture-guest-before".into()));
+    let rtsp = url("/cameras/garage/network/rtsp");
+    let before = response(&client, &rtsp, PRIMARY, None).await;
+    assert_eq!(
+        before.1,
+        json!({"supported":true,"enabled":true,"port":8554})
+    );
+    for enabled in [true, false, false] {
+        let res = client
+            .put(&rtsp)
+            .bearer_auth(PRIMARY)
+            .header("content-type", "application/json")
+            .body(json!({"enabled":enabled}).to_string())
+            .send()
+            .await?;
+        assert_eq!(res.status(), 200);
+        let verified: Value = serde_json::from_str(&res.text().await?)?;
+        assert_eq!(verified["enabled"], enabled);
+    }
+    assert_eq!(camera.rtsp_writes.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        response(
+            &client,
+            &url(&format!("/enrollments/{enrollment}")),
+            PRIMARY,
+            None
+        )
+        .await
+        .1["rtsp"],
+        "enabled"
+    );
+    assert!(!camera.rtsp_enabled.load(Ordering::SeqCst));
     let network = url("/cameras/garage/network");
     let before = response(&client, &network, PRIMARY, None).await;
     assert_eq!(before.0, 200);
@@ -1320,7 +1353,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"},
         "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
         "cameras":[{"id":"fixture","host":"127.0.0.1","baichuanPort":bc,"onvifPort":null,"username":"admin","password":baichuan::PASSWORD,"eventTransport":"baichuan"}],
-        "api":{"previews":{"cache":thumbnail_cache},"recordings":{"temporaryDirectory":workspace,"cache":{"maxBytes":1_048_576,"ttlSeconds":2}}},
+        "api":{"media":{"fixture":{"port":free_port()?,"streams":["main","sub"]}},"previews":{"cache":thumbnail_cache},"recordings":{"temporaryDirectory":workspace,"cache":{"maxBytes":1_048_576,"ttlSeconds":2}}},
         "logging":{"sinks":{"console":{"enabled":false},"file":{"enabled":true,"format":"json","path":log_file}}}
     }).to_string())?;
     let client = Client::builder()
@@ -1329,6 +1362,23 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         .build()?;
     let mut bridge = start(&config, &client, &origin).await?;
     discovered(&client, &format!("{origin}/api/inventory")).await;
+    for quality in ["main", "sub"] {
+        let mut live = client
+            .get(format!("{origin}/api/cameras/fixture/media/{quality}"))
+            .bearer_auth(PRIMARY)
+            .send()
+            .await?;
+        assert_eq!(live.status(), 200, "Baichuan fallback for {quality}");
+        let mut first = Vec::new();
+        while !first.windows(2).any(|marker| marker == [0xff, 0xd9]) {
+            first.extend(live.chunk().await?.context("early end of live preview")?);
+            ensure!(first.len() < 500_000);
+        }
+        assert!(
+            first.starts_with(b"--reolink-frame") && first.windows(3).any(|p| p == b"\xff\xd8\xff")
+        );
+    }
+    assert_eq!(&*camera.live_qualities.lock().unwrap(), &[0, 1]);
     let gallery = format!("{origin}/api/cameras/fixture/time-lapse/photos");
     let listing = format!("{gallery}?date=2026-11-17&from=11:00:00&to=11:59:59");
     assert_eq!(response(&client, &listing, "wrong", None).await.0, 401);

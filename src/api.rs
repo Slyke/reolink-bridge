@@ -4,6 +4,7 @@ mod network;
 mod photos;
 mod preview;
 mod recordings;
+mod rtsp;
 mod users;
 
 use std::{
@@ -403,6 +404,10 @@ pub fn router(api: Arc<Api>) -> Router {
             "/api/cameras/{id}/network",
             get(network::get).put(network::set),
         )
+        .route(
+            "/api/cameras/{id}/network/rtsp",
+            get(rtsp::get).put(rtsp::set),
+        )
         .route("/api/cameras/{id}/users/password", post(users::change))
         .route("/api/cameras/{id}/time-lapse/photos", get(photos::list))
         .route(
@@ -480,7 +485,7 @@ async fn contract(
         Vec::new()
     };
     Json(json!({"version":1,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
-       "networkCameras":api.devices.keys().collect::<Vec<_>>(),
+       "rtspSettings":true,"networkCameras":api.devices.keys().collect::<Vec<_>>(),
        "userCameras":api.devices.keys().collect::<Vec<_>>(),
        "storageCameras":api.devices.keys().collect::<Vec<_>>(),
        "timeLapsePhotoCameras":api.devices.keys().collect::<Vec<_>>(),
@@ -714,7 +719,7 @@ async fn targets(
     if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    Json(json!({"addressLookup":api.vault.is_some(),"targets":api.config.targets.keys().collect::<Vec<_>>(),"correlation_id":correlation.0})).into_response()
+    Json(json!({"addressLookup":api.vault.is_some(),"enableRtsp":api.vault.is_some(),"targets":api.config.targets.keys().collect::<Vec<_>>(),"correlation_id":correlation.0})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -841,7 +846,9 @@ async fn enrollment_status(
         return progress(Status::InProgress, None, &correlation);
     };
     match api.enrollment_progress(&vault, id) {
-        Some((state, camera)) => progress(state, camera, &correlation),
+        Some((state, camera)) => {
+            enrollment_response(state, camera, vault.enrollment_rtsp(id), &correlation)
+        }
         None => error(
             StatusCode::NOT_FOUND,
             "API_ENROLLMENT_UNKNOWN",
@@ -912,6 +919,25 @@ async fn finish_enrollment(
             correlation,
         );
     }
+    match vault.configure_rtsp(id).await {
+        Ok(Some(key)) => {
+            api.hub().diagnostics.error(
+                "api::enrollment",
+                key,
+                Some(correlation.0.clone()),
+                json!({"enrollmentId":id}),
+                None,
+            );
+        }
+        Ok(None) => (),
+        Err(_) => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "API_ENROLLMENT_INTERRUPTED",
+                correlation,
+            );
+        }
+    }
     let (status, camera) = api.enrollment_progress(vault, id).unwrap();
     if status == Status::Active
         && let Some(name) = camera.as_deref()
@@ -929,7 +955,17 @@ async fn finish_enrollment(
         }
         gate.cancel();
     }
-    progress(status, camera, correlation)
+    enrollment_response(status, camera, vault.enrollment_rtsp(id), correlation)
+}
+
+fn enrollment_response(
+    status: Status,
+    camera: Option<String>,
+    rtsp: Option<credentials::EnrollmentRtsp>,
+    cid: &CorrelationId,
+) -> Response {
+    Json(json!({"ok":true,"status":status,"camera_id":camera,"rtsp":rtsp,"correlation_id":cid.0}))
+        .into_response()
 }
 
 #[derive(Deserialize)]

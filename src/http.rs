@@ -380,6 +380,7 @@ async fn execute_camera(
         _ if reply["ok"] == true => StatusCode::OK,
         Some(
             "CONTROL_ID_CONFLICT"
+            | "PTZ_PRESET_OCCUPIED"
             | "PTZ_REQUEST_EXPIRED"
             | "PTZ_QUEUED_MOVE_CANCELLED"
             | "PTZ_MOVE_CANCELLED"

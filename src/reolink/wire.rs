@@ -55,6 +55,7 @@ pub struct Session {
     sequence: u32,
     key: Option<[u8; 16]>,
     stream_sequence: Option<u32>,
+    preview_type: u8,
     pub pushes: VecDeque<Packet>,
 }
 
@@ -87,6 +88,7 @@ impl Device {
             sequence: 0,
             key: None,
             stream_sequence: None,
+            preview_type: 0,
             pushes: VecDeque::new(),
         };
         let challenge = session.exchange(1, 250, "", "", true).await?;
@@ -151,17 +153,24 @@ impl Session {
         Ok(())
     }
 
-    pub async fn preview(&mut self, channel: u8, start: bool) -> Result<Packet> {
+    pub async fn preview(
+        &mut self,
+        channel: u8,
+        quality: super::recording_settings::Stream,
+        start: bool,
+    ) -> Result<Packet> {
         let command = if start { 3 } else { 4 };
         let extension =
             format!(r#"<Extension version="1.1"><channelId>{channel}</channelId></Extension>"#);
+        self.preview_type = u8::from(matches!(quality, super::recording_settings::Stream::Sub));
+        let handle = u16::from(self.preview_type) << 8;
         let stream = if start {
-            "<streamType>subStream</streamType>"
+            format!("<streamType>{}</streamType>", quality.tag())
         } else {
-            ""
+            String::new()
         };
         let body = format!(
-            r#"<body><Preview version="1.0"><channelId>{channel}</channelId><handle>256</handle>{stream}</Preview></body>"#
+            r#"<body><Preview version="1.0"><channelId>{channel}</channelId><handle>{handle}</handle>{stream}</Preview></body>"#
         );
         self.exchange(command, channel, &extension, &body, false)
             .await
@@ -263,7 +272,9 @@ impl Session {
             self.sequence = (self.sequence + 1) & 0x00ff_ffff;
             let sequence = match command {
                 3 => {
-                    let sequence = (self.sequence & 0xffff) << 16 | 1 << 8 | u32::from(channel);
+                    let sequence = (self.sequence & 0xffff) << 16
+                        | u32::from(self.preview_type) << 8
+                        | u32::from(channel);
                     self.stream_sequence = Some(sequence);
                     sequence
                 }

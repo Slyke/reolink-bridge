@@ -36,6 +36,8 @@ pub struct Camera {
     pub ptz: AtomicBool,
     pub zoom: AtomicI32,
     pub motions: Mutex<Vec<(String, Option<u32>)>>,
+    pub saved_presets: Mutex<BTreeMap<u32, String>>,
+    pub live_qualities: Mutex<Vec<u8>>,
     pub fail_next_stop: AtomicBool,
     pub jpeg: Option<Vec<u8>>,
     pub snapshot_requests: Mutex<Vec<tokio::time::Instant>>,
@@ -45,6 +47,8 @@ pub struct Camera {
     pub password: Mutex<Option<String>>,
     pub users: Mutex<BTreeMap<String, (bool, String)>>,
     pub schedule_xml: Mutex<Option<String>>,
+    pub rtsp_enabled: AtomicBool,
+    pub rtsp_writes: AtomicUsize,
     pub wifi_xml: Mutex<Option<String>>,
     pub time_lapse_xml: Mutex<Option<String>>,
     pub credential_writes: AtomicUsize,
@@ -203,6 +207,19 @@ impl Camera {
                 socket.write_u32_le(0).await?;
             }
             socket.write_all(&reply).await?;
+            if command == 3 && status == 200 {
+                let code = header[13];
+                self.live_qualities.lock().unwrap().push(code);
+                for _ in 0..6 {
+                    for chunk in self.recording.as_deref().unwrap().chunks(1100) {
+                        header[8..12].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+                        socket.write_all(&header).await?;
+                        socket.write_u32_le(0).await?;
+                        socket.write_all(chunk).await?;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
             if matches!(command, 143 | 298) && status == 200 {
                 if command == 143 {
                     self.recording_downloads.fetch_add(1, Ordering::SeqCst);
@@ -262,13 +279,31 @@ impl Camera {
         }
         let response = match command {
             76 => "<body><Ip><ip>192.0.2.7</ip><mask>255.255.255.0</mask><gateway>192.0.2.1</gateway></Ip><Dhcp><enable>1</enable></Dhcp></body>".into(),
+            37 => format!("<body><HttpPort><enable>0</enable></HttpPort><RtspPort><rtspPort>8554</rtspPort><enable>{}</enable></RtspPort></body>", u8::from(self.rtsp_enabled.load(Ordering::SeqCst))),
+            36 => {
+                let doc = roxmltree::Document::parse(body.trim_end_matches('\0'))?;
+                let root = doc.root_element();
+                ensure!(root.children().filter(|node|node.is_element()).count() == 1, "unexpected network changes");
+                let service = root.first_element_child().unwrap();
+                ensure!(service.has_tag_name("RtspPort") && service.children().filter(|node|node.is_element()).count() == 1, "unexpected RTSP changes");
+                let flag = service.first_element_child().unwrap();
+                ensure!(flag.has_tag_name("enable"), "unexpected RTSP field");
+                self.rtsp_enabled.store(flag.text() == Some("1"), Ordering::SeqCst);
+                self.rtsp_writes.fetch_add(1, Ordering::SeqCst);
+                String::new()
+            }
             116 => self.wifi_xml.lock().unwrap().clone().unwrap_or_else(|| "<body><Wifi><ssid>Fixture network</ssid><key>fixture-old-wifi</key><udidList><udid><name>Other network</name></udid></udidList></Wifi></body>".into()),
             117 => {
                 let doc = roxmltree::Document::parse(body)?;
                 *self.wifi_xml.lock().unwrap() = Some(body[doc.root_element().range()].to_owned());
                 String::new()
             }
-            2 | 16 | 31 | 93 | 144 => String::new(),
+            3 if self.recording.is_some() => {
+                let doc = roxmltree::Document::parse(body)?;
+                ensure!(matches!((field(&doc,"streamType"),field(&doc,"handle")), (Some("mainStream"),Some("0")) | (Some("subStream"),Some("256"))));
+                String::new()
+            }
+            2 | 4 | 16 | 31 | 93 | 144 => String::new(),
             102=>"<body><HddInfoList><HddInfo><number>0</number><storageType>2</storageType><mount>1</mount><format>1</format><capacity>63</capacity><capacityM>500</capacityM><remainSize>23</remainSize><remainSizeM>800</remainSizeM></HddInfo></HddInfoList></body>".into(),
             104=>"<body><SystemGeneral><year>2026</year><month>11</month><day>17</day><hour>12</hour><minute>30</minute><second>00</second></SystemGeneral></body>".into(),
             14=> {
@@ -348,12 +383,20 @@ impl Camera {
             19 => {
                 let doc = roxmltree::Document::parse(body)?;
                 ensure!(field(&doc, "channelId") == Some("0"));
-                ensure!(field(&doc, "command") == Some("toPos"));
                 let id = field(&doc, "id").unwrap().parse()?;
-                self.motions.lock().unwrap().push(("toPos".into(), Some(id)));
+                match field(&doc,"command") {
+                    Some("setPos") => { self.saved_presets.lock().unwrap().insert(id,field(&doc,"name").unwrap().to_owned()); }
+                    Some("toPos") => self.motions.lock().unwrap().push(("toPos".into(),Some(id))),
+                    _ => anyhow::bail!("unexpected fixture preset command"),
+                }
                 String::new()
             }
-            190 => "<body><PtzPreset version=\"1.1\"><channelId>0</channelId><presetList><preset><id>1</id><name>Fixture entrance</name></preset><preset><id>2</id><name>Unused</name><enable>0</enable></preset></presetList></PtzPreset></body>".into(),
+            190 => {
+                let mut presets = self.saved_presets.lock().unwrap().clone();
+                presets.entry(1).or_insert_with(||"Fixture entrance".into());
+                let list: String = presets.into_iter().map(|(id,name)|format!("<preset><id>{id}</id><name>{}</name></preset>",name.replace('&',"&amp;").replace('<',"&lt;"))).collect();
+                format!("<body><PtzPreset><channelId>0</channelId><presetList>{list}<preset><id>2</id><name>Unused</name><enable>0</enable></preset></presetList></PtzPreset></body>")
+            }
             294 => {
                 let zoom = self.zoom.load(Ordering::SeqCst);
                 format!("<body><ZoomFocus><channelId>0</channelId><zoom><minPos>0</minPos><maxPos>27</maxPos><curPos>{zoom}</curPos></zoom></ZoomFocus></body>")

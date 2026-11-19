@@ -58,6 +58,7 @@ The following examples are the value of the `action` object inside `{"setting":"
 | Interrupt | `{"op":"stop"}` | Interrupts the current movement and cancels earlier queued moves |
 | Read position | `{"op":"status"}` | Returns the positions the camera reports |
 | List presets | `{"op":"list_presets"}` | Returns IDs and names of usable saved presets |
+| Save preset | `{"op":"save_preset","preset_id":1,"name":"Door"}` | Save the current position to a numbered slot on a camera advertising `save_presets`. Use `"replace":true` to replace an occupied slot. The bridge reads the saved list back. |
 | Recall preset | `{"op":"goto_preset","preset_id":1}` | Use an ID returned by `list_presets` |
 | Absolute zoom | `{"op":"set_zoom","position":12}` | Use an integer inside the camera's current `zoom_range` |
 
@@ -77,6 +78,7 @@ Example `capabilities` snapshot for a channel with all PTZ features. Other disco
     "diagonal": true,
     "directional_zoom": true,
     "presets": true,
+    "save_presets": true,
     "speed_range": {"min": 1, "max": 64},
     "zoom_range": {"min": 0, "max": 27},
     "duration_ms": {"min": 50, "max": 3000}

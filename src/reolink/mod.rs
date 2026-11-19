@@ -1,6 +1,7 @@
 pub mod cgi;
 pub mod control;
 pub mod events;
+pub mod live_video;
 pub mod metadata;
 pub mod orientation;
 pub mod ptz;

@@ -21,7 +21,9 @@ pub async fn run(device: &Device, id: &str, hub: &Hub, stop: &CancellationToken)
         _ = stop.cancelled() => return Ok(()),
         result = device.connect() => result?,
     };
-    let first = session.preview(device.channel, true).await?;
+    let first = session
+        .preview(device.channel, super::recording_settings::Stream::Sub, true)
+        .await?;
     let mut buffer = BytesMut::new();
     let mut video_dimensions = None;
     let mut ai_dimensions = None;
@@ -86,7 +88,11 @@ pub async fn run(device: &Device, id: &str, hub: &Hub, stop: &CancellationToken)
     }.await;
     let _ = timeout(
         Duration::from_secs(2),
-        session.preview(device.channel, false),
+        session.preview(
+            device.channel,
+            super::recording_settings::Stream::Sub,
+            false,
+        ),
     )
     .await;
     session.logout().await;

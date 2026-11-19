@@ -29,6 +29,12 @@ pub enum Action {
     GotoPreset {
         preset_id: u32,
     },
+    SavePreset {
+        preset_id: u8,
+        name: String,
+        #[serde(default)]
+        replace: bool,
+    },
     SetZoom {
         position: i32,
     },
@@ -47,6 +53,12 @@ impl Action {
             anyhow::ensure!(
                 speed.is_none_or(|value| (1..=MAX_SPEED).contains(&value)),
                 "PTZ speed must be 1–{MAX_SPEED}"
+            );
+        }
+        if let Self::SavePreset { name, .. } = self {
+            anyhow::ensure!(
+                !name.trim().is_empty() && name.len() <= 32 && !name.chars().any(char::is_control),
+                "invalid PTZ preset name"
             );
         }
         Ok(())
@@ -147,6 +159,7 @@ impl Capabilities {
         let mut value = json!(self);
         value["source"] = json!("baichuan");
         value["supported"] = json!(self.has_motors());
+        value["save_presets"] = json!(self.presets);
         if self.pan || self.tilt || self.directional_zoom {
             value["duration_ms"] = json!({"min":MIN_MOVE_MS,"max":MAX_MOVE_MS});
         }
@@ -170,7 +183,9 @@ impl Capabilities {
             Action::Move { direction, .. } => direction.supported(self),
             Action::Stop => false,
             Action::Status => self.pan || self.tilt || self.zoom_range.is_some(),
-            Action::ListPresets | Action::GotoPreset { .. } => self.presets,
+            Action::ListPresets | Action::GotoPreset { .. } | Action::SavePreset { .. } => {
+                self.presets
+            }
             Action::SetZoom { .. } => self.zoom_range.is_some(),
         };
         if !supported {
@@ -416,6 +431,42 @@ async fn execute(
                 .map_err(|error| ("PTZ_PRESETS_FAILED", error))?;
             Ok(result(json!({"presets":presets}), true))
         }
+        Action::SavePreset {
+            preset_id,
+            name,
+            replace,
+        } => {
+            if !replace
+                && read_presets(session, channel)
+                    .await
+                    .map_err(|e| ("PTZ_PRESET_LOOKUP_FAILED", e))?
+                    .iter()
+                    .any(|p| p.id == u32::from(*preset_id))
+            {
+                return Err((
+                    "PTZ_PRESET_OCCUPIED",
+                    anyhow!("preset number is already in use"),
+                ));
+            }
+            let xml = format!(
+                r#"<body><PtzPreset version="1.1"><channelId>{channel}</channelId><presetList><preset><id>{preset_id}</id><name>{}</name><command>setPos</command></preset></presetList></PtzPreset></body>"#,
+                xml::escape(name)
+            );
+            session
+                .command(19, Some(channel), &xml)
+                .await
+                .map_err(|error| ("PTZ_PRESET_SAVE_FAILED", error))?;
+            let presets = read_presets(session, channel)
+                .await
+                .map_err(|error| ("PTZ_PRESETS_FAILED", error))?;
+            let listed = presets
+                .iter()
+                .any(|preset| preset.id == u32::from(*preset_id) && preset.name == *name);
+            Ok(result(
+                json!({"action":"save_preset","preset_id":preset_id,"presets":presets}),
+                listed,
+            ))
+        }
         Action::GotoPreset { preset_id } => {
             let presets = read_presets(session, channel)
                 .await
@@ -577,7 +628,10 @@ async fn timed_move(
             .await
             .map_err(|error| ("PTZ_TIMED_STOP_FAILED", error))?;
     }
-    start?;
+    // An interrupted acknowledgement is an expected release once Stop was acknowledged.
+    if !matches!(start, Err(("PTZ_START_INTERRUPTED", _))) {
+        start?;
+    }
     Ok(Outcome {
         result: json!({
             "action":"move","direction":movement,"duration_ms":duration_ms,
