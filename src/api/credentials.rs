@@ -159,9 +159,53 @@ struct Data {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct UserChange {
+    #[serde(default)]
+    action: UserAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<String>,
     camera: String,
     username: String,
     status: Status,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum UserAction {
+    #[default]
+    Password,
+    AddUser,
+    AddAdministrator,
+    Remove,
+}
+
+impl UserAction {
+    fn new_level(self) -> Option<&'static str> {
+        match self {
+            Self::AddUser => Some("0"),
+            Self::AddAdministrator => Some("1"),
+            _ => None,
+        }
+    }
+}
+
+pub(super) struct AccountEdit<'a> {
+    pub id: Uuid,
+    pub username: &'a str,
+    pub action: UserAction,
+    pub password: Option<&'a str>,
+    pub fingerprint: String,
+}
+
+impl UserChange {
+    fn matches(&self, camera: &str, edit: &AccountEdit<'_>) -> bool {
+        self.camera == camera
+            && self.username == edit.username
+            && self.action == edit.action
+            && self
+                .fingerprint
+                .as_ref()
+                .is_none_or(|old| old == &edit.fingerprint)
+    }
 }
 
 pub struct Vault {
@@ -211,6 +255,10 @@ impl Vault {
         let mut temp = NamedTempFile::new_in(directory)?;
         serde_json::to_writer(&mut temp, &data)?;
         temp.flush()?;
+        ensure!(
+            temp.as_file().metadata()?.len() <= 1_000_000,
+            "credential journal is full"
+        );
         temp.as_file().sync_all()?;
         temp.persist(&self.file)
             .map_err(|_| anyhow::anyhow!("could not save API vault"))?;
@@ -422,11 +470,12 @@ impl Vault {
         }
         let mut replacement = old.clone();
         replacement.password = generated_password();
-        let Ok(payload) = change_payload(
+        let Ok(payload) = account_payload(
             &mut session,
             &old.username,
             &old.username,
-            &replacement.password,
+            UserAction::Password,
+            Some(&replacement.password),
             true,
         )
         .await
@@ -485,7 +534,9 @@ impl Vault {
             );
         }
         ensure!(
-            !self.data.spent_rotations.contains(&id) && self.data.spent_rotations.len() < 4096,
+            !self.data.spent_rotations.contains(&id)
+                && !self.data.user_changes.contains_key(&id)
+                && self.data.spent_rotations.len() < 4096,
             "retired or over-limit rotation ID"
         );
         let mut data = self.data.clone();
@@ -497,11 +548,12 @@ impl Vault {
         );
         let mut next = old.clone();
         next.password = password.unwrap_or_else(generated_password);
-        let payload = change_payload(
+        let payload = account_payload(
             &mut session,
             &old.username,
             &old.username,
-            &next.password,
+            UserAction::Password,
+            Some(&next.password),
             false,
         )
         .await?;
@@ -520,60 +572,64 @@ impl Vault {
         self.reconcile(camera).await
     }
 
-    pub async fn change_other_user(
+    pub(super) async fn edit_account(
         &mut self,
         camera: &str,
-        id: Uuid,
         operator: &Credential,
-        username: &str,
-        password: String,
+        edit: &AccountEdit<'_>,
     ) -> Result<Status> {
+        let (id, username, action, password) = (edit.id, edit.username, edit.action, edit.password);
         ensure!(
-            username != operator.username,
+            !username.eq_ignore_ascii_case(&operator.username),
             "bridge login requires credential rotation"
         );
-        let verify = Device {
-            username: username.into(),
-            password: password.clone(),
-            ..operator.device()
-        };
+        ensure!(
+            !self.data.spent_rotations.contains(&id),
+            "operation ID conflict"
+        );
         if let Some(previous) = self.data.user_changes.get(&id) {
-            ensure!(
-                previous.camera == camera && previous.username == username,
-                "operation ID conflict"
-            );
+            ensure!(previous.matches(camera, edit), "operation ID conflict");
             if previous.status == Status::Verified {
                 return Ok(previous.status);
             }
-            // An interrupted write may have reached the camera. Only re-check the supplied login.
+            // A disconnected write may have succeeded. Replays only perform readback.
         } else {
             ensure!(
                 self.data.user_changes.len() < 4096,
-                "device password operation limit reached"
+                "device account operation limit reached"
             );
             let mut session = operator.device().connect().await?;
             ensure!(
                 identified(&mut session, &operator.identifiers).await,
                 "camera identity mismatch"
             );
-            let payload =
-                change_payload(&mut session, &operator.username, username, &password, false)
-                    .await?;
+            let payload = account_payload(
+                &mut session,
+                &operator.username,
+                username,
+                action,
+                password,
+                false,
+            )
+            .await?;
             let mut data = self.data.clone();
             data.user_changes.insert(
                 id,
                 UserChange {
                     camera: camera.into(),
                     username: username.into(),
+                    fingerprint: Some(edit.fingerprint.clone()),
+                    action,
                     status: Status::RecoveryRequired,
                 },
             );
             self.save(data)?;
             let _ = session.command(59, Some(0), &payload).await;
-            drop(session);
         }
-        let status = if let Ok(mut session) = verify.connect().await {
-            session.logout().await;
+        let verified = verify_account(operator, username, action, password)
+            .await
+            .unwrap_or(false);
+        let status = if verified {
             Status::Verified
         } else {
             Status::RecoveryRequired
@@ -605,16 +661,16 @@ impl Vault {
         self.save(data)
     }
 
-    pub fn user_write_pending(&self, camera: &str, id: Uuid) -> bool {
+    pub(super) fn user_write_pending(&self, camera: &str, edit: &AccountEdit<'_>) -> bool {
         self.data
             .rotations
             .get(camera)
-            .is_some_and(|op| op.id == id && op.staged.is_some())
+            .is_some_and(|op| op.id == edit.id && op.staged.is_some())
             || self
                 .data
                 .user_changes
-                .get(&id)
-                .is_some_and(|op| op.camera == camera && op.status == Status::RecoveryRequired)
+                .get(&edit.id)
+                .is_some_and(|op| op.matches(camera, edit) && op.status == Status::RecoveryRequired)
     }
 
     pub fn registered(&self) -> impl Iterator<Item = &String> {
@@ -737,58 +793,118 @@ pub async fn list_users(device: &Device) -> Result<(Vec<CameraUser>, bool)> {
     Ok((users, writable))
 }
 
-async fn change_payload(
+async fn verify_account(
+    operator: &Credential,
+    username: &str,
+    action: UserAction,
+    password: Option<&str>,
+) -> Result<bool> {
+    if action != UserAction::Password {
+        let mut session = operator.device().connect().await?;
+        ensure!(
+            identified(&mut session, &operator.identifiers).await,
+            "camera identity mismatch"
+        );
+        let raw = session.user_list(&operator.username).await?;
+        session.logout().await;
+        let doc = xml::document(&raw)?;
+        let users = user_nodes(&doc)?;
+        let user = users
+            .into_iter()
+            .find(|u| field(*u, "userName") == Some(username));
+        if action == UserAction::Remove {
+            return Ok(user.is_none());
+        }
+        if user.and_then(|u| field(u, "userLevel")) != action.new_level() {
+            return Ok(false);
+        }
+    }
+    let device = Device {
+        username: username.into(),
+        password: password.context("missing proposed password")?.into(),
+        ..operator.device()
+    };
+    let mut session = device.connect().await?;
+    session.logout().await;
+    Ok(true)
+}
+
+async fn account_payload(
     session: &mut Session,
     operator: &str,
     target_name: &str,
-    password: &str,
+    action: UserAction,
+    password: Option<&str>,
     factory: bool,
 ) -> Result<String> {
     ensure!(
         password_protocol(session).await?,
-        "unsupported device password protocol"
+        "unsupported device account protocol"
     );
     let raw = session.user_list(operator).await?;
-    password_payload(&raw, operator, target_name, password, factory)
-}
-fn password_payload(
-    raw: &str,
-    operator: &str,
-    target_name: &str,
-    password: &str,
-    factory: bool,
-) -> Result<String> {
-    let doc = xml::document(raw)?;
+    let doc = xml::document(&raw)?;
     let users = user_nodes(&doc)?;
     ensure!(users.iter().any(|u| field(*u, "userName") == Some(operator) && field(*u, "userLevel") == Some("1")), "administrator required");
-    ensure!(
-        users
-            .iter()
-            .any(|u| field(*u, "userName") == Some(target_name)),
-        "unknown device user"
-    );
-    ensure!(
-        !factory || (users.len() == 1 && operator == "admin" && target_name == operator),
-        "factory state not verified"
-    );
+    let primary = operator.eq_ignore_ascii_case("admin");
+    let target = users
+        .iter()
+        .find(|u| field(**u, "userName") == Some(target_name));
+    match action {
+        UserAction::AddUser | UserAction::AddAdministrator => {
+            ensure!(
+                primary || action == UserAction::AddUser,
+                "built-in administrator required"
+            );
+            ensure!(
+                users.len() < 32
+                    && !users.iter().any(|u| field(*u, "userName")
+                        .is_some_and(|name| name.eq_ignore_ascii_case(target_name))),
+                "account already exists or user list full"
+            );
+        }
+        UserAction::Remove => {
+            ensure!(
+                !target_name.eq_ignore_ascii_case("admin")
+                    && !target_name.eq_ignore_ascii_case(operator),
+                "protected camera account"
+            );
+            let target = target.context("unknown device user")?;
+            ensure!(
+                primary || field(*target, "userLevel") == Some("0"),
+                "built-in administrator required"
+            );
+        }
+        UserAction::Password => {
+            ensure!(target.is_some(), "unknown device user");
+            ensure!(
+                !factory || (users.len() == 1 && operator == "admin" && target_name == operator),
+                "factory state not verified"
+            );
+        }
+    }
     let mut output = String::from(r#"<body><UserList version="1.1">"#);
     for user in &users {
-        let target = field(*user, "userName") == Some(target_name);
         output.push_str("<User>");
-        for field in ["userName", "userLevel", "userId", "loginState"] {
-            if let Some(value) = xml::child(*user, field).and_then(xml::text) {
-                output.push_str(&format!("<{field}>{}</{field}>", xml::escape(value)));
+        for key in ["userName", "userLevel", "userId", "loginState"] {
+            if let Some(value) = field(*user, key) {
+                output.push_str(&format!("<{key}>{}</{key}>", xml::escape(value)));
             }
         }
-        if target {
+        if field(*user, "userName") != Some(target_name) {
+            output.push_str("<userSetState>none</userSetState>");
+        } else if action == UserAction::Remove {
+            output.push_str("<userSetState>delete</userSetState>");
+        } else {
             output.push_str(&format!(
                 "<userSetState>modify</userSetState><password>{}</password>",
-                xml::escape(password)
+                xml::escape(password.context("missing password")?)
             ));
-        } else {
-            output.push_str("<userSetState>none</userSetState>");
         }
         output.push_str("</User>");
+    }
+    if let Some(level) = action.new_level() {
+        output.push_str(&format!("<User><userName>{}</userName><userLevel>{level}</userLevel><userSetState>add</userSetState><password>{}</password></User>",
+            xml::escape(target_name), xml::escape(password.context("missing password")?)));
     }
     output.push_str("</UserList></body>");
     Ok(output)

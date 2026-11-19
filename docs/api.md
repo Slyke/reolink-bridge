@@ -33,6 +33,8 @@ Replace the documentation address with a private IPv4 target from the installati
 | PUT/DELETE `/callbacks/{id}` | `http.token` | Update or delete a rule. Use the same ID in the URL and the update body. |
 | GET `/cameras/{id}/settings/{group}` | `http.token` | Fresh allowlisted setting values for `leds`, `spotlight`, `motion`, or `ai` and `image`, without raw vendor XML. Writes use the existing typed command interface. |
 | GET/HEAD `/cameras/{id}/preview` | `http.token` | Latest cached JPEG or its headers. Supports `If-None-Match` and returns `304` when the image is unchanged. |
+| GET `/cameras/{id}/time-lapse/photos` | `http.token` | List saved time-lapse photos for a camera-local `date`. Optional inclusive `from` and `to` use HH:mm:ss. Returns an opaque ID and capture time when available. |
+| GET `/cameras/{id}/time-lapse/photos/{photo}` | `http.token` | Download the original JPEG converted to a full-resolution PNG. Repeat the search when its ten-minute reference expires. |
 | GET `/cameras/{id}/storage` | `http.token` | Card capacity, used/free bytes, readiness, and the camera's local clock. |
 | GET `/cameras/{id}/recordings?date=YYYY-MM-DD&stream=sub` | `http.token` | Search a camera-local day. The stream can be `main` or `sub`. Returns opaque recording IDs. |
 | GET `/cameras/{id}/recordings/{recordingId}/video` | `http.token` | Browser-playable MP4 with HTTP byte ranges for seeking. Search first to obtain the recording ID. |
@@ -133,6 +135,18 @@ Time lapse supports JPEG or MP4, main or sub stream, and an optional overwrite s
 `GET /api/cameras/{id}/users` returns local camera usernames, administrator flags, the account used by the bridge, and whether password changes are available. The contract lists native endpoints in `userCameras`. Password changes require a verified device password protocol and a credential vault.
 
 `POST /api/cameras/{id}/users/password` accepts a version-4 UUID in `id`, `username`, `password` and `confirmation: true`. If the list returns `requiresUid: true`, include the printed `uid`. The bridge verifies identity before writing and verifies the new login afterward. A change to its own account uses the rotation journal. Restart the bridge when the response reports `restart-required`. Keep the credential vault when restarting.
+
+When the list returns `manageAccounts: true`, `POST /api/cameras/{id}/users` also accepts the following operations. Both take the same operation ID, confirmation and optional identity binding as a password change.
+
+```json
+{"action":"add","id":"d9ff5da9-aa38-4275-bdbe-197b8cb3d227","username":"viewer","role":"user","password":"<new camera password>","confirmation":true}
+```
+
+```json
+{"action":"remove","id":"aa058e55-247d-4893-9a92-78fb0f11ab77","username":"viewer","confirmation":true}
+```
+
+The available roles are `user` and `administrator`. Only the built-in administrator can manage other administrators. The bridge protects its own login and the built-in admin from deletion. It reads back membership and checks a new login before reporting success. Reusing an operation ID cannot submit the device write twice.
 
 ## Image orientation
 

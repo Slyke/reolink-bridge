@@ -1863,6 +1863,7 @@ dependencies = [
  "redis",
  "reqwest",
  "retina",
+ "ring",
  "roxmltree",
  "rumqttc",
  "rustls",

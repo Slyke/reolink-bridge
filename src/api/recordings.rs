@@ -18,7 +18,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use chrono::{NaiveDate, Utc};
+use chrono::{NaiveDate, NaiveTime, Utc};
 use futures_util::stream;
 use serde::Deserialize;
 use serde_json::json;
@@ -470,7 +470,7 @@ pub(super) async fn metadata(
     }
 }
 
-fn read_failure(
+pub(super) fn read_failure(
     api: &Api,
     correlation: &CorrelationId,
     camera: &str,
@@ -564,6 +564,8 @@ pub(super) async fn storage(
 #[serde(deny_unknown_fields)]
 pub(super) struct Search {
     date: NaiveDate,
+    from: Option<NaiveTime>,
+    to: Option<NaiveTime>,
     #[serde(default = "substream")]
     stream: String,
 }
@@ -581,7 +583,13 @@ pub(super) async fn list(
     if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    if !matches!(query.stream.as_str(), "main" | "sub") {
+    let start = query.date.and_time(query.from.unwrap_or(NaiveTime::MIN));
+    let end = query.date.and_time(
+        query
+            .to
+            .unwrap_or(NaiveTime::from_hms_opt(23, 59, 59).unwrap()),
+    );
+    if start > end || !matches!(query.stream.as_str(), "main" | "sub") {
         return error(
             StatusCode::BAD_REQUEST,
             "API_MEDIA_UNSUPPORTED",
@@ -605,7 +613,7 @@ pub(super) async fn list(
     let result = timeout(Duration::from_secs(45), async {
         let mut session = device.connect().await?;
         let result =
-            recordings::search(&mut session, device.channel, query.date, &query.stream).await;
+            recordings::search(&mut session, device.channel, start, end, &query.stream).await;
         session.logout().await;
         result
     })

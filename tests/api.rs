@@ -723,7 +723,11 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
         404
     );
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 2);
-    *camera.guest_password.lock().unwrap() = Some("fixture-guest-before".into());
+    camera
+        .users
+        .lock()
+        .unwrap()
+        .insert("guest".into(), (false, "fixture-guest-before".into()));
     let accounts = url("/cameras/garage/users");
     let listed = response(&client, &accounts, PRIMARY, None).await;
     assert_eq!(listed.0, 200);
@@ -735,7 +739,97 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     assert_eq!(listed.1["users"][1]["username"], "guest");
     assert!(!listed.1.to_string().contains("fixture-hidden"));
     assert_eq!(response(&client, &accounts, SERVICE, None).await.0, 401);
-    for (name, status, writes) in [("guest", "verified", 3), ("admin", "restart-required", 4)] {
+    assert_eq!(listed.1["manageAccounts"], true);
+    let initial = camera.credential_writes.load(Ordering::SeqCst);
+    let add = json!({"id":Uuid::new_v4(),"action":"add","role":"administrator","username":"second","password":"fixture-<&>Pass","confirmation":true});
+    let remove =
+        json!({"id":Uuid::new_v4(),"action":"remove","username":"second","confirmation":true});
+    assert_eq!(
+        response(&client, &accounts, SERVICE, Some(add.clone()))
+            .await
+            .0,
+        401
+    );
+    for name in ["admin", "ADMIN", "absent"] {
+        let mut invalid = remove.clone();
+        invalid["username"] = json!(name);
+        assert_eq!(
+            response(&client, &accounts, PRIMARY, Some(invalid)).await.0,
+            422
+        );
+    }
+    assert_eq!(camera.credential_writes.load(Ordering::SeqCst), initial);
+    camera.block_after_write.store(true, Ordering::SeqCst);
+    assert_eq!(
+        response(&client, &accounts, PRIMARY, Some(add.clone()))
+            .await
+            .1["status"],
+        "recovery-required"
+    );
+    camera.block_login.store(false, Ordering::SeqCst);
+    let mut conflicting = add.clone();
+    conflicting["password"] = json!("wrong-fixture-99");
+    assert_eq!(
+        response(&client, &accounts, PRIMARY, Some(conflicting))
+            .await
+            .0,
+        422
+    );
+    assert_eq!(
+        response(&client, &accounts, PRIMARY, Some(add.clone()))
+            .await
+            .1["status"],
+        "verified"
+    );
+    let list = response(&client, &accounts, PRIMARY, None).await.1;
+    assert!(
+        list["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["username"] == "second" && u["administrator"] == true)
+    );
+    assert!(!list.to_string().contains("fixture-<&>Pass"));
+    let mut duplicate = add.clone();
+    duplicate["id"] = json!(Uuid::new_v4());
+    duplicate["username"] = json!("SECOND");
+    assert_eq!(
+        response(&client, &accounts, PRIMARY, Some(duplicate))
+            .await
+            .0,
+        422
+    );
+    assert_eq!(camera.credential_writes.load(Ordering::SeqCst), initial + 1);
+    camera.block_after_write.store(true, Ordering::SeqCst);
+    assert_eq!(
+        response(&client, &accounts, PRIMARY, Some(remove.clone()))
+            .await
+            .1["status"],
+        "recovery-required"
+    );
+    camera.block_login.store(false, Ordering::SeqCst);
+    assert_eq!(
+        response(&client, &accounts, PRIMARY, Some(remove.clone()))
+            .await
+            .1["status"],
+        "verified"
+    );
+    assert_eq!(
+        response(&client, &accounts, PRIMARY, Some(remove.clone()))
+            .await
+            .1["status"],
+        "verified"
+    );
+    assert_eq!(
+        response(&client, &accounts, PRIMARY, None).await.1["users"],
+        listed.1["users"]
+    );
+    let baseline = camera.credential_writes.load(Ordering::SeqCst);
+    assert_eq!(baseline, initial + 2);
+    for (name, status, writes) in [
+        ("guest", "verified", baseline + 1),
+        ("admin", "restart-required", baseline + 2),
+    ] {
         let password = format!("fixture-{name}<&>99");
         let change =
             json!({"id":Uuid::new_v4(),"username":name,"password":password,"confirmation":true});
@@ -749,6 +843,14 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
         assert_eq!(result.1["status"], status, "{result:?}");
         assert!(!result.1.to_string().contains(&password));
         assert_eq!(camera.credential_writes.load(Ordering::SeqCst), writes);
+        if name == "admin" {
+            assert_eq!(
+                response(&client, &url("/cameras/garage/rotation"), PRIMARY, None)
+                    .await
+                    .1["status"],
+                "restart-required"
+            );
+        }
     }
     Ok(())
 }
@@ -816,6 +918,12 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         ));
     }
     let camera = Arc::new(baichuan::Camera {
+        gallery_jpeg: {
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::RgbImage::from_pixel(13, 9, image::Rgb([0, 70, 120]))
+                .write_to(&mut out, image::ImageFormat::Jpeg)?;
+            out.into_inner()
+        },
         recording: Some(recording),
         ..Default::default()
     });
@@ -858,6 +966,36 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         .timeout(Duration::from_secs(20))
         .build()?;
     let mut bridge = start(&config, &client, &origin).await?;
+    discovered(&client, &format!("{origin}/api/inventory")).await;
+    let gallery = format!("{origin}/api/cameras/fixture/time-lapse/photos");
+    let listing = format!("{gallery}?date=2026-11-17&from=11:00:00&to=11:59:59");
+    assert_eq!(response(&client, &listing, "wrong", None).await.0, 401);
+    let (status, list) = response(&client, &listing, PRIMARY, None).await;
+    assert_eq!(status, 200, "{list}");
+    let photos = list["photos"].as_array().unwrap();
+    assert_eq!(photos.len(), 1);
+    assert!(!list.to_string().contains("private-image"));
+    let id = photos[0]["id"].as_str().unwrap();
+    let photo = client
+        .get(format!("{gallery}/{id}"))
+        .bearer_auth(PRIMARY)
+        .send()
+        .await?;
+    assert_eq!(photo.status(), 200);
+    assert_eq!(photo.headers()["content-type"], "image/png");
+    let pixels = image::load_from_memory(&photo.bytes().await?)?;
+    assert_eq!((pixels.width(), pixels.height()), (13, 9));
+    assert_eq!(
+        response(
+            &client,
+            &format!("{gallery}?date=2026-11-17&from=12:00:00&to=11:00:00"),
+            PRIMARY,
+            None
+        )
+        .await
+        .0,
+        400
+    );
     let storage = format!("{origin}/api/cameras/fixture/storage");
     assert_eq!(response(&client, &storage, "wrong", None).await.0, 401);
     let card = response(&client, &storage, PRIMARY, None).await;

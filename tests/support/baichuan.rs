@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
@@ -24,6 +25,7 @@ pub struct Camera {
     pub flip: AtomicBool,
     pub rotation: AtomicI32,
     pub recording: Option<Vec<u8>>,
+    pub gallery_jpeg: Vec<u8>,
     pub recording_downloads: AtomicUsize,
     pub recording_end_status: AtomicUsize,
     pub recording_previews: AtomicUsize,
@@ -40,7 +42,7 @@ pub struct Camera {
     pub snapshot_delay: std::time::Duration,
     pub reject_snapshots: AtomicBool,
     pub password: Mutex<Option<String>>,
-    pub guest_password: Mutex<Option<String>>,
+    pub users: Mutex<BTreeMap<String, (bool, String)>>,
     pub schedule_xml: Mutex<Option<String>>,
     pub time_lapse_xml: Mutex<Option<String>>,
     pub credential_writes: AtomicUsize,
@@ -90,14 +92,20 @@ impl Camera {
             } else if command == 1 {
                 xor(&mut body, header[12]);
                 let raw = std::str::from_utf8(&body)?;
-                let guest_user = format!("{:X}", md5::compute(format!("guest{NONCE}")));
-                let guest_password = self.guest_password.lock().unwrap().clone();
-                let login_password = if raw.contains(&guest_user[..31]) {
-                    guest_password
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("unknown fixture user"))?
+                let matches_user = |name: &str| {
+                    let hash = format!("{:X}", md5::compute(format!("{name}{NONCE}")));
+                    raw.contains(&hash[..31])
+                };
+                let login_password = if matches_user("admin") {
+                    password.clone()
                 } else {
-                    &password
+                    self.users
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(name, _)| matches_user(name))
+                        .map(|(_, (_, password))| password.clone())
+                        .ok_or_else(|| anyhow::anyhow!("unknown fixture user"))?
                 };
                 let expected = format!("{:X}", md5::compute(format!("{login_password}{NONCE}")));
                 let hash = format!("{:X}", md5::compute(format!("{NONCE}-{login_password}")));
@@ -114,26 +122,55 @@ impl Camera {
                     .decrypt(&mut body[offset..]);
                 if command == 59 {
                     let raw = roxmltree::Document::parse(std::str::from_utf8(&body[offset..])?)?;
-                    let user = raw
-                        .descendants()
-                        .find(|n| {
-                            n.has_tag_name("User")
-                                && n.children().any(|f| {
-                                    f.has_tag_name("userSetState") && f.text() == Some("modify")
-                                })
-                        })
-                        .unwrap();
-                    let field = |name| {
-                        user.children()
-                            .find(|f| f.has_tag_name(name))
-                            .and_then(|f| f.text())
-                    };
-                    let account = match field("userName") {
-                        Some("admin") => &self.password,
-                        Some("guest") => &self.guest_password,
-                        _ => anyhow::bail!("unknown fixture user"),
-                    };
-                    *account.lock().unwrap() = Some(field("password").unwrap().to_owned());
+                    let mut changed = 0;
+                    for user in raw.descendants().filter(|u| u.has_tag_name("User")) {
+                        let field = |name| {
+                            user.children()
+                                .find(|f| f.has_tag_name(name))
+                                .and_then(|f| f.text())
+                        };
+                        let name = field("userName").unwrap();
+                        let mut users = self.users.lock().unwrap();
+                        match field("userSetState") {
+                            Some("none") => {
+                                ensure!(field("password").is_none());
+                                continue;
+                            }
+                            Some("modify") if name == "admin" => {
+                                *self.password.lock().unwrap() =
+                                    Some(field("password").unwrap().into())
+                            }
+                            Some("modify") => {
+                                users.get_mut(name).unwrap().1 = field("password").unwrap().into()
+                            }
+                            Some("add") => {
+                                let admin = match field("userLevel") {
+                                    Some("1") => true,
+                                    Some("0") => false,
+                                    _ => anyhow::bail!("unknown level"),
+                                };
+                                ensure!(
+                                    name != "admin"
+                                        && users
+                                            .insert(
+                                                name.into(),
+                                                (admin, field("password").unwrap().into())
+                                            )
+                                            .is_none()
+                                );
+                            }
+                            Some("delete") => {
+                                ensure!(
+                                    name != "admin"
+                                        && field("password").is_none()
+                                        && users.remove(name).is_some()
+                                );
+                            }
+                            _ => anyhow::bail!("unexpected user operation"),
+                        }
+                        changed += 1;
+                    }
+                    ensure!(changed == 1);
                     self.credential_writes.fetch_add(1, Ordering::SeqCst);
                     if self.block_after_write.swap(false, Ordering::SeqCst) {
                         self.block_login.store(true, Ordering::SeqCst);
@@ -184,13 +221,18 @@ impl Camera {
                 socket.write_all(&header).await?;
                 socket.write_u32_le(0).await?;
             }
-            if command == 109 && status == 200 {
-                self.snapshot_requests
-                    .lock()
-                    .unwrap()
-                    .push(tokio::time::Instant::now());
-                tokio::time::sleep(self.snapshot_delay).await;
-                for chunk in self.jpeg.as_deref().unwrap().chunks(64 * 1024) {
+            if matches!(command, 109 | 327) && status == 200 {
+                let binary = if command == 327 {
+                    self.gallery_jpeg.as_slice()
+                } else {
+                    self.snapshot_requests
+                        .lock()
+                        .unwrap()
+                        .push(tokio::time::Instant::now());
+                    tokio::time::sleep(self.snapshot_delay).await;
+                    self.jpeg.as_deref().unwrap()
+                };
+                for chunk in binary.chunks(if command == 327 { 67 } else { 64 * 1024 }) {
                     let mut extension = format!(
                         r#"<?xml version="1.0"?><Extension><binaryData>1</binaryData><encryptLen>{}</encryptLen></Extension>"#,
                         chunk.len().min(16),
@@ -225,6 +267,20 @@ impl Camera {
                 "<body><FileInfoList><FileInfo><handle>42</handle></FileInfo></FileInfoList></body>".into()
             }
             15=>"<body><FileInfoList><bFinished>1</bFinished><FileInfo><name>RecS01_20261117_120000_120002_AAA.mp4</name><size>18000</size><type>md</type></FileInfo></FileInfoList></body>".into(),
+            321 => "<body><timelapseTasks><uid>disk-1</uid><item><id>task</id><taskType>jpeg</taskType></item><item><id>ignore</id><taskType>mp4</taskType></item></timelapseTasks></body>".into(),
+            323 => {
+                ensure!(body.contains("<taskType>jpeg</taskType>") && body.contains("<id>task</id>") && body.contains("<endTime>"));
+                "<body><timelapseFileSearch><handle>3</handle><totalNum>1</totalNum><finished>0</finished></timelapseFileSearch></body>".into()
+            }
+            324 => {
+                ensure!(body.contains("<handle>3</handle>"));
+                format!("<body><timelapseFileSearch><finished>1</finished><item><original><id>private-image</id><size>{}</size></original><thumbnail><id>ignore-thumb</id></thumbnail></item></timelapseFileSearch></body>",self.gallery_jpeg.len())
+            }
+            325 => {ensure!(body.contains("<handle>3</handle>"));String::new()}
+            327 => {
+                ensure!(body.contains("<id>private-image</id>") && body.contains("<position>0</position>"));
+                "<body><timelapseDownload><position>0</position></timelapseDownload></body>".into()
+            }
             298 => {
                 if self.reject_recording_cover.load(Ordering::SeqCst) { return Ok((405,String::new())); }
                 if self.recording.is_none() {return Ok((405,String::new()))}
@@ -303,8 +359,12 @@ impl Camera {
             }
             433 => "<body><PtzCurPos><channelId>0</channelId><pPos>725</pPos><tPos>110</tPos></PtzCurPos></body>".into(),
             58 => {
-                let guest = if self.guest_password.lock().unwrap().is_some() { "<User><userName>guest</userName><userLevel>0</userLevel><userId>2</userId></User>" } else { "" };
-                format!("<body><UserList><User><userName>admin</userName><userLevel>1</userLevel><userId>1</userId><loginState>1</loginState><password>fixture-hidden</password></User>{guest}</UserList></body>")
+                let mut list = String::from("<body><UserList><User><userName>admin</userName><userLevel>1</userLevel><userId>1</userId><loginState>1</loginState><password>fixture-hidden</password></User>");
+                for (index,(name,(admin,_))) in self.users.lock().unwrap().iter().enumerate() {
+                    let name = name.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                    list.push_str(&format!("<User><userName>{name}</userName><userLevel>{}</userLevel><userId>{}</userId></User>", u8::from(*admin), index + 2));
+                }
+                list + "</UserList></body>"
             },
             81 => self.schedule_xml.lock().unwrap().clone().unwrap_or_else(||format!("<body><Record><channelId>0</channelId><enable>1</enable><typeScheduleList><item><type>Normal,</type><valueTable>{}</valueTable></item></typeScheduleList><vendor>keep</vendor></Record></body>","0".repeat(168))),
             319 => self.time_lapse_xml.lock().unwrap().clone().unwrap_or_else(||"<body><timelapseCfg><channelId>0</channelId><overwrite>0</overwrite></timelapseCfg></body>".into()),

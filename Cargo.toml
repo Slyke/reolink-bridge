@@ -23,6 +23,7 @@ rcgen = "0.14"
 redis = { version = "0.32", default-features = false, features = ["tokio-rustls-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 retina = "0.4"
+ring = "0.17"
 roxmltree = "0.21"
 rumqttc = "0.25"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

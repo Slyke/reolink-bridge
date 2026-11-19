@@ -125,7 +125,8 @@ pub async fn uid(session: &mut Session) -> Result<String> {
 pub async fn search(
     session: &mut Session,
     channel: u8,
-    day: NaiveDate,
+    start: NaiveDateTime,
+    end: NaiveDateTime,
     stream: &str,
 ) -> Result<(Vec<Clip>, bool)> {
     ensure!(
@@ -133,8 +134,6 @@ pub async fn search(
         "unsupported recording stream"
     );
     let uid = uid(session).await?;
-    let start = day.and_hms_opt(0, 0, 0).unwrap();
-    let end = day.and_hms_opt(23, 59, 59).unwrap();
     let body = format!(
         r#"<body><FileInfoList version="1.1"><FileInfo><uid>{}</uid><channelId>{channel}</channelId><logicChnBitmap>255</logicChnBitmap><streamType>{stream}Stream</streamType><recordType>manual, sched, io, md, people, face, vehicle, dog_cat, visitor, other, package</recordType>{}{}</FileInfo></FileInfoList></body>"#,
         xml::escape(&uid),
@@ -161,11 +160,14 @@ pub async fn search(
                 .descendants()
                 .filter(|n| n.has_tag_name("FileInfo") || n.has_tag_name("File"))
             {
-                let Some(clip) = parse_clip(node, stream, day) else {
+                let Some(clip) = parse_clip(node, stream, start.date()) else {
                     continue;
                 };
-                clips.insert(clip.id.clone(), clip);
                 count += 1;
+                if clip.start < start || clip.start > end {
+                    continue;
+                }
+                clips.insert(clip.id.clone(), clip);
                 if clips.len() >= 4096 {
                     return Ok((clips.into_values().collect(), true));
                 }

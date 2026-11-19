@@ -1,5 +1,6 @@
 mod credentials;
 mod media;
+mod photos;
 mod preview;
 mod recordings;
 mod users;
@@ -73,6 +74,7 @@ pub struct Api {
     devices: BTreeMap<String, Device>,
     previews: preview::Previews,
     recordings: recordings::Recordings,
+    photos: photos::Gallery,
     hub: Option<Arc<Hub>>,
     media_slots: Arc<Semaphore>,
     settings_slots: Semaphore,
@@ -217,6 +219,7 @@ impl Api {
         recordings.thumbnail_store = store;
         Ok(Self {
             recordings,
+            photos: photos::Gallery::default(),
             config,
             http_token: http_token.to_owned(),
             vault: vault.map(Mutex::new),
@@ -309,8 +312,16 @@ pub fn router(api: Arc<Api>) -> Router {
     Router::new()
         .route("/api/contract", get(contract))
         .route("/api/inventory", get(inventory))
-        .route("/api/cameras/{id}/users", get(users::list))
+        .route(
+            "/api/cameras/{id}/users",
+            get(users::list).post(users::manage),
+        )
         .route("/api/cameras/{id}/users/password", post(users::change))
+        .route("/api/cameras/{id}/time-lapse/photos", get(photos::list))
+        .route(
+            "/api/cameras/{id}/time-lapse/photos/{photo}",
+            get(photos::image),
+        )
         .route("/api/cameras/{id}/storage", get(recordings::storage))
         .route("/api/cameras/{id}/recordings", get(recordings::list))
         .route(
@@ -380,6 +391,7 @@ async fn contract(
     Json(json!({"version":1,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
        "userCameras":api.devices.keys().collect::<Vec<_>>(),
        "storageCameras":api.devices.keys().collect::<Vec<_>>(),
+       "timeLapsePhotoCameras":api.devices.keys().collect::<Vec<_>>(),
        "recordingPreviewCameras":api.devices.keys().collect::<Vec<_>>(),
        "recordingMetadataCameras":recordings,
        "recordingsCameras":recordings,

@@ -1,0 +1,222 @@
+use std::{collections::BTreeMap, io::Cursor};
+
+use anyhow::{Result, anyhow, ensure};
+use chrono::NaiveDateTime;
+use image::{ImageFormat, ImageReader};
+use roxmltree::Node;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use super::{
+    recordings::{time_xml, wall_time},
+    wire::Session,
+};
+use crate::xml;
+
+const MAX_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_PHOTOS: usize = 20_000;
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Photo {
+    pub id: String,
+    pub captured_at: Option<NaiveDateTime>,
+    #[serde(skip)]
+    file: String,
+    #[serde(skip)]
+    size: Option<usize>,
+}
+
+fn field<'a>(node: Node<'a, '_>, tag: &str) -> Option<&'a str> {
+    xml::child(node, tag).and_then(xml::text)
+}
+
+fn folder(tag: &str, content: &str) -> String {
+    format!(r#"<body><{tag} version="1.1">{content}</{tag}></body>"#)
+}
+
+fn id(node: Node<'_, '_>, tag: &str) -> Result<String> {
+    field(node, tag)
+        .filter(|s| s.len() <= 512 && !s.contains(char::is_control))
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("missing or invalid time-lapse identifier"))
+}
+
+fn page(
+    raw: &str,
+    scope: &str,
+    task: &str,
+    photos: &mut BTreeMap<String, Photo>,
+) -> Result<(bool, usize)> {
+    let doc = xml::document(raw)?;
+    let root = xml::find(doc.root_element(), "timelapseFileSearch")
+        .ok_or_else(|| anyhow!("missing time-lapse search result"))?;
+    let before = photos.len();
+    for item in root.children().filter(|n| n.has_tag_name("item")) {
+        let original = xml::child(item, "original")
+            .ok_or_else(|| anyhow!("missing original time-lapse image"))?;
+        let file = id(original, "id")?;
+        let key = format!("{:x}", Sha256::digest(format!("{scope}\0{task}\0{file}")));
+        let captured_at = xml::child(original, "startTime").and_then(wall_time);
+        let size = field(original, "size")
+            .map(str::parse::<usize>)
+            .transpose()?
+            .filter(|n| *n > 0);
+        photos.entry(key.clone()).or_insert(Photo {
+            id: key,
+            captured_at,
+            file,
+            size,
+        });
+        ensure!(
+            photos.len() <= MAX_PHOTOS,
+            "time-lapse gallery result limit exceeded"
+        );
+    }
+    Ok((field(root, "finished") == Some("1"), photos.len() - before))
+}
+
+pub async fn search(
+    session: &mut Session,
+    channel: u8,
+    scope: &str,
+    from: NaiveDateTime,
+    to: NaiveDateTime,
+) -> Result<Vec<Photo>> {
+    let target = format!("<channelId>{channel}</channelId>");
+    let raw = session
+        .command(321, Some(channel), &folder("timelapseTasks", &target))
+        .await?;
+    let doc = xml::document(&raw)?;
+    let root = xml::find(doc.root_element(), "timelapseTasks")
+        .ok_or_else(|| anyhow!("camera time-lapse gallery unavailable"))?;
+    let tasks: Vec<_> = root
+        .children()
+        .filter(|n| {
+            n.has_tag_name("item")
+                && field(*n, "taskType").is_some_and(|v| v.eq_ignore_ascii_case("jpeg"))
+        })
+        .map(|item| id(item, "id"))
+        .collect::<Result<_>>()?;
+    ensure!(tasks.len() <= 128, "too many time-lapse tasks");
+    let mut photos = BTreeMap::new();
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let uid = xml::escape(&id(root, "uid")?);
+    for task in tasks {
+        let params = format!(
+            "{target}<uid>{uid}</uid><id>{}</id><taskType>jpeg</taskType>",
+            xml::escape(&task)
+        );
+        let body = folder(
+            "timelapseFileSearch",
+            &format!(
+                "{params}{}{}",
+                time_xml("startTime", from),
+                time_xml("endTime", to)
+            ),
+        );
+        let raw = session.command(323, Some(channel), &body).await?;
+        let doc = xml::document(&raw)?;
+        let root = xml::find(doc.root_element(), "timelapseFileSearch")
+            .ok_or_else(|| anyhow!("missing time-lapse search handle"))?;
+        let handle: u32 = field(root, "handle")
+            .ok_or_else(|| anyhow!("missing time-lapse search handle"))?
+            .parse()?;
+        let next = folder(
+            "timelapseFileSearch",
+            &format!("{params}<handle>{handle}</handle>"),
+        );
+        let result = async {
+            let expected = field(root, "totalNum")
+                .map(str::parse::<usize>)
+                .transpose()?;
+            let mut raw = raw.clone();
+            let mut count = 0;
+            for index in 0..=MAX_PHOTOS {
+                let (done, added) = page(&raw, scope, &task, &mut photos)?;
+                count += added;
+                if done || expected == Some(count) {
+                    ensure!(
+                        expected.is_none_or(|n| n == count),
+                        "incomplete time-lapse gallery"
+                    );
+                    return Ok(());
+                }
+                ensure!(
+                    index == 0 || added > 0,
+                    "time-lapse search stopped progressing"
+                );
+                raw = session.command(324, Some(channel), &next).await?;
+            }
+            anyhow::bail!("too many time-lapse search pages")
+        }
+        .await;
+        let close = session.command(325, Some(channel), &next).await;
+        result?;
+        close?;
+    }
+    Ok(photos.into_values().collect())
+}
+
+pub async fn download(session: &mut Session, channel: u8, photo: &Photo) -> Result<Vec<u8>> {
+    ensure!(
+        photo.size.is_none_or(|n| n <= MAX_BYTES),
+        "time-lapse image exceeds size limit"
+    );
+    let body = folder(
+        "timelapseDownload",
+        &format!(
+            "<position>0</position><id>{}</id><taskType>jpeg</taskType>",
+            xml::escape(&photo.file)
+        ),
+    );
+    let extension =
+        format!(r#"<Extension version="1.1"><channelId>{channel}</channelId></Extension>"#);
+    let mut packet = session
+        .exchange(327, channel + 1, &extension, &body, false)
+        .await?;
+    let sequence = packet.sequence;
+    let mut jpeg = Vec::new();
+    loop {
+        if packet.command == 327 && packet.sequence == sequence {
+            ensure!(
+                matches!(packet.status, 200 | 201),
+                "camera rejected time-lapse image transfer"
+            );
+            if let Some(bytes) = packet.binary(session) {
+                ensure!(
+                    bytes.len() <= MAX_BYTES - jpeg.len(),
+                    "time-lapse image exceeds size limit"
+                );
+                jpeg.extend_from_slice(&bytes);
+                ensure!(
+                    photo.size.is_none_or(|n| jpeg.len() <= n),
+                    "time-lapse image exceeded expected size"
+                );
+                if jpeg.ends_with(&[0xff, 0xd9]) && photo.size.is_none_or(|n| n == jpeg.len()) {
+                    break;
+                }
+            } else if !jpeg.is_empty() && packet.payload_finished(session) {
+                anyhow::bail!("incomplete time-lapse image transfer");
+            }
+        }
+        packet = session.read().await?;
+    }
+    ensure!(jpeg.starts_with(&[0xff, 0xd8]), "invalid time-lapse JPEG");
+    Ok(jpeg)
+}
+
+pub fn png(jpeg: Vec<u8>) -> Result<Vec<u8>> {
+    let reader = || ImageReader::with_format(Cursor::new(&jpeg), ImageFormat::Jpeg);
+    let (w, h) = reader().into_dimensions()?;
+    ensure!(
+        w > 0 && h > 0 && u64::from(w) * u64::from(h) <= 32_000_000,
+        "invalid time-lapse dimensions"
+    );
+    let frame = reader().decode()?;
+    let mut out = Cursor::new(Vec::new());
+    frame.write_to(&mut out, ImageFormat::Png)?;
+    Ok(out.into_inner())
+}

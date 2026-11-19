@@ -7,6 +7,7 @@ pub mod ptz;
 pub mod recording_media;
 pub mod recording_settings;
 pub mod recordings;
+pub mod timelapse_photos;
 pub mod wire;
 
 use std::sync::Mutex;
