@@ -110,6 +110,7 @@
   "reolink-bridge-PTZ_STOP_FAILED": "The camera did not acknowledge the PTZ Stop command.",
   "reolink-bridge-PTZ_STATUS_FAILED": "The camera did not return its PTZ position.",
   "reolink-bridge-PTZ_PRESET_OCCUPIED": "The selected PTZ preset number is already in use.",
+  "reolink-bridge-PTZ_PRESET_DELETE_FAILED": "The camera did not acknowledge deleting its PTZ preset.",
   "reolink-bridge-PTZ_PRESET_SAVE_FAILED": "The camera could not confirm saving the PTZ preset.",
   "reolink-bridge-PTZ_PRESETS_FAILED": "The camera did not return its PTZ presets.",
   "reolink-bridge-PTZ_PRESET_LOOKUP_FAILED": "The bridge could not read the camera preset before recall.",
