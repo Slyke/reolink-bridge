@@ -26,6 +26,7 @@ pub struct Camera {
     pub rotation: AtomicI32,
     pub recording: Option<Vec<u8>>,
     pub gallery_jpeg: Vec<u8>,
+    pub empty_gallery_uid: AtomicBool,
     pub recording_downloads: AtomicUsize,
     pub recording_end_status: AtomicUsize,
     pub recording_previews: AtomicUsize,
@@ -287,6 +288,21 @@ impl Camera {
         if self.reject_read_command.load(Ordering::SeqCst) == command as usize {
             return Ok((405, String::new()));
         }
+        if matches!(command, 323..=325) {
+            let doc = roxmltree::Document::parse(body)?;
+            let uid = doc.descendants().find(|n| n.has_tag_name("uid"));
+            if self.empty_gallery_uid.load(Ordering::SeqCst) {
+                ensure!(
+                    uid.is_none(),
+                    "standalone SD search should omit the blank storage UID"
+                );
+            } else {
+                ensure!(
+                    uid.and_then(|n| n.text()) == Some("disk-1"),
+                    "missing camera storage UID"
+                );
+            }
+        }
         let response = match command {
             76 => "<body><Ip><ip>192.0.2.7</ip><mask>255.255.255.0</mask><gateway>192.0.2.1</gateway></Ip><Dhcp><enable>1</enable></Dhcp></body>".into(),
             37 => format!("<body><HttpPort><enable>0</enable></HttpPort><RtspPort><rtspPort>8554</rtspPort><enable>{}</enable></RtspPort></body>", u8::from(self.rtsp_enabled.load(Ordering::SeqCst))),
@@ -354,7 +370,10 @@ impl Camera {
                 "<body><FileInfoList><FileInfo><handle>42</handle></FileInfo></FileInfoList></body>".into()
             }
             15=>"<body><FileInfoList><bFinished>1</bFinished><FileInfo><name>RecS01_20261117_120000_120002_AAA.mp4</name><size>18000</size><type>md</type></FileInfo></FileInfoList></body>".into(),
-            321 => "<body><timelapseTasks><uid>disk-1</uid><item><id>task</id><taskType>jpeg</taskType></item><item><id>ignore</id><taskType>mp4</taskType></item></timelapseTasks></body>".into(),
+            321 => {
+                let uid = if self.empty_gallery_uid.load(Ordering::SeqCst) { "" } else { "disk-1" };
+                format!("<body><timelapseTasks><uid>{uid}</uid><item><id>task</id><taskType>jpeg</taskType></item><item><id>ignore</id><taskType>mp4</taskType></item></timelapseTasks></body>")
+            }
             323 => {
                 ensure!(body.contains("<taskType>jpeg</taskType>") && body.contains("<id>task</id>") && body.contains("<endTime>"));
                 "<body><timelapseFileSearch><handle>3</handle><totalNum>1</totalNum><finished>0</finished></timelapseFileSearch></body>".into()

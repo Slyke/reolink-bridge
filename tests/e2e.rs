@@ -541,8 +541,12 @@ async fn local_broker_http_websocket_and_camera_controls() {
         .as_bytes();
     assert_eq!(hours.iter().filter(|b| **b == b'1').count(), 2);
     assert_eq!((hours[32], hours[167]), (b'1', b'1'));
-    let lapse = request(&mut websocket, json!({"id":"time-lapse", "op":"control", "camera_id":"lab",
-        "command":{"setting":"time_lapse","enabled":true,"interval_seconds":30,"format":"jpeg","stream":"sub"}})).await;
+    let lapse = request(
+        &mut websocket,
+        json!({"id":"time-lapse", "op":"control", "camera_id":"lab",
+        "command":{"setting":"time_lapse","enabled":true,"interval_seconds":30,"stream":"sub"}}),
+    )
+    .await;
     assert_eq!(lapse["ok"], true, "{lapse}");
     assert_eq!(lapse["verified"], true);
     assert_eq!(

@@ -322,7 +322,8 @@ impl LapseChange {
         if let Some(v) = self.interval_seconds {
             fields.push(("interval", v.to_string()))
         }
-        if let Some(v) = self.format {
+        let capture_format = self.format.or(now.map(|_| CaptureFormat::Jpeg));
+        if let Some(v) = capture_format {
             fields.push(("taskType", v.tag().into()))
         }
         if let Some(v) = self.stream {
@@ -350,8 +351,7 @@ impl LapseChange {
                 && item.and_then(|i| boolean_field(i, "buseThumbnail")) == Some(true))
         {
             let reported = |name| item.and_then(|i| text(i, name));
-            let format = self
-                .format
+            let format = capture_format
                 .map(CaptureFormat::tag)
                 .or_else(|| reported("taskType"))
                 .unwrap_or("jpeg");
@@ -470,6 +470,26 @@ pub async fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_mp4_survives_later_edits() {
+        let doc = xml::document(include_str!(
+            "../../tests/fixtures/lumus-empty-time-lapse.xml"
+        ))
+        .unwrap();
+        let root = Group::Lapse.root(&doc, 0).unwrap();
+        let create: LapseChange =
+            serde_json::from_value(json!({"enabled":true,"format":"mp4"})).unwrap();
+        let start = chrono::DateTime::UNIX_EPOCH.naive_utc();
+        let created = create.patch(root, Some(start)).unwrap();
+        let saved = xml::document(&created).unwrap();
+        let edit: LapseChange = serde_json::from_value(json!({"interval_seconds":60})).unwrap();
+        let edited = edit.patch(saved.root_element(), None).unwrap();
+        let after = xml::document(&edited).unwrap();
+        let item = xml::child(after.root_element(), "item").unwrap();
+        assert_eq!(text(item, "taskType"), Some("mp4"));
+        assert_eq!(boolean_field(item, "buseThumbnail"), Some(false));
+    }
 
     #[test]
     fn new_tasks_honor_opt_out_and_edits_preserve_the_existing_task() {

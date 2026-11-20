@@ -165,7 +165,7 @@ Recording hours use the camera’s local week, starting with Sunday at 00:00 (sl
 {"setting":"time_lapse","enabled":true,"interval_seconds":10,"format":"jpeg","stream":"main"}
 ```
 
-Time lapse supports JPEG or MP4, main or sub stream, and an optional overwrite switch when the camera reports it. New tasks use the camera clock and run daily until stopped. On cameras that support overwrite, new tasks enable it unless the request specifies `"overwrite": false`. Existing tasks retain their overwrite setting, dates and daily windows. Fluent photos use the original JPEG for gallery previews. An explicit camera rejection of the time-lapse write returns `CONTROL_TIME_LAPSE_REJECTED` and the numeric `cameraStatus`.
+Time lapse supports JPEG or MP4, main or sub stream, and an optional overwrite switch when the camera reports it. New tasks default to JPEG, use the camera clock and run daily until stopped. Specify `"format": "mp4"` to save video. On cameras that support overwrite, new tasks enable it unless the request specifies `"overwrite": false`. Existing tasks retain their overwrite setting, dates and daily windows. Fluent photos use the original JPEG for gallery previews. An explicit camera rejection of the time-lapse write returns `CONTROL_TIME_LAPSE_REJECTED` and the numeric `cameraStatus`.
 
 ## Camera accounts
 

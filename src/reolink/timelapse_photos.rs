@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, io::Cursor};
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use image::{DynamicImage, ImageFormat, ImageReader, codecs::jpeg::JpegEncoder};
 use roxmltree::Node;
@@ -35,11 +35,13 @@ fn folder(tag: &str, content: &str) -> String {
     format!(r#"<body><{tag} version="1.1">{content}</{tag}></body>"#)
 }
 
-fn id(node: Node<'_, '_>, tag: &str) -> Result<String> {
-    field(node, tag)
-        .filter(|s| s.len() <= 512 && !s.contains(char::is_control))
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow!("missing or invalid time-lapse identifier"))
+fn identifier<'a>(node: Node<'a, '_>, tag: &str) -> Result<Option<&'a str>> {
+    let value = field(node, tag);
+    ensure!(
+        value.is_none_or(|s| s.len() <= 512 && !s.contains(char::is_control)),
+        "invalid time-lapse {tag}"
+    );
+    Ok(value)
 }
 
 // JPEG entries on some firmware carry the capture time only in the file name.
@@ -85,13 +87,13 @@ fn page(
     for item in root.children().filter(|n| n.has_tag_name("item")) {
         let original = xml::child(item, "original")
             .ok_or_else(|| anyhow!("missing original time-lapse image"))?;
-        let file = id(original, "id")?;
+        let file = identifier(original, "id")?.context("time-lapse photo has no file ID")?;
         let key = format!("{:x}", Sha256::digest(format!("{scope}\0{task}\0{file}")));
         let captured_at = [original, item]
             .into_iter()
             .find_map(|node| xml::child(node, "startTime").and_then(wall_time))
             .or_else(|| field(original, "fileName").and_then(|name| filename_time(name, day)))
-            .or_else(|| filename_time(&file, day));
+            .or_else(|| filename_time(file, day));
         let size = field(original, "size")
             .map(str::parse::<usize>)
             .transpose()?
@@ -99,7 +101,7 @@ fn page(
         photos.entry(key.clone()).or_insert(Photo {
             id: key,
             captured_at,
-            file,
+            file: file.to_owned(),
             size,
         });
         ensure!(
@@ -130,18 +132,21 @@ pub async fn search(
             n.has_tag_name("item")
                 && field(*n, "taskType").is_some_and(|v| v.eq_ignore_ascii_case("jpeg"))
         })
-        .map(|item| id(item, "id"))
+        .map(|item| identifier(item, "id")?.context("time-lapse task has no ID"))
         .collect::<Result<_>>()?;
     ensure!(tasks.len() <= 128, "too many time-lapse tasks");
     let mut photos = BTreeMap::new();
     if tasks.is_empty() {
         return Ok(Vec::new());
     }
-    let uid = xml::escape(&id(root, "uid")?);
+    // Standalone cameras can report a blank storage UID for their local SD card.
+    let uid = identifier(root, "uid")?
+        .map(|uid| format!("<uid>{}</uid>", xml::escape(uid)))
+        .unwrap_or_default();
     for task in tasks {
         let params = format!(
-            "{target}<uid>{uid}</uid><id>{}</id><taskType>jpeg</taskType>",
-            xml::escape(&task)
+            "{target}{uid}<id>{}</id><taskType>jpeg</taskType>",
+            xml::escape(task)
         );
         let body = folder(
             "timelapseFileSearch",
@@ -169,7 +174,7 @@ pub async fn search(
             let mut raw = raw.clone();
             let mut count = 0;
             for index in 0..=MAX_PHOTOS {
-                let (done, added) = page(&raw, scope, &task, from.date(), &mut photos)?;
+                let (done, added) = page(&raw, scope, task, from.date(), &mut photos)?;
                 count += added;
                 if done || expected == Some(count) {
                     ensure!(
