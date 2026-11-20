@@ -9,9 +9,11 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use chrono::{NaiveDate, NaiveTime};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
@@ -122,9 +124,16 @@ pub(super) async fn list(
     }
 }
 
+#[derive(Deserialize, Default)]
+pub(super) struct ImageOptions {
+    #[serde(default)]
+    preview: bool,
+}
+
 pub(super) async fn image(
     State(api): State<Arc<Api>>,
     Path((camera, id)): Path<(String, String)>,
+    Query(options): Query<ImageOptions>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
@@ -144,6 +153,16 @@ pub(super) async fn image(
         .rev()
         .filter(|m| m.scope == scope && m.expires > Instant::now())
         .find_map(|m| m.photos.get(&id).cloned());
+    let thumbnail_store = options
+        .preview
+        .then_some(api.recordings.thumbnail_store.as_deref())
+        .flatten();
+    let origin = Sha256::digest(format!(
+        "{}:{}:{}",
+        device.host, device.port, device.channel
+    ));
+    let cache_key = format!("photo:{scope}:{origin:x}:{id}");
+    let ttl = Duration::from_secs(600);
     let Some(photo) = photo else {
         return error(StatusCode::NOT_FOUND, "API_MEDIA_UNSUPPORTED", &correlation);
     };
@@ -154,23 +173,46 @@ pub(super) async fn image(
             &correlation,
         );
     };
+    let content_type = if options.preview {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
     let result = timeout(Duration::from_secs(60), async {
+        if let Some(store) = thumbnail_store
+            && let Some((jpeg, _)) = store.recording(&cache_key, None, ttl).await
+        {
+            return Ok(jpeg);
+        }
         let mut session = device.connect().await?;
         let result = timelapse_photos::download(&mut session, device.channel, &photo).await;
         session.logout().await;
         let jpeg = result?;
-        tokio::task::spawn_blocking(move || timelapse_photos::png(jpeg)).await?
+        let image = Bytes::from(
+            tokio::task::spawn_blocking(move || {
+                if options.preview {
+                    timelapse_photos::thumbnail(&jpeg)
+                } else {
+                    timelapse_photos::png(jpeg)
+                }
+            })
+            .await??,
+        );
+        if let Some(store) = thumbnail_store {
+            store.recording(&cache_key, Some((&image, 0)), ttl).await;
+        }
+        Ok::<_, anyhow::Error>(image)
     })
     .await
     .map_err(anyhow::Error::from)
     .and_then(|r| r);
     match result {
-        Ok(png) => (
+        Ok(image) => (
             [
-                (header::CONTENT_TYPE, "image/png"),
+                (header::CONTENT_TYPE, content_type),
                 (header::CACHE_CONTROL, "private, no-store"),
             ],
-            png,
+            image,
         )
             .into_response(),
         Err(cause) => read_failure(

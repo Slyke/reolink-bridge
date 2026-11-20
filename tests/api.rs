@@ -1482,7 +1482,19 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     let photos = list["photos"].as_array().unwrap();
     assert_eq!(photos.len(), 1);
     assert!(!list.to_string().contains("private-image"));
+    assert_eq!(photos[0]["capturedAt"], "2026-11-17T09:15:00");
     let id = photos[0]["id"].as_str().unwrap();
+    let thumbnail = client
+        .get(format!("{gallery}/{id}?preview=true"))
+        .bearer_auth(PRIMARY)
+        .send()
+        .await?;
+    assert_eq!(thumbnail.status(), 200);
+    assert_eq!(thumbnail.headers()["content-type"], "image/jpeg");
+    let thumb = thumbnail.bytes().await?;
+    assert_eq!(image::guess_format(&thumb)?, image::ImageFormat::Jpeg);
+    let decoded = image::load_from_memory(&thumb)?;
+    assert_eq!((decoded.width(), decoded.height()), (13, 9));
     let photo = client
         .get(format!("{gallery}/{id}"))
         .bearer_auth(PRIMARY)

@@ -361,7 +361,7 @@ impl Camera {
             }
             324 => {
                 ensure!(body.contains("<handle>3</handle>"));
-                format!("<body><timelapseFileSearch><finished>1</finished><item><original><id>private-image</id><size>{}</size></original><thumbnail><id>ignore-thumb</id></thumbnail></item></timelapseFileSearch></body>",self.gallery_jpeg.len())
+                format!("<body><timelapseFileSearch><finished>1</finished><item><startTime><year>2026</year><month>11</month><day>17</day><hour>9</hour><minute>15</minute><second>0</second></startTime><original><id>private-image</id><size>{}</size></original><thumbnail><id>ignore-thumb</id></thumbnail></item></timelapseFileSearch></body>",self.gallery_jpeg.len())
             }
             325 => {ensure!(body.contains("<handle>3</handle>"));String::new()}
             327 => {

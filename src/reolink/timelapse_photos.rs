@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, io::Cursor};
 
 use anyhow::{Result, anyhow, ensure};
-use chrono::NaiveDateTime;
-use image::{ImageFormat, ImageReader};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use image::{DynamicImage, ImageFormat, ImageReader, codecs::jpeg::JpegEncoder};
 use roxmltree::Node;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -42,10 +42,40 @@ fn id(node: Node<'_, '_>, tag: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("missing or invalid time-lapse identifier"))
 }
 
+// JPEG entries on some firmware carry the capture time only in the file name.
+// Match the requested camera-local date and never use a parent task's start time.
+fn filename_time(name: &str, day: NaiveDate) -> Option<NaiveDateTime> {
+    let base = name.rsplit(['/', '\\']).next()?;
+    for date_format in ["%Y%m%d", "%Y-%m-%d", "%Y_%m_%d"] {
+        let date = day.format(date_format).to_string();
+        for (pos, _) in base.match_indices(&date) {
+            if pos > 0 && base.as_bytes()[pos - 1].is_ascii_digit() {
+                continue;
+            }
+            let tail = base[pos + date.len()..].trim_start_matches(['T', '_', '-', ' ']);
+            for (len, format) in [
+                (6, "%H%M%S"),
+                (8, "%H-%M-%S"),
+                (8, "%H:%M:%S"),
+                (8, "%H_%M_%S"),
+            ] {
+                if let Some(value) = tail.get(..len)
+                    && !tail.as_bytes().get(len).is_some_and(u8::is_ascii_digit)
+                    && let Ok(clock) = NaiveTime::parse_from_str(value, format)
+                {
+                    return Some(day.and_time(clock));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn page(
     raw: &str,
     scope: &str,
     task: &str,
+    day: NaiveDate,
     photos: &mut BTreeMap<String, Photo>,
 ) -> Result<(bool, usize)> {
     let doc = xml::document(raw)?;
@@ -57,7 +87,11 @@ fn page(
             .ok_or_else(|| anyhow!("missing original time-lapse image"))?;
         let file = id(original, "id")?;
         let key = format!("{:x}", Sha256::digest(format!("{scope}\0{task}\0{file}")));
-        let captured_at = xml::child(original, "startTime").and_then(wall_time);
+        let captured_at = [original, item]
+            .into_iter()
+            .find_map(|node| xml::child(node, "startTime").and_then(wall_time))
+            .or_else(|| field(original, "fileName").and_then(|name| filename_time(name, day)))
+            .or_else(|| filename_time(&file, day));
         let size = field(original, "size")
             .map(str::parse::<usize>)
             .transpose()?
@@ -135,7 +169,7 @@ pub async fn search(
             let mut raw = raw.clone();
             let mut count = 0;
             for index in 0..=MAX_PHOTOS {
-                let (done, added) = page(&raw, scope, &task, &mut photos)?;
+                let (done, added) = page(&raw, scope, &task, from.date(), &mut photos)?;
                 count += added;
                 if done || expected == Some(count) {
                     ensure!(
@@ -208,15 +242,45 @@ pub async fn download(session: &mut Session, channel: u8, photo: &Photo) -> Resu
     Ok(jpeg)
 }
 
-pub fn png(jpeg: Vec<u8>) -> Result<Vec<u8>> {
-    let reader = || ImageReader::with_format(Cursor::new(&jpeg), ImageFormat::Jpeg);
+fn decode(jpeg: &[u8]) -> Result<DynamicImage> {
+    let reader = || ImageReader::with_format(Cursor::new(jpeg), ImageFormat::Jpeg);
     let (w, h) = reader().into_dimensions()?;
     ensure!(
         w > 0 && h > 0 && u64::from(w) * u64::from(h) <= 32_000_000,
         "invalid time-lapse dimensions"
     );
-    let frame = reader().decode()?;
+    Ok(reader().decode()?)
+}
+
+pub fn thumbnail(jpeg: &[u8]) -> Result<Vec<u8>> {
+    let frame = decode(jpeg)?;
+    let scaled = if frame.width() > 480 || frame.height() > 270 {
+        frame.thumbnail(480, 270)
+    } else {
+        frame
+    };
+    let mut out = Vec::new();
+    JpegEncoder::new_with_quality(&mut out, 80).encode_image(&scaled)?;
+    Ok(out)
+}
+
+pub fn png(jpeg: Vec<u8>) -> Result<Vec<u8>> {
+    let frame = decode(&jpeg)?;
     let mut out = Cursor::new(Vec::new());
     frame.write_to(&mut out, ImageFormat::Png)?;
     Ok(out.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn jpeg_filename_uses_the_capture_date_and_ignores_the_task_directory() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 17).unwrap();
+        let expected = day.and_hms_opt(9, 15, 0);
+        assert_eq!(filename_time("TL_20261117_091500.jpg", day), expected);
+        assert_eq!(filename_time("2026-11-17T09-15-00.jpg", day), expected);
+        assert_eq!(filename_time("/20261117_091500/000004.jpg", day), None);
+        assert_eq!(filename_time("20261116_091500.jpg", day), None);
+    }
 }
