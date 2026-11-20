@@ -83,8 +83,9 @@ fn page(
     let doc = xml::document(raw)?;
     let root = xml::find(doc.root_element(), "timelapseFileSearch")
         .ok_or_else(|| anyhow!("missing time-lapse search result"))?;
-    let before = photos.len();
+    let mut returned = 0;
     for item in root.children().filter(|n| n.has_tag_name("item")) {
+        returned += 1;
         let original = xml::child(item, "original")
             .ok_or_else(|| anyhow!("missing original time-lapse image"))?;
         let file = identifier(original, "id")?.context("time-lapse photo has no file ID")?;
@@ -109,7 +110,7 @@ fn page(
             "time-lapse gallery result limit exceeded"
         );
     }
-    Ok((field(root, "finished") == Some("1"), photos.len() - before))
+    Ok((field(root, "finished") == Some("1"), returned))
 }
 
 pub async fn search(
@@ -163,36 +164,50 @@ pub async fn search(
         let handle: u32 = field(root, "handle")
             .ok_or_else(|| anyhow!("missing time-lapse search handle"))?
             .parse()?;
-        let next = folder(
-            "timelapseFileSearch",
-            &format!("{params}<handle>{handle}</handle>"),
-        );
+        let handle_fields = format!("{params}<handle>{handle}</handle>");
         let result = async {
             let expected = field(root, "totalNum")
                 .map(str::parse::<usize>)
                 .transpose()?;
             let mut raw = raw.clone();
-            let mut count = 0;
+            let initial_count = photos.len();
+            let mut offset = 0;
             for index in 0..=MAX_PHOTOS {
-                let (done, added) = page(&raw, scope, task, from.date(), &mut photos)?;
-                count += added;
-                if done || expected == Some(count) {
+                let before = photos.len();
+                let (done, returned) = page(&raw, scope, task, from.date(), &mut photos)?;
+                offset += returned;
+                ensure!(
+                    offset <= MAX_PHOTOS,
+                    "time-lapse gallery result limit exceeded"
+                );
+                if done || expected == Some(offset) {
                     ensure!(
-                        expected.is_none_or(|n| n == count),
+                        expected.is_none_or(|n| n == photos.len() - initial_count),
                         "incomplete time-lapse gallery"
                     );
                     return Ok(());
                 }
                 ensure!(
-                    index == 0 || added > 0,
+                    index == 0 || photos.len() > before,
                     "time-lapse search stopped progressing"
+                );
+                // The Lumus repeats its first 16 files unless the next request includes the file offset.
+                let next = folder(
+                    "timelapseFileSearch",
+                    &format!("{handle_fields}<fromWhere>{offset}</fromWhere>"),
                 );
                 raw = session.command(324, Some(channel), &next).await?;
             }
             anyhow::bail!("too many time-lapse search pages")
         }
         .await;
-        let close = session.command(325, Some(channel), &next).await;
+        let close = session
+            .command(
+                325,
+                Some(channel),
+                &folder("timelapseFileSearch", &handle_fields),
+            )
+            .await;
         result?;
         close?;
     }

@@ -376,15 +376,23 @@ impl Camera {
             }
             323 => {
                 ensure!(body.contains("<taskType>jpeg</taskType>") && body.contains("<id>task</id>") && body.contains("<endTime>"));
-                "<body><timelapseFileSearch><handle>3</handle><totalNum>1</totalNum><finished>0</finished></timelapseFileSearch></body>".into()
+                "<body><timelapseFileSearch><handle>3</handle><totalNum>17</totalNum><finished>0</finished></timelapseFileSearch></body>".into()
             }
             324 => {
-                ensure!(body.contains("<handle>3</handle>"));
-                format!("<body><timelapseFileSearch><finished>1</finished><item><startTime><year>2026</year><month>11</month><day>17</day><hour>9</hour><minute>15</minute><second>0</second></startTime><original><id>private-image</id><size>{}</size></original><thumbnail><id>ignore-thumb</id></thumbnail></item></timelapseFileSearch></body>",self.gallery_jpeg.len())
+                let doc = roxmltree::Document::parse(body)?;
+                ensure!(field(&doc, "handle") == Some("3"));
+                let start = field(&doc, "fromWhere").unwrap_or("0").parse::<usize>()?;
+                ensure!(start <= 17);
+                let end = (start + 16).min(17);
+                let items = (start..end).map(|second| format!(
+                    "<item><startTime><year>2026</year><month>11</month><day>17</day><hour>9</hour><minute>15</minute><second>{second}</second></startTime><original><id>private-image-{second}</id><size>{}</size></original><thumbnail><id>ignore-thumb</id></thumbnail></item>",
+                    self.gallery_jpeg.len()
+                )).collect::<String>();
+                format!("<body><timelapseFileSearch><finished>{}</finished><totalNum>0</totalNum>{items}</timelapseFileSearch></body>", u8::from(end == 17))
             }
             325 => {ensure!(body.contains("<handle>3</handle>"));String::new()}
             327 => {
-                ensure!(body.contains("<id>private-image</id>") && body.contains("<position>0</position>"));
+                ensure!(body.contains("<id>private-image-0</id>") && body.contains("<position>0</position>"));
                 "<body><timelapseDownload><position>0</position></timelapseDownload></body>".into()
             }
             298 => {

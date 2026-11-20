@@ -1484,10 +1484,11 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     assert_eq!(status, 200, "{local_sd}");
     assert_eq!(local_sd, list);
     let photos = local_sd["photos"].as_array().unwrap();
-    assert_eq!(photos.len(), 1);
+    assert_eq!(photos.len(), 17);
     assert!(!list.to_string().contains("private-image"));
-    assert_eq!(photos[0]["capturedAt"], "2026-11-17T09:15:00");
-    let id = photos[0]["id"].as_str().unwrap();
+    let by_time = |at: &str| photos.iter().find(|p| p["capturedAt"] == at).unwrap();
+    by_time("2026-11-17T09:15:16");
+    let id = by_time("2026-11-17T09:15:00")["id"].as_str().unwrap();
     let thumbnail = client
         .get(format!("{gallery}/{id}?preview=true"))
         .bearer_auth(PRIMARY)
