@@ -1,4 +1,4 @@
-use std::{future::Future, process::Stdio, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, future::Future, process::Stdio, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::{
@@ -27,7 +27,10 @@ use url::Url;
 use super::{Api, error};
 use crate::{
     http::CorrelationId,
-    reolink::{live_video::LiveVideo, recording_settings::Stream, wire::Device},
+    reolink::{
+        live_video::LiveVideo,
+        wire::{Device, LiveStream},
+    },
 };
 use tokio_util::sync::CancellationToken;
 
@@ -37,7 +40,7 @@ pub struct Profile {
     #[serde(default)]
     transport: VideoTransport,
     pub port: u16,
-    pub streams: Vec<String>,
+    pub streams: Vec<LiveStream>,
 }
 
 #[derive(Default, Deserialize, Clone, Copy)]
@@ -50,15 +53,19 @@ enum VideoTransport {
 }
 
 impl Profile {
-    pub fn valid(&self) -> bool {
-        self.port != 0
-            && !self.streams.is_empty()
-            && self.streams.len() <= 2
-            && self
-                .streams
-                .iter()
-                .all(|name| matches!(name.as_str(), "main" | "sub"))
-            && (self.streams.len() == 1 || self.streams[0] != self.streams[1])
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.port != 0, "media port must be positive");
+        ensure!(!self.streams.is_empty(), "media profile requires a stream");
+        ensure!(
+            self.streams.iter().collect::<BTreeSet<_>>().len() == self.streams.len(),
+            "duplicate media stream"
+        );
+        ensure!(
+            !(matches!(self.transport, VideoTransport::Rtsp)
+                && self.streams.contains(&LiveStream::Third)),
+            "the third live stream requires auto or baichuan transport"
+        );
+        Ok(())
     }
 }
 
@@ -103,12 +110,14 @@ pub async fn get(
     if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    let Some(profile) = api
-        .config
-        .media
-        .get(&id)
-        .filter(|profile| profile.streams.contains(&stream))
-    else {
+    let Some((profile, quality)) = api.config.media.get(&id).and_then(|profile| {
+        profile
+            .streams
+            .iter()
+            .copied()
+            .find(|q| q.id() == stream)
+            .map(|q| (profile, q))
+    }) else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "API_MEDIA_UNSUPPORTED",
@@ -133,10 +142,11 @@ pub async fn get(
     let open = |transport| {
         let slot = slot.clone();
         let stop = api.stop.clone();
-        let quality = stream.as_str();
         async move {
             let mut relay = match transport {
-                VideoTransport::Rtsp => rtsp_relay(device, profile, quality, slot, stop).await?,
+                VideoTransport::Rtsp => {
+                    rtsp_relay(device, profile, quality.id(), slot, stop).await?
+                }
                 VideoTransport::Baichuan => native_relay(device, quality, slot, stop).await?,
                 VideoTransport::Auto => unreachable!(),
             };
@@ -147,7 +157,13 @@ pub async fn get(
             Ok::<_, anyhow::Error>((relay, first))
         }
     };
-    let result = match profile.transport {
+    // Reolink defines RTSP paths for main and sub. The third encoder has a native preview handle.
+    let transport = if quality == LiveStream::Third {
+        VideoTransport::Baichuan
+    } else {
+        profile.transport
+    };
+    let result = match transport {
         VideoTransport::Auto => {
             match timeout(Duration::from_secs(8), open(VideoTransport::Rtsp))
                 .await
@@ -320,15 +336,10 @@ async fn rtsp_relay(
 
 async fn native_relay(
     device: &Device,
-    quality: &str,
+    quality: LiveStream,
     slot: Arc<OwnedSemaphorePermit>,
     stop: CancellationToken,
 ) -> Result<Relay> {
-    let quality = match quality {
-        "main" => Stream::Main,
-        "sub" => Stream::Sub,
-        _ => anyhow::bail!("unknown stream quality"),
-    };
     let mut video = LiveVideo::open(device, quality)
         .await
         .context("open Baichuan preview")?;
@@ -403,4 +414,45 @@ where
         deadline: Instant::now() + Duration::from_secs(125),
         stop,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Profile;
+    use serde_json::json;
+
+    #[test]
+    fn validates_live_streams_for_each_transport() {
+        let profile = |transport, streams| {
+            serde_json::from_value::<Profile>(json!({
+                "transport": transport, "port": 554, "streams": streams
+            }))
+        };
+        assert!(
+            profile("auto", vec!["main", "sub", "third"])
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            profile("baichuan", vec!["third"])
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            profile("rtsp", vec!["main", "sub"])
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        assert!(profile("rtsp", vec!["third"]).unwrap().validate().is_err());
+        assert!(
+            profile("auto", vec!["main", "third", "third"])
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        assert!(profile("auto", vec!["other"]).is_err());
+    }
 }

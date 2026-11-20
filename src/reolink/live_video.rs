@@ -3,8 +3,7 @@ use bytes::{Buf, Bytes, BytesMut};
 
 use super::{
     metadata::{Media, media_sample},
-    recording_settings::Stream,
-    wire::{Device, Packet, Session},
+    wire::{Device, LiveStream, Packet, Session},
 };
 
 pub struct LiveVideo {
@@ -15,7 +14,7 @@ pub struct LiveVideo {
 }
 
 impl LiveVideo {
-    pub async fn open(device: &Device, stream: Stream) -> Result<Self> {
+    pub async fn open(device: &Device, stream: LiveStream) -> Result<Self> {
         let mut session = device.connect().await?;
         let first = session.preview(device.channel, stream, true).await?;
         Ok(Self {

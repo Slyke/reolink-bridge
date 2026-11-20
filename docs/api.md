@@ -10,7 +10,7 @@ api: {
     staging: { host: "192.0.2.2", port: 9000, cameraId: "new-camera" },
   },
   media: {
-    entrance: { port: 554, streams: ["main", "sub"] },
+    entrance: { port: 554, streams: ["main", "sub", "third"] },
   },
   recordings: {
     temporaryDirectory: "/tmp", // null disables recorded-video playback
@@ -50,7 +50,7 @@ Replace the documentation address with a private IPv4 target from the installati
 | GET `/cameras/{id}/recordings/{recordingId}/preview` | `http.token` | JPEG keyframe preview. Optional offsetMs selects a position within the clip (0–86400000, one-second buckets). Search first to obtain the ID. Does not require a writable recording workspace. |
 | GET `/cameras/{id}/network/rtsp` | `http.token` | Read the camera's RTSP switch and port over Baichuan. Returns `{"supported":true,"enabled":false,"port":554}` on a camera with RTSP off. A camera without a readable switch returns `{"supported":false}`. |
 | PUT `/cameras/{id}/network/rtsp` | `http.token` | Send `{"enabled":true}` or `{"enabled":false}`. The bridge changes only RTSP, preserves the port, and reads the result back. The contract advertises these routes with `rtspSettings`. |
-| GET `/cameras/{id}/media/{stream}` | `http.token` | Bounded multipart MJPEG stream from H.264 or H.265 video. Each media profile accepts `transport` of `auto` (default), `rtsp` or `baichuan`. Auto tries RTSP/TCP first and uses Baichuan if RTSP fails to deliver a frame. FFmpeg receives encoded video bytes. Camera credentials stay at the bridge. |
+| GET `/cameras/{id}/media/{stream}` | `http.token` | Bounded multipart MJPEG stream from H.264 or H.265 video. Each media profile accepts `transport` of `auto` (default), `rtsp` or `baichuan`. For `main` and `sub`, auto tries RTSP/TCP first and uses Baichuan if RTSP fails to deliver a frame. Add `third` on cameras that support a third live profile. It uses the native Baichuan `externStream` and requires `auto` or `baichuan`. Each camera advertises only its configured streams. FFmpeg receives encoded video bytes. Camera credentials stay at the bridge. |
 | GET `/enrollment-targets` | `http.token` | Named targets and `addressLookup`, which advertises lookup of cameras declared in `cameras[]`. |
 | GET `/enrollment-targets/identify?address=<IPv4>&method=initialize` | `http.token` | Match the configured camera, sign in and read its UID, reported serial and model. An optional `port` selects its Baichuan port. Use `method=import` for an initialized camera. |
 | POST `/enrollments` | `http.token` | Reserve and begin a UUID operation with target, separate `uid` and/or `serial`, `method` (`initialize` or `import`), and `confirmation: true`. First-password setup requires a UID. For a configured camera, also send its returned `address` and `port`. When `/enrollment-targets` advertises `enableRtsp`, send optional `enableRtsp: true` to enable streaming after verified login. The `rtsp` result is `enabled`, `unsupported`, `failed` or `unverified`. Enrollment status is reported separately. Replaying the operation preserves subsequent manual RTSP edits. |

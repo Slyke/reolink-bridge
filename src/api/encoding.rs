@@ -6,13 +6,7 @@ use crate::{
 use roxmltree::Node;
 use serde::Serialize;
 
-#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum Stream {
-    Main,
-    Sub,
-    Third,
-}
+use crate::reolink::wire::LiveStream as Stream;
 impl Stream {
     fn element(self) -> &'static str {
         match self {
@@ -123,7 +117,10 @@ fn parse(current: &str, tables: &str, channel: u8) -> Result<Encoding> {
                 continue;
             }
             for table in group.children().filter(|n| n.has_tag_name("encodeTable")) {
-                if xml::value(table, "type") != Some(stream.element()) {
+                let kind = xml::value(table, "type");
+                if kind != Some(stream.element())
+                    && !(stream == Stream::Third && kind == Some("externStream"))
+                {
                     continue;
                 }
                 let Some(resolution) = xml::child(table, "resolution") else {
@@ -382,6 +379,22 @@ mod tests {
         let main = &enc.profiles[0];
         assert_eq!(main.options.len(), 1);
         assert!(enc.profiles[1].options.is_empty());
+        let with_third = raw.replace(
+            "</subStream>",
+            "</subStream><thirdStream><width>896</width><height>512</height></thirdStream>",
+        );
+        assert!(
+            parse(&with_third, &tables, 0).unwrap().profiles[2]
+                .options
+                .is_empty()
+        );
+        let third_tables = tables.replace("mainStream", "externStream");
+        assert_eq!(
+            parse(&with_third, &third_tables, 0).unwrap().profiles[2]
+                .options
+                .len(),
+            1
+        );
         let mut change = Change {
             stream: Stream::Main,
             settings: Values {

@@ -24,6 +24,24 @@ const SNAPSHOT: u32 = 109;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(18);
 const MAX_JPEG_BYTES: usize = 8 * 1024 * 1024;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveStream {
+    Main,
+    Sub,
+    Third,
+}
+
+impl LiveStream {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Sub => "sub",
+            Self::Third => "third",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Device {
     pub host: String,
@@ -160,16 +178,20 @@ impl Session {
     pub async fn preview(
         &mut self,
         channel: u8,
-        quality: super::recording_settings::Stream,
+        quality: LiveStream,
         start: bool,
     ) -> Result<Packet> {
         let command = if start { 3 } else { 4 };
         let extension =
             format!(r#"<Extension version="1.1"><channelId>{channel}</channelId></Extension>"#);
-        self.preview_type = u8::from(matches!(quality, super::recording_settings::Stream::Sub));
-        let handle = u16::from(self.preview_type) << 8;
+        let (packet_type, handle, name) = match quality {
+            LiveStream::Main => (0, 0, "mainStream"),
+            LiveStream::Sub => (1, 256, "subStream"),
+            LiveStream::Third => (0, 1024, "externStream"),
+        };
+        self.preview_type = packet_type;
         let stream = if start {
-            format!("<streamType>{}</streamType>", quality.tag())
+            format!("<streamType>{name}</streamType>")
         } else {
             String::new()
         };

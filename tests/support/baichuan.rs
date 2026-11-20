@@ -37,7 +37,7 @@ pub struct Camera {
     pub zoom: AtomicI32,
     pub motions: Mutex<Vec<(String, Option<u32>)>>,
     pub saved_presets: Mutex<BTreeMap<u32, String>>,
-    pub live_qualities: Mutex<Vec<u8>>,
+    pub live_qualities: Mutex<Vec<(u8, u16)>>,
     pub fail_next_stop: AtomicBool,
     pub jpeg: Option<Vec<u8>>,
     pub snapshot_requests: Mutex<Vec<tokio::time::Instant>>,
@@ -210,8 +210,14 @@ impl Camera {
             }
             socket.write_all(&reply).await?;
             if command == 3 && status == 200 {
-                let code = header[13];
-                self.live_qualities.lock().unwrap().push(code);
+                let request = roxmltree::Document::parse(std::str::from_utf8(&body[offset..])?)?;
+                let handle = field(&request, "handle")
+                    .ok_or_else(|| anyhow::anyhow!("missing preview handle"))?
+                    .parse()?;
+                self.live_qualities
+                    .lock()
+                    .unwrap()
+                    .push((header[13], handle));
                 for _ in 0..6 {
                     for chunk in self.recording.as_deref().unwrap().chunks(1100) {
                         header[8..12].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
@@ -302,7 +308,7 @@ impl Camera {
             }
             3 if self.recording.is_some() => {
                 let doc = roxmltree::Document::parse(body)?;
-                ensure!(matches!((field(&doc,"streamType"),field(&doc,"handle")), (Some("mainStream"),Some("0")) | (Some("subStream"),Some("256"))));
+                ensure!(matches!((field(&doc,"streamType"),field(&doc,"handle")), (Some("mainStream"),Some("0")) | (Some("subStream"),Some("256")) | (Some("externStream"),Some("1024"))));
                 String::new()
             }
             2 | 4 | 16 | 31 | 93 | 144 => String::new(),

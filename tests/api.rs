@@ -1399,7 +1399,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         "mqtt":{"url":format!("mqtt://127.0.0.1:{broker}"),"baseTopic":"fixture"},
         "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
         "cameras":[{"id":"fixture","host":"127.0.0.1","baichuanPort":bc,"onvifPort":null,"username":"admin","password":baichuan::PASSWORD,"eventTransport":"baichuan"}],
-        "api":{"media":{"fixture":{"port":free_port()?,"streams":["main","sub"]}},"previews":{"cache":thumbnail_cache},"recordings":{"temporaryDirectory":workspace,"cache":{"maxBytes":1_048_576,"ttlSeconds":2}}},
+        "api":{"media":{"fixture":{"port":free_port()?,"streams":["main","sub","third"]}},"previews":{"cache":thumbnail_cache},"recordings":{"temporaryDirectory":workspace,"cache":{"maxBytes":1_048_576,"ttlSeconds":2}}},
         "logging":{"sinks":{"console":{"enabled":false},"file":{"enabled":true,"format":"json","path":log_file}}}
     }).to_string())?;
     let client = Client::builder()
@@ -1408,7 +1408,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         .build()?;
     let mut bridge = start(&config, &client, &origin).await?;
     discovered(&client, &format!("{origin}/api/inventory")).await;
-    for quality in ["main", "sub"] {
+    for quality in ["main", "sub", "third"] {
         let mut live = client
             .get(format!("{origin}/api/cameras/fixture/media/{quality}"))
             .bearer_auth(PRIMARY)
@@ -1424,7 +1424,10 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
             first.starts_with(b"--reolink-frame") && first.windows(3).any(|p| p == b"\xff\xd8\xff")
         );
     }
-    assert_eq!(&*camera.live_qualities.lock().unwrap(), &[0, 1]);
+    assert_eq!(
+        &*camera.live_qualities.lock().unwrap(),
+        &[(0, 0), (1, 256), (0, 1024)]
+    );
     let gallery = format!("{origin}/api/cameras/fixture/time-lapse/photos");
     let listing = format!("{gallery}?date=2026-11-17&from=11:00:00&to=11:59:59");
     assert_eq!(response(&client, &listing, "wrong", None).await.0, 401);

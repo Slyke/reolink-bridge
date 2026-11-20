@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use axum::{
     Extension, Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection},
@@ -184,16 +184,15 @@ impl Api {
                 .all(|(camera, id)| configured.contains(camera) && id.valid()),
             "invalid API rotation binding"
         );
-        ensure!(
-            config
-                .media
-                .iter()
-                .all(
-                    |(id, profile)| (configured.contains(id) || target_ids.contains(id))
-                        && profile.valid()
-                ),
-            "invalid API media profile"
-        );
+        for (id, profile) in &config.media {
+            ensure!(
+                configured.contains(id) || target_ids.contains(id),
+                "unknown camera in API media profile"
+            );
+            profile
+                .validate()
+                .with_context(|| format!("invalid API media profile for {id}"))?;
+        }
 
         ensure!(
             config.previews.cameras.iter().all(|(id, profile)| {

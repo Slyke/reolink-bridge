@@ -7,7 +7,7 @@ use serde_json::json;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use super::wire::{Device, le_u32};
+use super::wire::{Device, LiveStream, le_u32};
 use crate::{
     hub::Hub,
     model::{Bounds, Event, Object, Observation, reolink_timestamp},
@@ -22,7 +22,7 @@ pub async fn run(device: &Device, id: &str, hub: &Hub, stop: &CancellationToken)
         result = device.connect() => result?,
     };
     let first = session
-        .preview(device.channel, super::recording_settings::Stream::Sub, true)
+        .preview(device.channel, LiveStream::Sub, true)
         .await?;
     let mut buffer = BytesMut::new();
     let mut video_dimensions = None;
@@ -88,11 +88,7 @@ pub async fn run(device: &Device, id: &str, hub: &Hub, stop: &CancellationToken)
     }.await;
     let _ = timeout(
         Duration::from_secs(2),
-        session.preview(
-            device.channel,
-            super::recording_settings::Stream::Sub,
-            false,
-        ),
+        session.preview(device.channel, LiveStream::Sub, false),
     )
     .await;
     session.logout().await;
