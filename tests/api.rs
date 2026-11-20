@@ -1141,6 +1141,60 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     assert_eq!(change_clock(manual).await?.status(), 200);
     assert!(!camera.clock_ntp.load(Ordering::SeqCst));
 
+    let saved_clock = *camera.clock.lock().unwrap();
+    let saved_dst = camera.clock_dst.lock().unwrap().clone().unwrap();
+    let ntp_only = change_clock(json!({"ntpEnabled":true})).await?;
+    assert_eq!(ntp_only.status(), 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&ntp_only.text().await?)?["settings"],
+        json!({"utcOffsetMinutes":-420,"daylightSavingEnabled":false,"ntpEnabled":true})
+    );
+    assert_eq!(*camera.clock_dst.lock().unwrap(), Some(saved_dst.clone()));
+    let dst_only = change_clock(json!({"daylightSavingEnabled":true})).await?;
+    assert_eq!(dst_only.status(), 200);
+    assert_eq!(
+        *camera.clock_dst.lock().unwrap(),
+        Some(saved_dst.replace("<enable>0</enable>", "<enable>1</enable>"))
+    );
+    let read = response(&client, &clock, PRIMARY, None).await.1;
+    assert_eq!(
+        read["editableOptions"],
+        json!(["daylightSavingEnabled", "ntpEnabled"])
+    );
+    assert_eq!(
+        read["settings"],
+        json!({"utcOffsetMinutes":-420,"daylightSavingEnabled":true,"ntpEnabled":true})
+    );
+    assert_eq!(
+        change_clock(json!({"daylightSavingEnabled":false,"ntpEnabled":false}))
+            .await?
+            .status(),
+        200
+    );
+    assert_eq!(*camera.clock_dst.lock().unwrap(), Some(saved_dst));
+    assert_eq!(*camera.clock.lock().unwrap(), saved_clock);
+    assert_eq!(*camera.clock_zone_west.lock().unwrap(), Some(25200));
+    for invalid in [
+        json!({}),
+        json!({"timeZone":fixed}),
+        json!({"cameraTime":"wrong","ntpEnabled":false}),
+        json!({"cameraTime":"2028-02-29T20:47:06","daylightSavingEnabled":true}),
+    ] {
+        assert_eq!(change_clock(invalid).await?.status(), 422);
+    }
+    camera.reject_read_command.store(106, Ordering::SeqCst);
+    assert_eq!(
+        response(&client, &clock, PRIMARY, None).await.1["editableOptions"],
+        json!(["ntpEnabled"])
+    );
+    assert_eq!(
+        change_clock(json!({"daylightSavingEnabled":true,"ntpEnabled":true}))
+            .await?
+            .status(),
+        422
+    );
+    assert!(!camera.clock_ntp.load(Ordering::SeqCst));
+    camera.reject_read_command.store(0, Ordering::SeqCst);
     for fault in [&camera.forget_clock_on_login, &camera.freeze_clock] {
         fault.store(true, Ordering::SeqCst);
         let result = change_clock(json!({"cameraTime":"2028-02-29T22:47:06"})).await?;

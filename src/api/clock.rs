@@ -85,10 +85,20 @@ impl Reading {
     fn matches(&self, change: &Change) -> bool {
         change.time_zone.as_ref().is_none_or(|zone| {
             self.utc_offset == Some(zone.utc_offset_minutes) && self.same_dst(zone)
-        }) && change.ntp_enabled.is_none_or(|ntp| self.ntp == Some(ntp))
+        }) && change
+            .daylight_saving_enabled
+            .is_none_or(|enabled| self.dst_enabled == Some(enabled))
+            && change.ntp_enabled.is_none_or(|ntp| self.ntp == Some(ntp))
     }
     fn json(&self) -> Value {
-        json!({"cameraTime":self.time.map(|v|v.format(FORMAT).to_string()),"settings":{
+        let editable: Vec<_> = [
+            ("daylightSavingEnabled", self.dst_enabled),
+            ("ntpEnabled", self.ntp),
+        ]
+        .into_iter()
+        .filter_map(|(name, state)| state.map(|_| name))
+        .collect();
+        json!({"cameraTime":self.time.map(|v|v.format(FORMAT).to_string()),"editableOptions":editable,"settings":{
             "utcOffsetMinutes":self.utc_offset,"daylightSavingEnabled":self.dst_enabled,"ntpEnabled":self.ntp}})
     }
 }
@@ -100,9 +110,9 @@ fn set_general(time: NaiveDateTime, zone: Option<&Zone>) -> String {
     });
     format!(r#"<body><SystemGeneral version="1.1">{offset}{wall}</SystemGeneral></body>"#)
 }
-fn set_ntp(enabled: bool) -> String {
+fn set_switch(section: &str, enabled: bool) -> String {
     format!(
-        r#"<body><Ntp version="1.1"><enable>{}</enable></Ntp></body>"#,
+        r#"<body><{section} version="1.1"><enable>{}</enable></{section}></body>"#,
         u8::from(enabled)
     )
 }
@@ -140,26 +150,28 @@ pub(super) async fn get(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Change {
-    camera_time: String,
+    camera_time: Option<String>,
     time_zone: Option<Zone>,
+    daylight_saving_enabled: Option<bool>,
     ntp_enabled: Option<bool>,
 }
 
 async fn apply(
     session: &mut Session,
     change: &Change,
-    requested: NaiveDateTime,
+    requested: Option<NaiveDateTime>,
 ) -> Result<(), &'static str> {
     let current = Reading::read(session)
         .await
         .map_err(|_| "API_CLOCK_READ_FAILED")?;
     let current_time = current.time.ok_or("API_CLOCK_UNSUPPORTED")?;
     if change.time_zone.is_some() && (current.utc_offset.is_none() || current.dst_enabled.is_none())
+        || change.daylight_saving_enabled.is_some() && current.dst_enabled.is_none()
         || change.ntp_enabled.is_some() && current.ntp.is_none()
     {
         return Err("API_CLOCK_UNSUPPORTED");
     }
-    let change_time = !confirmed(current_time, requested, Duration::ZERO);
+    let change_time = requested.is_some_and(|time| !confirmed(current_time, time, Duration::ZERO));
     if change_time && change.time_zone.is_none() && change.ntp_enabled.or(current.ntp) == Some(true)
     {
         return Err("API_CLOCK_NTP_ACTIVE");
@@ -167,7 +179,7 @@ async fn apply(
     let change_ntp = change.ntp_enabled.is_some() && change.ntp_enabled != current.ntp;
     let mut updates = Vec::new();
     if change_ntp && change.ntp_enabled == Some(false) {
-        updates.push((39, set_ntp(false)));
+        updates.push((39, set_switch("Ntp", false)));
     }
     if let Some(zone) = change
         .time_zone
@@ -175,16 +187,20 @@ async fn apply(
         .filter(|zone| !current.same_dst(zone))
     {
         updates.push((107, zone.dst_xml()));
-    }
-    if change_time
-        || change.time_zone.as_ref().is_some_and(|zone| {
-            current.utc_offset != Some(zone.utc_offset_minutes) || !current.same_dst(zone)
-        })
+    } else if let Some(enabled) = change
+        .daylight_saving_enabled
+        .filter(|value| current.dst_enabled != Some(*value))
     {
-        updates.push((105, set_general(requested, change.time_zone.as_ref())));
+        updates.push((107, set_switch("Dst", enabled)));
+    }
+    let change_zone = change.time_zone.as_ref().is_some_and(|zone| {
+        current.utc_offset != Some(zone.utc_offset_minutes) || !current.same_dst(zone)
+    });
+    if let Some(time) = requested.filter(|_| change_time || change_zone) {
+        updates.push((105, set_general(time, change.time_zone.as_ref())));
     }
     if change_ntp && change.ntp_enabled == Some(true) {
-        updates.push((39, set_ntp(true)));
+        updates.push((39, set_switch("Ntp", true)));
     }
     for (index, (command, xml)) in updates.into_iter().enumerate() {
         session.command(command, None, &xml).await.map_err(|err| {
@@ -211,11 +227,18 @@ pub(super) async fn set(
     let Ok(Json(change)) = body else {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "API_CLOCK_INVALID", &cid);
     };
-    let Some(requested) = parse_clock(&change.camera_time)
-        .filter(|_| change.time_zone.as_ref().is_none_or(Zone::valid))
-    else {
-        return error(StatusCode::UNPROCESSABLE_ENTITY, "API_CLOCK_INVALID", &cid);
+    let requested = change.camera_time.as_deref().and_then(parse_clock);
+    let valid = if change.camera_time.is_some() {
+        requested.is_some()
+            && change.daylight_saving_enabled.is_none()
+            && change.time_zone.as_ref().is_none_or(Zone::valid)
+    } else {
+        change.time_zone.is_none()
+            && (change.daylight_saving_enabled.is_some() || change.ntp_enabled.is_some())
     };
+    if !valid {
+        return error(StatusCode::UNPROCESSABLE_ENTITY, "API_CLOCK_INVALID", &cid);
+    }
     let Some(device) = api.devices.get(&id) else {
         return error(StatusCode::NOT_FOUND, "API_CLOCK_UNSUPPORTED", &cid);
     };
@@ -237,8 +260,15 @@ pub(super) async fn set(
         let mut reader = device.connect().await.map_err(|_| "API_CLOCK_UNVERIFIED")?;
         let verification = async {
             let mut fresh = Reading::read(&mut reader).await.ok()?;
+            if !fresh.matches(&change) {
+                return None;
+            }
+            // DST and NTP can legitimately move the clock when their switches change.
+            let Some(requested) = requested else {
+                return Some(fresh);
+            };
             let first = fresh.time?;
-            if !fresh.matches(&change) || !confirmed(first, requested, start.elapsed()) {
+            if !confirmed(first, requested, start.elapsed()) {
                 return None;
             }
             tokio::time::sleep(Duration::from_millis(1100)).await;

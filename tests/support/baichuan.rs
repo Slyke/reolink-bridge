@@ -391,8 +391,16 @@ impl Camera {
             106 => self.clock_dst.lock().unwrap().clone().unwrap_or_else(||"<body><Dst><enable>0</enable></Dst></body>".into()),
             107 => {
                 let doc=roxmltree::Document::parse(body)?;
-                ensure!(doc.descendants().any(|n|n.has_tag_name("Dst")));
-                *self.clock_dst.lock().unwrap()=Some(body[doc.root_element().range()].to_owned());
+                let dst=doc.descendants().find(|n|n.has_tag_name("Dst")).unwrap();
+                let mut saved=self.clock_dst.lock().unwrap();
+                let previous=saved.as_deref().unwrap_or("<body><Dst><enable>0</enable></Dst></body>");
+                if dst.children().filter(|n|n.is_element()).count()==1 {
+                    let old=roxmltree::Document::parse(previous)?;
+                    let old_switch=old.descendants().find(|n|n.has_tag_name("enable")).unwrap().range();
+                    let mut result=previous.to_string();
+                    result.replace_range(old_switch,&format!("<enable>{}</enable>",field(&doc,"enable").unwrap()));
+                    *saved=Some(result);
+                } else { *saved=Some(body[doc.root_element().range()].to_owned()); }
                 String::new()
             }
             38 => format!("<body><Ntp><enable>{}</enable><server>fixture.example</server><port>123</port></Ntp></body>",u8::from(self.clock_ntp.load(Ordering::SeqCst))),
