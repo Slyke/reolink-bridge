@@ -40,6 +40,19 @@ pub fn escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Patch scalar elements without reserializing the rest of a device configuration.
+pub fn replace_nodes(root: Node<'_, '_>, mut replacements: Vec<(Node<'_, '_>, String)>) -> String {
+    let range = root.range();
+    let start = range.start;
+    let mut body = root.document().input_text()[range].to_owned();
+    replacements.sort_by_key(|(node, _)| std::cmp::Reverse(node.range().start));
+    for (node, replacement) in replacements {
+        let range = node.range();
+        body.replace_range(range.start - start..range.end - start, &replacement);
+    }
+    body
+}
+
 pub fn sensitive(name: &str) -> bool {
     let key: String = name
         .chars()

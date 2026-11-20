@@ -145,18 +145,6 @@ fn element<'i>(node: Node<'_, 'i>) -> &'i str {
     &node.document().input_text()[node.range()]
 }
 
-// Keep unknown fields, indexed alarm rules and existing task metadata when changing device XML.
-fn replace_nodes(root: Node<'_, '_>, replacements: Vec<(Node<'_, '_>, String)>) -> String {
-    let start = root.range().start;
-    let mut body = element(root).to_owned();
-    let mut replacements = replacements;
-    replacements.sort_by_key(|(node, _)| std::cmp::Reverse(node.range().start));
-    for (node, replacement) in replacements {
-        let range = node.range();
-        body.replace_range(range.start - start..range.end - start, &replacement);
-    }
-    body
-}
 fn with_fields(root: Node<'_, '_>, fields: Vec<(&str, String)>) -> Result<String> {
     let mut replacements = Vec::new();
     let mut extra = String::new();
@@ -168,7 +156,7 @@ fn with_fields(root: Node<'_, '_>, fields: Vec<(&str, String)>) -> Result<String
             extra.push_str(&value);
         }
     }
-    let mut patched = replace_nodes(root, replacements);
+    let mut patched = xml::replace_nodes(root, replacements);
     if !extra.is_empty() {
         if patched.ends_with("/>") {
             patched.truncate(patched.len() - 2);
@@ -305,7 +293,7 @@ impl ScheduleChange {
             let hours = String::from_utf8(bytes)?;
             edits.push((table, format!("<valueTable>{hours}</valueTable>")));
         }
-        Ok(replace_nodes(node, edits))
+        Ok(xml::replace_nodes(node, edits))
     }
 }
 
@@ -363,7 +351,7 @@ impl LapseChange {
                 }
             }
             if let Some(i) = item {
-                let patched = replace_nodes(node, vec![(i, updated)]);
+                let patched = xml::replace_nodes(node, vec![(i, updated)]);
                 let doc = xml::document(&patched)?;
                 return with_fields(doc.root_element(), top);
             }

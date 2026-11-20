@@ -133,7 +133,7 @@ enum Problem {
     Invalid,
     Unsupported,
     Read,
-    Rejected,
+    Rejected(u16),
     Unverified,
 }
 impl Problem {
@@ -142,7 +142,7 @@ impl Problem {
             Self::Invalid => (StatusCode::UNPROCESSABLE_ENTITY, "API_DISPLAY_INVALID"),
             Self::Unsupported => (StatusCode::UNPROCESSABLE_ENTITY, "API_DISPLAY_UNSUPPORTED"),
             Self::Read => (StatusCode::BAD_GATEWAY, "API_DISPLAY_READ_FAILED"),
-            Self::Rejected => (StatusCode::UNPROCESSABLE_ENTITY, "API_DISPLAY_REJECTED"),
+            Self::Rejected(_) => (StatusCode::UNPROCESSABLE_ENTITY, "API_DISPLAY_REJECTED"),
             Self::Unverified => (StatusCode::BAD_GATEWAY, "API_DISPLAY_UNVERIFIED"),
         };
         error(status, key, cid)
@@ -152,22 +152,31 @@ type Fields = Map<String, Value>;
 
 type DisplayResult<T> = std::result::Result<T, Problem>;
 
+fn overlay_for(group: Node<'_, '_>, channel: u8) -> bool {
+    matches!(group.tag_name().name(), NAME | TIME)
+        && xml::child(group, "channelId")
+            .and_then(xml::text)
+            .and_then(|id| id.parse::<u8>().ok())
+            == Some(channel)
+}
+
 fn parse(raw: &str, channel: u8, general: bool) -> DisplayResult<Fields> {
     let doc = xml::document(raw).map_err(|_| Problem::Read)?;
     let mut fields = Fields::new();
-    for group in doc.root_element().children().filter(Node::is_element) {
+    let matches = |group: &Node<'_, '_>| {
+        if general {
+            group.has_tag_name(GENERAL)
+        } else {
+            overlay_for(*group, channel)
+        }
+    };
+    for group in doc
+        .root_element()
+        .children()
+        .filter(Node::is_element)
+        .filter(matches)
+    {
         let tag = group.tag_name().name();
-        if general != (tag == GENERAL) {
-            continue;
-        }
-        if !general
-            && xml::child(group, "channelId")
-                .and_then(xml::text)
-                .and_then(|id| id.parse::<u8>().ok())
-                != Some(channel)
-        {
-            continue;
-        }
         for field in FIELDS.iter().filter(|field| field.group == tag) {
             if let Some(node) = xml::child(group, field.tag)
                 && let Some(value) = field.decode(node.text().unwrap_or(""))
@@ -179,8 +188,8 @@ fn parse(raw: &str, channel: u8, general: bool) -> DisplayResult<Fields> {
     Ok(fields)
 }
 
-async fn read(session: &mut Session, channel: u8, general: bool) -> DisplayResult<Fields> {
-    let raw = match session
+async fn read_raw(session: &mut Session, channel: u8, general: bool) -> DisplayResult<String> {
+    match session
         .command(
             if general { 104 } else { 44 },
             (!general).then_some(channel),
@@ -188,11 +197,18 @@ async fn read(session: &mut Session, channel: u8, general: bool) -> DisplayResul
         )
         .await
     {
-        Ok(raw) => raw,
-        Err(e) if e.is::<Rejected>() => return Ok(Fields::new()),
-        Err(_) => return Err(Problem::Read),
-    };
-    parse(&raw, channel, general)
+        Ok(raw) => Ok(raw),
+        Err(e) if e.is::<Rejected>() => Ok("<body/>".into()),
+        Err(_) => Err(Problem::Read),
+    }
+}
+
+async fn read(session: &mut Session, channel: u8, general: bool) -> DisplayResult<Fields> {
+    parse(
+        &read_raw(session, channel, general).await?,
+        channel,
+        general,
+    )
 }
 
 #[derive(Deserialize)]
@@ -217,35 +233,58 @@ impl Change {
         Ok(general)
     }
 
-    fn body(&self, current: &Fields, channel: u8) -> DisplayResult<Option<String>> {
+    fn body(
+        &self,
+        current: &Fields,
+        raw: &str,
+        channel: u8,
+        general: bool,
+    ) -> DisplayResult<Option<String>> {
         if self.fields.keys().any(|key| !current.contains_key(key)) {
             return Err(Problem::Unsupported);
         }
-        let mut groups = String::new();
-        for group in [GENERAL, NAME, TIME] {
-            let mut tags = String::new();
-            for field in FIELDS.iter().filter(|f| f.group == group) {
-                if let Some(value) = self.fields.get(field.key)
-                    && current.get(field.key) != Some(value)
-                {
-                    let encoded = field.encode(value).ok_or(Problem::Invalid)?;
-                    let tag = field.tag;
-                    tags.push_str(&format!("<{tag}>{encoded}</{tag}>"));
-                }
-            }
-            if !tags.is_empty() {
-                let target = if group == GENERAL {
-                    String::new()
-                } else {
-                    format!("<channelId>{channel}</channelId>")
-                };
-                groups.push_str(&format!(
-                    r#"<{group} version="1.1">{target}{tags}</{group}>"#
-                ));
+        let mut edits = Vec::new();
+        for field in FIELDS {
+            if let Some(value) = self.fields.get(field.key)
+                && current.get(field.key) != Some(value)
+            {
+                let value = field.encode(value).ok_or(Problem::Invalid)?;
+                let tag = field.tag;
+                edits.push((field, format!("<{tag}>{value}</{tag}>")));
             }
         }
-        // These setters accept partial fields. Replaying the full SystemGeneral read would also set the camera clock.
-        Ok((!groups.is_empty()).then(|| format!("<body>{groups}</body>")))
+        if edits.is_empty() {
+            return Ok(None);
+        }
+        if general {
+            // The general read also contains the clock and login policy; only send edited general fields.
+            let tags: String = edits.into_iter().map(|(_, element)| element).collect();
+            return Ok(Some(format!(
+                r#"<body><SystemGeneral version="1.1">{tags}</SystemGeneral></body>"#
+            )));
+        }
+
+        // Command 45 takes the channel-name and date/time blocks together. Preserve the
+        // camera's layout, including position values outside the editable API range.
+        let doc = xml::document(raw).map_err(|_| Problem::Read)?;
+        let mut body = String::from("<body>");
+        for group in doc
+            .root_element()
+            .children()
+            .filter(Node::is_element)
+            .filter(|g| overlay_for(*g, channel))
+        {
+            let mut replacements = Vec::new();
+            for (field, element) in &edits {
+                if field.group == group.tag_name().name() {
+                    let node = xml::child(group, field.tag).ok_or(Problem::Unsupported)?;
+                    replacements.push((node, element.clone()));
+                }
+            }
+            body.push_str(&xml::replace_nodes(group, replacements));
+        }
+        body.push_str("</body>");
+        Ok(Some(body))
     }
 }
 
@@ -326,8 +365,9 @@ pub(super) async fn set(
     let work = async {
         let mut session = device.connect().await.map_err(|_| Problem::Read)?;
         let result = async {
-            let current = read(&mut session, device.channel, general).await?;
-            let Some(body) = change.body(&current, device.channel)? else {
+            let raw = read_raw(&mut session, device.channel, general).await?;
+            let current = parse(&raw, device.channel, general)?;
+            let Some(body) = change.body(&current, &raw, device.channel, general)? else {
                 return Ok(current);
             };
             session
@@ -338,11 +378,10 @@ pub(super) async fn set(
                 )
                 .await
                 .map_err(|e| {
-                    if e.is::<Rejected>() {
-                        Problem::Rejected
-                    } else {
-                        Problem::Unverified
-                    }
+                    e.downcast_ref::<Rejected>()
+                        .map_or(Problem::Unverified, |rejection| {
+                            Problem::Rejected(rejection.status())
+                        })
                 })?;
             let after = read(&mut session, device.channel, general)
                 .await
@@ -370,6 +409,16 @@ pub(super) async fn set(
             Json(json!({"outcome":"confirmed","fields":fields,"correlation_id":cid.0}))
                 .into_response()
         }
+        Err(Problem::Rejected(status)) => {
+            let command = if general { 105 } else { 45 };
+            let mut report = api.hub().diagnostics.error(
+                "api::display::set", "API_DISPLAY_REJECTED", Some(cid.0.clone()),
+                json!({"cameraId":id, "channel":device.channel, "command":command, "cameraStatus":status,
+                    "requestedFields":change.fields.keys().collect::<Vec<_>>(), "httpStatus":422}), None,
+            );
+            report["cameraStatus"] = json!(status);
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(report)).into_response()
+        }
         Err(problem) => problem.response(&cid),
     }
 }
@@ -378,7 +427,7 @@ pub(super) async fn set(
 mod tests {
     use super::*;
     #[test]
-    fn display_writes_only_the_selected_reported_fields_on_the_matching_channel() {
+    fn display_changes_preserve_the_channel_layout_and_keep_general_writes_partial() {
         let xml = r#"<body><OsdChannelName><channelId>1</channelId><name>Other</name></OsdChannelName><OsdChannelName><channelId>0</channelId><name>Entry</name><enWatermark>1</enWatermark></OsdChannelName></body>"#;
         let fields = parse(xml, 0, false).unwrap();
         assert_eq!(fields["name"], "Entry");
@@ -389,19 +438,45 @@ mod tests {
                 .clone(),
         };
         assert!(!change.general().unwrap());
-        let out = change.body(&fields, 0).unwrap().unwrap();
+        let out = change.body(&fields, xml, 0, false).unwrap().unwrap();
         assert!(
             out.contains("<channelId>0</channelId>")
                 && out.contains("<enWatermark>0</enWatermark>")
                 && out.contains("A &amp; B")
         );
-        let current=parse("<body><SystemGeneral><deviceName>old</deviceName><year>2026</year><osdFormat>DMY</osdFormat></SystemGeneral></body>",0,true).unwrap();
+        assert!(!out.contains("Other"));
+        let original = r#"<body><OsdChannelName version="1.2"><channelId>0</channelId><name>A &amp; B</name><enWatermark>1</enWatermark><enBgcolor>0</enBgcolor></OsdChannelName><OsdDatetime version="1.0"><channelId>0</channelId><topLeftX>-32768</topLeftX><language>English</language><extra>untouched</extra></OsdDatetime></body>"#;
+        let toggles = Change {
+            fields: json!({"watermark":false,"background":true})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let before = parse(original, 0, false).unwrap();
+        let saved = toggles.body(&before, original, 0, false).unwrap().unwrap();
+        assert_eq!(
+            saved,
+            original
+                .replace("<enWatermark>1", "<enWatermark>0")
+                .replace("<enBgcolor>0", "<enBgcolor>1")
+        );
+        assert!(
+            toggles
+                .body(&parse(&saved, 0, false).unwrap(), &saved, 0, false)
+                .unwrap()
+                .is_none()
+        );
+        let general_raw = "<body><SystemGeneral><deviceName>old</deviceName><year>2026</year><osdFormat>DMY</osdFormat></SystemGeneral></body>";
+        let current = parse(general_raw, 0, true).unwrap();
         let rename = Change {
             fields: json!({"deviceName":"new"}).as_object().unwrap().clone(),
         };
         assert!(rename.general().unwrap());
         assert_eq!(
-            rename.body(&current, 0).unwrap().unwrap(),
+            rename
+                .body(&current, general_raw, 0, true)
+                .unwrap()
+                .unwrap(),
             r#"<body><SystemGeneral version="1.1"><deviceName>new</deviceName></SystemGeneral></body>"#
         );
     }

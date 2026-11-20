@@ -52,6 +52,8 @@ pub struct Camera {
     pub wifi_xml: Mutex<Option<String>>,
     pub encoder_fps: Mutex<Option<u32>>,
     pub clock_xml: Mutex<Option<String>>,
+    pub display_xml: Mutex<Option<String>>,
+    pub reject_display: AtomicBool,
     pub time_lapse_xml: Mutex<Option<String>>,
     pub credential_writes: AtomicUsize,
     pub block_after_write: AtomicBool,
@@ -304,6 +306,22 @@ impl Camera {
             117 => {
                 let doc = roxmltree::Document::parse(body)?;
                 *self.wifi_xml.lock().unwrap() = Some(body[doc.root_element().range()].to_owned());
+                String::new()
+            }
+            44 => self.display_xml.lock().unwrap().clone().unwrap_or_else(|| r#"<body><OsdChannelName version="1.1"><channelId>0</channelId><name>Fixture overlay</name><enable>1</enable><topLeftX>65536</topLeftX><topLeftY>65536</topLeftY><enWatermark>1</enWatermark><enBgcolor>0</enBgcolor></OsdChannelName><OsdDatetime version="1.1"><channelId>0</channelId><enable>1</enable><topLeftX>-32768</topLeftX><topLeftY>1</topLeftY><width>0</width><height>0</height><language>English</language></OsdDatetime></body>"#.into()),
+            45 => {
+                let doc = roxmltree::Document::parse(body)?;
+                let root = doc.root_element();
+                let complete = |tag: &str, fields: &[&str]| root.children().find(|n| n.has_tag_name(tag))
+                    .is_some_and(|group| fields.iter().all(|f| group.children().any(|n| n.has_tag_name(*f))));
+                if !complete("OsdChannelName", &["channelId","name","enable","topLeftX","topLeftY","enWatermark","enBgcolor"])
+                    || !complete("OsdDatetime", &["channelId","enable","topLeftX","topLeftY","width","height","language"]) {
+                    return Ok((400, String::new()));
+                }
+                if self.reject_display.swap(false, Ordering::SeqCst) {
+                    return Ok((403, String::new()));
+                }
+                *self.display_xml.lock().unwrap() = Some(body[root.range()].to_owned());
                 String::new()
             }
             3 if self.recording.is_some() => {

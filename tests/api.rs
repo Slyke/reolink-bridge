@@ -1408,6 +1408,52 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         .build()?;
     let mut bridge = start(&config, &client, &origin).await?;
     discovered(&client, &format!("{origin}/api/inventory")).await;
+    let display = format!("{origin}/api/cameras/fixture/display");
+    let save_overlay = |fields: Value| {
+        client
+            .put(&display)
+            .bearer_auth(PRIMARY)
+            .header("content-type", "application/json")
+            .body(json!({"fields":fields}).to_string())
+            .send()
+    };
+    let saved = save_overlay(json!({"watermark":false,"background":true})).await?;
+    assert_eq!(saved.status(), 200);
+    let result: Value = serde_json::from_slice(&saved.bytes().await?)?;
+    assert_eq!(result["outcome"], "confirmed");
+    assert_eq!(result["fields"]["watermark"], false);
+    assert_eq!(result["fields"]["background"], true);
+    assert_eq!(result["fields"]["name"], "Fixture overlay");
+    camera.reject_display.store(true, Ordering::SeqCst);
+    let rejected = save_overlay(json!({"watermark":true})).await?;
+    assert_eq!(rejected.status(), 422);
+    let rejected: Value = serde_json::from_slice(&rejected.bytes().await?)?;
+    assert_eq!(rejected["errorKey"], "API_DISPLAY_REJECTED");
+    assert_eq!(rejected["cameraStatus"], 403);
+    let failure_id = rejected["correlation_id"]
+        .as_str()
+        .context("display reference")?;
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        let logs = std::fs::read_to_string(&log_file).unwrap_or_default();
+        if let Some(entry) = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|line| line["correlationId"] == failure_id)
+        {
+            assert_eq!(entry["context"]["cameraId"], "fixture");
+            assert_eq!(entry["context"]["command"], 45);
+            assert_eq!(entry["context"]["cameraStatus"], 403);
+            assert_eq!(entry["context"]["requestedFields"], json!(["watermark"]));
+            assert!(!entry.to_string().contains("Fixture overlay"));
+            break;
+        }
+        ensure!(
+            Instant::now() < until,
+            "missing correlated display rejection"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
     for quality in ["main", "sub", "third"] {
         let mut live = client
             .get(format!("{origin}/api/cameras/fixture/media/{quality}"))

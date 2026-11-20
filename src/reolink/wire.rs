@@ -56,6 +56,12 @@ pub struct Rejected {
     command: u32,
     status: u16,
 }
+impl Rejected {
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+}
+
 impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
