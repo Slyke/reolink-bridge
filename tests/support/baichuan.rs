@@ -54,7 +54,12 @@ pub struct Camera {
     pub rtsp_writes: AtomicUsize,
     pub wifi_xml: Mutex<Option<String>>,
     pub encoder_fps: Mutex<Option<u32>>,
-    pub clock_xml: Mutex<Option<String>>,
+    pub clock: Mutex<Option<(chrono::NaiveDateTime, std::time::Instant)>>,
+    pub clock_zone_west: Mutex<Option<i32>>,
+    pub clock_dst: Mutex<Option<String>>,
+    pub clock_ntp: AtomicBool,
+    pub forget_clock_on_login: AtomicBool,
+    pub freeze_clock: AtomicBool,
     pub display_xml: Mutex<Option<String>>,
     pub reject_display: AtomicBool,
     pub time_lapse_xml: Mutex<Option<String>>,
@@ -127,6 +132,9 @@ impl Camera {
                     !self.block_login.load(Ordering::SeqCst)
                         && std::str::from_utf8(&body)?.contains(&expected[..31])
                 );
+                if self.forget_clock_on_login.load(Ordering::SeqCst) {
+                    *self.clock.lock().unwrap() = None;
+                }
                 logged_in = true;
                 (200, String::new())
             } else {
@@ -358,13 +366,41 @@ impl Camera {
                 *self.encoder_fps.lock().unwrap()=Some(field(&doc,"frame").unwrap().parse()?);
                 String::new()
             }
-            104=>self.clock_xml.lock().unwrap().clone().unwrap_or_else(||"<body><SystemGeneral><year>2026</year><month>11</month><day>17</day><hour>12</hour><minute>30</minute><second>00</second></SystemGeneral></body>".into()),
-            105=>{
+            104 => {
+                let clock = *self.clock.lock().unwrap();
+                let time = match clock {
+                    Some((time,start)) if !self.freeze_clock.load(Ordering::SeqCst) => time + chrono::Duration::seconds(start.elapsed().as_secs() as i64),
+                    Some((time,_)) => time,
+                    None => chrono::NaiveDate::from_ymd_opt(2026,11,17).unwrap().and_hms_opt(12,30,0).unwrap(),
+                };
+                let date = time.format("<year>%Y</year><month>%m</month><day>%d</day><hour>%H</hour><minute>%M</minute><second>%S</second>");
+                let west=self.clock_zone_west.lock().unwrap().unwrap_or(28800);
+                format!("<body><SystemGeneral>{date}<timeZone>{west}</timeZone></SystemGeneral></body>")
+            }
+            105 => {
                 let doc=roxmltree::Document::parse(body)?;
                 let general=doc.descendants().find(|n|n.has_tag_name("SystemGeneral")).unwrap();
-                ensure!(general.children().filter(|n|n.is_element()).count()==6);
-                for name in ["year","month","day","hour","minute","second"] {ensure!(field(&doc,name).is_some());}
-                *self.clock_xml.lock().unwrap()=Some(body[doc.root_element().range()].to_owned());
+                let timestamp=["year","month","day","hour","minute","second"].map(|name|field(&doc,name).unwrap()).join("-");
+                let time=chrono::NaiveDateTime::parse_from_str(&timestamp,"%Y-%m-%d-%H-%M-%S")?;
+                let zone=field(&doc,"timeZone");
+                ensure!(general.children().filter(|n|n.is_element()).count()==6+usize::from(zone.is_some()));
+                if let Some(west)=zone {*self.clock_zone_west.lock().unwrap()=Some(west.parse()?);}
+                *self.clock.lock().unwrap()=Some((time,std::time::Instant::now()));
+                String::new()
+            }
+            106 => self.clock_dst.lock().unwrap().clone().unwrap_or_else(||"<body><Dst><enable>0</enable></Dst></body>".into()),
+            107 => {
+                let doc=roxmltree::Document::parse(body)?;
+                ensure!(doc.descendants().any(|n|n.has_tag_name("Dst")));
+                *self.clock_dst.lock().unwrap()=Some(body[doc.root_element().range()].to_owned());
+                String::new()
+            }
+            38 => format!("<body><Ntp><enable>{}</enable><server>fixture.example</server><port>123</port></Ntp></body>",u8::from(self.clock_ntp.load(Ordering::SeqCst))),
+            39 => {
+                let doc=roxmltree::Document::parse(body)?;
+                let node=doc.descendants().find(|n|n.has_tag_name("Ntp")).unwrap();
+                ensure!(node.children().filter(|n|n.is_element()).count()==1);
+                self.clock_ntp.store(field(&doc,"enable")==Some("1"),Ordering::SeqCst);
                 String::new()
             }
             14=> {

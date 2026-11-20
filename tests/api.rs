@@ -1090,18 +1090,67 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
         response(&client, &clock, PRIMARY, None).await.1["cameraTime"],
         "2026-11-17T12:30:00"
     );
-    let clock_change = client
-        .put(&clock)
-        .bearer_auth(PRIMARY)
-        .header("content-type", "application/json")
-        .body(r#"{"cameraTime":"2028-02-29T23:47:06"}"#)
-        .send()
-        .await?;
-    assert_eq!(clock_change.status(), 200);
+    let change_clock = |change: Value| {
+        client
+            .put(&clock)
+            .bearer_auth(PRIMARY)
+            .header("content-type", "application/json")
+            .body(change.to_string())
+            .send()
+    };
+    let result = change_clock(json!({"cameraTime":"2028-02-29T23:47:06"})).await?;
+    assert_eq!(result.status(), 200);
+    let after = response(&client, &clock, PRIMARY, None).await.1;
+    assert!(after["cameraTime"].as_str().unwrap() >= "2028-02-29T23:47:07");
     assert_eq!(
-        response(&client, &clock, PRIMARY, None).await.1["cameraTime"],
-        "2028-02-29T23:47:06"
+        after["settings"],
+        json!({"utcOffsetMinutes":-480,"daylightSavingEnabled":false,"ntpEnabled":false})
     );
+
+    let spring = json!({"month":3,"week":2,"weekday":0,"hour":2,"minute":0});
+    let fall = json!({"month":11,"week":1,"weekday":0,"hour":2,"minute":0});
+    let seasonal =
+        json!({"utcOffsetMinutes":-480,"daylightSaving":{"hours":1,"start":spring,"end":fall}});
+    let change = json!({"cameraTime":after["cameraTime"],"timeZone":seasonal,"ntpEnabled":true});
+    assert_eq!(change_clock(change).await?.status(), 200);
+    assert!(
+        camera
+            .clock_dst
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains("<startWeekday>Sunday</startWeekday>")
+    );
+    let result = change_clock(json!({"cameraTime":"2028-02-29T22:47:06"})).await?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.text().await?)?["errorKey"],
+        "API_CLOCK_NTP_ACTIVE"
+    );
+
+    let fixed = json!({"utcOffsetMinutes":-420,"daylightSaving":null});
+    let change = json!({"cameraTime":"2028-02-29T21:47:06","timeZone":fixed,"ntpEnabled":true});
+    assert_eq!(change_clock(change).await?.status(), 200);
+    let after = response(&client, &clock, PRIMARY, None).await.1;
+    assert_eq!(
+        after["settings"],
+        json!({"utcOffsetMinutes":-420,"daylightSavingEnabled":false,"ntpEnabled":true})
+    );
+    assert_eq!(*camera.clock_zone_west.lock().unwrap(), Some(25200));
+    let manual = json!({"cameraTime":"2028-02-29T20:47:06","ntpEnabled":false});
+    assert_eq!(change_clock(manual).await?.status(), 200);
+    assert!(!camera.clock_ntp.load(Ordering::SeqCst));
+
+    for fault in [&camera.forget_clock_on_login, &camera.freeze_clock] {
+        fault.store(true, Ordering::SeqCst);
+        let result = change_clock(json!({"cameraTime":"2028-02-29T22:47:06"})).await?;
+        assert_eq!(result.status(), 502);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.text().await?)?["errorKey"],
+            "API_CLOCK_UNVERIFIED"
+        );
+        fault.store(false, Ordering::SeqCst);
+    }
     let network = url("/cameras/garage/network");
     let before = response(&client, &network, PRIMARY, None).await;
     assert_eq!(before.0, 200);
