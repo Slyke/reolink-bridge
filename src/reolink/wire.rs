@@ -112,6 +112,10 @@ impl Device {
 }
 
 impl Session {
+    pub(crate) fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.socket.peer_addr().ok().map(|peer| peer.ip())
+    }
+
     pub async fn command(&mut self, id: u32, channel: Option<u8>, body: &str) -> Result<String> {
         let extension = channel.map(|channel| {
             format!(r#"<Extension version="1.1"><channelId>{channel}</channelId></Extension>"#)

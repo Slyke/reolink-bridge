@@ -172,6 +172,7 @@ impl Frame {
 struct StateOfPreview {
     identity: Option<String>,
     attempt: u64,
+    started_at: Option<Instant>,
     finished_at: Option<Instant>,
     succeeded: bool,
     frame: Option<Frame>,
@@ -247,12 +248,12 @@ impl Preview {
                 _ = self.stop.cancelled() => return,
                 _ = updates.changed() => {},
                 _ = identities.changed() => {},
-                _ = sleep_until(next) => { self.refresh(previous).await; }
+                _ = sleep_until(next) => { self.refresh(previous, None).await; }
             }
         }
     }
 
-    async fn refresh(&self, previous: u64) -> Option<Frame> {
+    async fn refresh(&self, previous: u64, requested_at: Option<Instant>) -> Option<Frame> {
         let _lock = tokio::select! {
             _ = self.stop.cancelled() => return None,
             lock = self.in_flight.lock() => lock,
@@ -263,10 +264,11 @@ impl Preview {
             if current.identity != identity {
                 return None;
             }
-            if current.attempt != previous {
+            if current.attempt != previous && current.started_at >= requested_at {
                 return current.succeeded.then(|| current.frame.clone()).flatten();
             }
         }
+        let started = Instant::now();
         let frame = tokio::select! {
             _ = self.stop.cancelled() => return None,
             result = timeout(CAPTURE_TIMEOUT, async {
@@ -292,6 +294,7 @@ impl Preview {
         let finished = Instant::now();
         self.state.send_modify(|state| {
             state.attempt = state.attempt.wrapping_add(1);
+            state.started_at = Some(started);
             state.finished_at = Some(finished);
             state.succeeded = frame.is_some();
             if let Some(frame) = &frame {
@@ -445,7 +448,7 @@ pub(super) async fn get(
     };
     let frame = if query.refresh && method == Method::GET {
         let previous = preview.state.borrow().attempt;
-        preview.refresh(previous).await
+        preview.refresh(previous, Some(Instant::now())).await
     } else {
         let state = preview.state.borrow();
         (state.identity == api.camera_identity(&id))

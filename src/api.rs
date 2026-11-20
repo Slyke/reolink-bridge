@@ -1,4 +1,7 @@
+mod clock;
 mod credentials;
+mod display;
+mod encoding;
 mod media;
 mod network;
 mod photos;
@@ -95,6 +98,7 @@ pub struct Api {
     inactive_identities: BTreeMap<String, crate::identity::HardwareId>,
     active: BTreeSet<String>,
     devices: BTreeMap<String, Device>,
+    onvif: BTreeMap<String, crate::onvif::Onvif>,
     previews: preview::Previews,
     recordings: recordings::Recordings,
     photos: photos::Gallery,
@@ -248,6 +252,22 @@ impl Api {
                 ))
             })
             .collect();
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let mut onvif = BTreeMap::new();
+        for camera in cameras.iter() {
+            if let (Some(port), Some(password)) = (camera.onvif_port, camera.password.as_ref()) {
+                let client = crate::onvif::Onvif::new(
+                    http.clone(),
+                    &camera.host,
+                    port,
+                    camera.username.clone(),
+                    password.clone(),
+                )?;
+                onvif.insert(camera.id.clone(), client);
+            }
+        }
         let enrollment_cameras: BTreeMap<_, _> = cameras
             .iter()
             .filter(|cam| vault.is_some() && configured.contains(&cam.id))
@@ -299,9 +319,11 @@ impl Api {
             active,
             network_writes: devices
                 .keys()
+                .chain(onvif.keys())
                 .map(|id| (id.clone(), Mutex::new(())))
                 .collect(),
             devices,
+            onvif,
             previews,
             hub: None,
             media_slots: Arc::new(Semaphore::new(4)),
@@ -397,6 +419,19 @@ pub fn router(api: Arc<Api>) -> Router {
         .route("/api/contract", get(contract))
         .route("/api/inventory", get(inventory))
         .route(
+            "/api/cameras/{id}/encoding",
+            get(encoding::get).put(encoding::set),
+        )
+        .route("/api/cameras/{id}/clock", get(clock::get).put(clock::set))
+        .route(
+            "/api/cameras/{id}/network/wifi",
+            axum::routing::put(network::switch),
+        )
+        .route(
+            "/api/cameras/{id}/display",
+            get(display::get).put(display::set),
+        )
+        .route(
             "/api/cameras/{id}/users",
             get(users::list).post(users::manage),
         )
@@ -485,7 +520,9 @@ async fn contract(
         Vec::new()
     };
     Json(json!({"version":1,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
-       "rtspSettings":true,"networkCameras":api.devices.keys().collect::<Vec<_>>(),
+       "displayCameras":api.devices.keys().collect::<Vec<_>>(),
+       "encodingCameras":api.devices.keys().collect::<Vec<_>>(),
+       "clockCameras":api.devices.keys().collect::<Vec<_>>(),"rtspSettings":true,"networkCameras":api.devices.keys().chain(api.onvif.keys()).collect::<BTreeSet<_>>(),
        "userCameras":api.devices.keys().collect::<Vec<_>>(),
        "storageCameras":api.devices.keys().collect::<Vec<_>>(),
        "timeLapsePhotoCameras":api.devices.keys().collect::<Vec<_>>(),

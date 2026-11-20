@@ -1068,6 +1068,40 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
         "enabled"
     );
     assert!(!camera.rtsp_enabled.load(Ordering::SeqCst));
+    let encoding = url("/cameras/garage/encoding");
+    let current = response(&client, &encoding, PRIMARY, None).await.1;
+    assert_eq!(current["profiles"][0]["current"]["fps"], 20);
+    assert_eq!(current["profiles"][0]["options"][0]["fps"], json!([20, 15]));
+    for (fps, expected) in [(19, 422), (15, 200)] {
+        let result = client
+            .put(&encoding)
+            .bearer_auth(PRIMARY)
+            .header("content-type", "application/json")
+            .body(json!({"stream":"main","settings":{"fps":fps}}).to_string())
+            .send()
+            .await?;
+        assert_eq!(result.status().as_u16(), expected);
+    }
+    let current = response(&client, &encoding, PRIMARY, None).await.1;
+    assert_eq!(current["profiles"][0]["current"]["fps"], 15);
+    assert_eq!(current["profiles"][1]["current"]["fps"], 4);
+    let clock = url("/cameras/garage/clock");
+    assert_eq!(
+        response(&client, &clock, PRIMARY, None).await.1["cameraTime"],
+        "2026-11-17T12:30:00"
+    );
+    let clock_change = client
+        .put(&clock)
+        .bearer_auth(PRIMARY)
+        .header("content-type", "application/json")
+        .body(r#"{"cameraTime":"2028-02-29T23:47:06"}"#)
+        .send()
+        .await?;
+    assert_eq!(clock_change.status(), 200);
+    assert_eq!(
+        response(&client, &clock, PRIMARY, None).await.1["cameraTime"],
+        "2028-02-29T23:47:06"
+    );
     let network = url("/cameras/garage/network");
     let before = response(&client, &network, PRIMARY, None).await;
     assert_eq!(before.0, 200);

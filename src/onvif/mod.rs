@@ -1,5 +1,6 @@
 pub mod events;
 mod metadata;
+pub(crate) mod network;
 
 use std::time::Duration;
 

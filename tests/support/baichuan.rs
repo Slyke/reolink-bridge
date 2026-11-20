@@ -50,6 +50,8 @@ pub struct Camera {
     pub rtsp_enabled: AtomicBool,
     pub rtsp_writes: AtomicUsize,
     pub wifi_xml: Mutex<Option<String>>,
+    pub encoder_fps: Mutex<Option<u32>>,
+    pub clock_xml: Mutex<Option<String>>,
     pub time_lapse_xml: Mutex<Option<String>>,
     pub credential_writes: AtomicUsize,
     pub block_after_write: AtomicBool,
@@ -305,7 +307,24 @@ impl Camera {
             }
             2 | 4 | 16 | 31 | 93 | 144 => String::new(),
             102=>"<body><HddInfoList><HddInfo><number>0</number><storageType>2</storageType><mount>1</mount><format>1</format><capacity>63</capacity><capacityM>500</capacityM><remainSize>23</remainSize><remainSizeM>800</remainSizeM></HddInfo></HddInfoList></body>".into(),
-            104=>"<body><SystemGeneral><year>2026</year><month>11</month><day>17</day><hour>12</hour><minute>30</minute><second>00</second></SystemGeneral></body>".into(),
+            56=>format!("<body><Compression><channelId>0</channelId><mainStream><width>1920</width><height>1080</height><frame>{}</frame><bitRate>2048</bitRate></mainStream><subStream><width>640</width><height>360</height><frame>4</frame></subStream></Compression></body>",self.encoder_fps.lock().unwrap().unwrap_or(20)),
+            146=>"<body><StreamInfoList><StreamInfo><channelBits>1</channelBits><encodeTable><type>mainStream</type><resolution><width>1920</width><height>1080</height></resolution><framerateTable>20,15</framerateTable><bitrateTable>2048,4096</bitrateTable></encodeTable></StreamInfo></StreamInfoList></body>".into(),
+            57=>{
+                let doc=roxmltree::Document::parse(body)?;
+                let main=doc.descendants().find(|n|n.has_tag_name("mainStream")).unwrap();
+                ensure!(main.children().filter(|n|n.is_element()).count()==1 && field(&doc,"subStream").is_none());
+                *self.encoder_fps.lock().unwrap()=Some(field(&doc,"frame").unwrap().parse()?);
+                String::new()
+            }
+            104=>self.clock_xml.lock().unwrap().clone().unwrap_or_else(||"<body><SystemGeneral><year>2026</year><month>11</month><day>17</day><hour>12</hour><minute>30</minute><second>00</second></SystemGeneral></body>".into()),
+            105=>{
+                let doc=roxmltree::Document::parse(body)?;
+                let general=doc.descendants().find(|n|n.has_tag_name("SystemGeneral")).unwrap();
+                ensure!(general.children().filter(|n|n.is_element()).count()==6);
+                for name in ["year","month","day","hour","minute","second"] {ensure!(field(&doc,name).is_some());}
+                *self.clock_xml.lock().unwrap()=Some(body[doc.root_element().range()].to_owned());
+                String::new()
+            }
             14=> {
                 ensure!(body.contains("<streamType>subStream</streamType>") || body.contains("<streamType>mainStream</streamType>"));
                 "<body><FileInfoList><FileInfo><handle>42</handle></FileInfo></FileInfoList></body>".into()

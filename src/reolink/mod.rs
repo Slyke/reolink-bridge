@@ -67,6 +67,13 @@ pub async fn discover(
             }),
         );
     }
+    if let Ok(raw) = session.command(104, None, "").await
+        && let Ok(doc) = xml::document(&raw)
+        && let Some(general) = xml::find(doc.root_element(), "SystemGeneral")
+        && let Some(name) = xml::child(general, "deviceName").and_then(xml::text)
+    {
+        hub.section(id, "info", "display", json!({"name":name}));
+    }
     let (ai_types, ai_configuration) = events::ai_types(&mut session, channel).await;
     let mut controls = Map::new();
     let mut settings = vec![
