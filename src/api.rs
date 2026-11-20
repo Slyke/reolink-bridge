@@ -3,6 +3,7 @@ mod credentials;
 mod display;
 mod encoding;
 mod media;
+mod media_files;
 mod network;
 mod photos;
 mod preview;
@@ -448,6 +449,16 @@ pub fn router(api: Arc<Api>) -> Router {
             "/api/cameras/{id}/time-lapse/photos/{photo}",
             get(photos::image),
         )
+        .route(
+            "/api/cameras/{id}/media/capabilities",
+            get(media_files::capabilities),
+        )
+        .route("/api/cameras/{id}/media/days", get(media_files::calendar))
+        .route("/api/cameras/{id}/media/files", get(media_files::list))
+        .route(
+            "/api/cameras/{id}/media/delete",
+            post(media_files::delete).layer(DefaultBodyLimit::max(80 * 1024)),
+        )
         .route("/api/cameras/{id}/storage", get(recordings::storage))
         .route("/api/cameras/{id}/recordings", get(recordings::list))
         .route(
@@ -524,6 +535,7 @@ async fn contract(
        "clockCameras":api.devices.keys().collect::<Vec<_>>(),"rtspSettings":true,"networkCameras":api.devices.keys().chain(api.onvif.keys()).collect::<BTreeSet<_>>(),
        "userCameras":api.devices.keys().collect::<Vec<_>>(),
        "storageCameras":api.devices.keys().collect::<Vec<_>>(),
+       "mediaFileCameras":api.devices.keys().collect::<Vec<_>>(),
        "timeLapsePhotoCameras":api.devices.keys().collect::<Vec<_>>(),
        "recordingPreviewCameras":api.devices.keys().collect::<Vec<_>>(),
        "recordingMetadataCameras":recordings,

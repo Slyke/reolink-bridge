@@ -29,6 +29,8 @@ pub struct Clip {
     pub end: NaiveDateTime,
     pub stream: String,
     pub size_bytes: Option<u64>,
+    #[serde(skip)]
+    pub file_identity: Option<String>,
     pub kind: Option<String>,
 }
 
@@ -227,6 +229,7 @@ fn parse_clip(node: Node<'_, '_>, stream: &str, day: NaiveDate) -> Option<Clip> 
         start,
         end,
         stream: stream.into(),
+        file_identity: get("Id").or_else(|| get("fileIdentity")).map(str::to_owned),
         size_bytes: get("size")
             .or_else(|| get("fileSize"))
             .and_then(|s| s.parse().ok()),

@@ -209,6 +209,12 @@ impl Recordings {
             entries.remove(&key);
         }
     }
+    pub(super) async fn forget(&self, scope: &str, ids: &BTreeSet<&str>) {
+        let mut entries = self.entries.lock().await;
+        for id in ids {
+            entries.remove(&format!("{scope}/{id}"));
+        }
+    }
     pub(super) async fn clean(&self) {
         self.prune(&mut *self.entries.lock().await, Instant::now());
         self.clean_thumbnails().await;
@@ -827,6 +833,7 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .unwrap();
         Clip {
+            file_identity: None,
             id: id.into(),
             start,
             end: start + chrono::Duration::seconds(10),

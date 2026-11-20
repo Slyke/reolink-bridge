@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
@@ -27,6 +27,8 @@ pub struct Camera {
     pub recording: Option<Vec<u8>>,
     pub gallery_jpeg: Vec<u8>,
     pub empty_gallery_uid: AtomicBool,
+    pub deleted_media: Mutex<BTreeSet<String>>,
+    pub video_delete_disabled: AtomicBool,
     pub recording_downloads: AtomicUsize,
     pub recording_end_status: AtomicUsize,
     pub recording_previews: AtomicUsize,
@@ -369,28 +371,86 @@ impl Camera {
                 ensure!(body.contains("<streamType>subStream</streamType>") || body.contains("<streamType>mainStream</streamType>"));
                 "<body><FileInfoList><FileInfo><handle>42</handle></FileInfo></FileInfoList></body>".into()
             }
-            15=>"<body><FileInfoList><bFinished>1</bFinished><FileInfo><name>RecS01_20261117_120000_120002_AAA.mp4</name><size>18000</size><type>md</type></FileInfo></FileInfoList></body>".into(),
+            15 => {
+                let item = if self.deleted_media.lock().unwrap().contains("fixture-video") { "" } else {
+                    "<FileInfo><Id>fixture-video</Id><name>RecS01_20261117_120000_120002_AAA.mp4</name><size>18000</size><type>md</type></FileInfo>"
+                };
+                format!("<body><FileInfoList><bFinished>1</bFinished>{item}</FileInfoList></body>")
+            }
+            142 => {
+                let doc = roxmltree::Document::parse(body)?;
+                let day = if field(&doc, "month")==Some("11") && field(&doc, "year")==Some("2026") {
+                    "<dayType><index>16</index></dayType>"
+                } else { "" };
+                format!("<body><DayRecords><DayRecordList><DayRecord><channelId>0</channelId>{day}</DayRecord></DayRecordList></DayRecords></body>")
+            }
             321 => {
                 let uid = if self.empty_gallery_uid.load(Ordering::SeqCst) { "" } else { "disk-1" };
-                format!("<body><timelapseTasks><uid>{uid}</uid><item><id>task</id><taskType>jpeg</taskType></item><item><id>ignore</id><taskType>mp4</taskType></item></timelapseTasks></body>")
+                format!("<body><timelapseTasks><uid>{uid}</uid><item><id>task</id><taskType>jpeg</taskType></item><item><id>movie</id><taskType>mp4</taskType><taskState>IDLE</taskState></item><item><id>running</id><taskType>mp4</taskType><taskState>RUNNING</taskState></item></timelapseTasks></body>")
+            }
+            322 => {
+                let mut days="0".repeat(372);
+                days.replace_range(326..327,"1");
+                format!("<body><timelapseDateTbl><item><year>2026</year><dateTable>{days}</dateTable></item></timelapseDateTbl></body>")
             }
             323 => {
-                ensure!(body.contains("<taskType>jpeg</taskType>") && body.contains("<id>task</id>") && body.contains("<endTime>"));
-                "<body><timelapseFileSearch><handle>3</handle><totalNum>17</totalNum><finished>0</finished></timelapseFileSearch></body>".into()
+                ensure!(body.contains("<endTime>"));
+                let deleted=self.deleted_media.lock().unwrap();
+                let (handle,total) = if body.contains("<taskType>jpeg</taskType>") && body.contains("<id>task</id>") {
+                    (3,(0..17).filter(|i| !deleted.contains(&format!("private-image-{i}"))).count())
+                } else if body.contains("<taskType>mp4</taskType>") && body.contains("<id>movie</id>") {
+                    (4,usize::from(!deleted.contains("private-movie")))
+                } else {
+                    ensure!(body.contains("<taskType>mp4</taskType>") && body.contains("<id>running</id>"));
+                    (5,1)
+                };
+                format!("<body><timelapseFileSearch><handle>{handle}</handle><totalNum>{total}</totalNum><finished>0</finished></timelapseFileSearch></body>")
             }
             324 => {
                 let doc = roxmltree::Document::parse(body)?;
-                ensure!(field(&doc, "handle") == Some("3"));
-                let start = field(&doc, "fromWhere").unwrap_or("0").parse::<usize>()?;
-                ensure!(start <= 17);
-                let end = (start + 16).min(17);
-                let items = (start..end).map(|second| format!(
-                    "<item><startTime><year>2026</year><month>11</month><day>17</day><hour>9</hour><minute>15</minute><second>{second}</second></startTime><original><id>private-image-{second}</id><size>{}</size></original><thumbnail><id>ignore-thumb</id></thumbnail></item>",
-                    self.gallery_jpeg.len()
-                )).collect::<String>();
-                format!("<body><timelapseFileSearch><finished>{}</finished><totalNum>0</totalNum>{items}</timelapseFileSearch></body>", u8::from(end == 17))
+                let clock = |second| format!("<year>2026</year><month>11</month><day>17</day><hour>9</hour><minute>15</minute><second>{second}</second>");
+                let (items,done)=match field(&doc,"handle") {
+                    Some("3") => {
+                        let deleted=self.deleted_media.lock().unwrap();
+                        let remaining:Vec<_>=(0..17).filter(|i| !deleted.contains(&format!("private-image-{i}"))).collect();
+                        let start = field(&doc, "fromWhere").unwrap_or("0").parse::<usize>()?;
+                        ensure!(start <= remaining.len());
+                        let end = (start + 16).min(remaining.len());
+                        let items=remaining[start..end].iter().map(|second| format!(
+                            "<item><startTime>{}</startTime><original><id>private-image-{second}</id><size>{}</size></original><thumbnail><id>ignore-thumb</id></thumbnail></item>",clock(*second),self.gallery_jpeg.len()
+                        )).collect::<String>();
+                        (items,end==remaining.len())
+                    }
+                    Some(handle @ ("4"|"5")) => {
+                        let file=if handle=="4" {"private-movie"} else {"running-movie"};
+                        (format!("<item><startTime>{}</startTime><endTime>{}</endTime><original><id>{file}</id></original></item>",clock(0),clock(40)),true)
+                    }
+                    _=>anyhow::bail!("unexpected gallery handle"),
+                };
+                format!("<body><timelapseFileSearch><finished>{}</finished><totalNum>0</totalNum>{items}</timelapseFileSearch></body>", u8::from(done))
             }
-            325 => {ensure!(body.contains("<handle>3</handle>"));String::new()}
+            325 => {ensure!(["3","4","5"].iter().any(|h|body.contains(&format!("<handle>{h}</handle>"))));String::new()}
+            303 | 330 => {
+                let doc=roxmltree::Document::parse(body)?;
+                let root=doc.root_element().first_element_child().unwrap();
+                ensure!(root.tag_name().name()==if command==303 {"RecFilesDelete"} else {"timelapseFileDel"});
+                let tag=if command==303 {"fileIdentity"} else {"id"};
+                let ids:Vec<_>=root.children().filter(|n|n.has_tag_name("item")).map(|item| {
+                    let id=item.first_element_child().unwrap();
+                    ensure!(id.has_tag_name(tag) && id.next_sibling().is_none());
+                    let value=id.text().unwrap_or("");
+                    ensure!(match (command,field(&doc,"taskType")) {
+                        (303,None)=>value=="fixture-video",
+                        (330,Some("jpeg"))=>value.starts_with("private-image-"),
+                        (330,Some("mp4"))=>value=="private-movie",
+                        _=>false,
+                    });
+                    Ok(value.to_owned())
+                }).collect::<Result<Vec<_>>>()?;
+                ensure!((1..=40).contains(&ids.len()));
+                self.deleted_media.lock().unwrap().extend(ids);
+                String::new()
+            }
             327 => {
                 ensure!(body.contains("<id>private-image-0</id>") && body.contains("<position>0</position>"));
                 "<body><timelapseDownload><position>0</position></timelapseDownload></body>".into()
@@ -434,7 +494,8 @@ impl Camera {
                 let kind = if self.ptz.load(Ordering::SeqCst) { 2 } else { 0 };
                 let control = if kind == 2 { 64 } else { 0 };
                 let presets = if kind == 2 { 1 } else { 0 };
-                format!("<body><Support><item><chnID>0</chnID><ptzType>{kind}</ptzType><ptzControl>{control}</ptzControl><ptzPreset>{presets}</ptzPreset></item><item><chnID>1</chnID><ptzType>0</ptzType><ptzControl>0</ptzControl></item></Support></body>")
+                let replay=if self.video_delete_disabled.load(Ordering::SeqCst) { 0 } else { 8 };
+                format!("<body><Support><replayVersion>{replay}</replayVersion><item><chnID>0</chnID><timelapse>3</timelapse><ptzType>{kind}</ptzType><ptzControl>{control}</ptzControl><ptzPreset>{presets}</ptzPreset></item><item><chnID>1</chnID><ptzType>0</ptzType><ptzControl>0</ptzControl></item></Support></body>")
             }
             18 | 19 | 190 | 294 | 295 | 433 if !self.ptz.load(Ordering::SeqCst) => {
                 return Ok((405, String::new()));

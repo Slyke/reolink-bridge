@@ -1,7 +1,10 @@
-use std::{collections::BTreeMap, io::Cursor};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Cursor,
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime};
 use image::{DynamicImage, ImageFormat, ImageReader, codecs::jpeg::JpegEncoder};
 use roxmltree::Node;
 use serde::Serialize;
@@ -22,7 +25,11 @@ pub struct Photo {
     pub id: String,
     pub captured_at: Option<NaiveDateTime>,
     #[serde(skip)]
-    file: String,
+    pub file: String,
+    #[serde(skip)]
+    pub completed_at: Option<NaiveDateTime>,
+    #[serde(skip)]
+    pub format: String,
     #[serde(skip)]
     size: Option<usize>,
 }
@@ -76,7 +83,7 @@ fn filename_time(name: &str, day: NaiveDate) -> Option<NaiveDateTime> {
 fn page(
     raw: &str,
     scope: &str,
-    task: &str,
+    task: &Task,
     day: NaiveDate,
     photos: &mut BTreeMap<String, Photo>,
 ) -> Result<(bool, usize)> {
@@ -89,7 +96,10 @@ fn page(
         let original = xml::child(item, "original")
             .ok_or_else(|| anyhow!("missing original time-lapse image"))?;
         let file = identifier(original, "id")?.context("time-lapse photo has no file ID")?;
-        let key = format!("{:x}", Sha256::digest(format!("{scope}\0{task}\0{file}")));
+        let key = format!(
+            "{:x}",
+            Sha256::digest(format!("{scope}\0{}\0{file}", task.id))
+        );
         let captured_at = [original, item]
             .into_iter()
             .find_map(|node| xml::child(node, "startTime").and_then(wall_time))
@@ -103,6 +113,16 @@ fn page(
             id: key,
             captured_at,
             file: file.to_owned(),
+            completed_at: if task.format == "jpeg" {
+                captured_at
+            } else if task.closed {
+                [original, item]
+                    .into_iter()
+                    .find_map(|node| xml::child(node, "endTime").and_then(wall_time))
+            } else {
+                None
+            },
+            format: task.format.clone(),
             size,
         });
         ensure!(
@@ -113,6 +133,98 @@ fn page(
     Ok((field(root, "finished") == Some("1"), returned))
 }
 
+struct Task {
+    id: String,
+    format: String,
+    closed: bool,
+    params: String,
+}
+
+async fn tasks(session: &mut Session, channel: u8) -> Result<Vec<Task>> {
+    let target = format!("<channelId>{channel}</channelId>");
+    let raw = session
+        .command(321, Some(channel), &folder("timelapseTasks", &target))
+        .await?;
+    let doc = xml::document(&raw)?;
+    let root = xml::find(doc.root_element(), "timelapseTasks")
+        .context("camera time-lapse gallery unavailable")?;
+    let uid = identifier(root, "uid")?
+        .map(|u| format!("<uid>{}</uid>", xml::escape(u)))
+        .unwrap_or_default();
+    let mut result = Vec::new();
+    for item in root.children().filter(|n| n.has_tag_name("item")) {
+        let format = field(item, "taskType").unwrap_or("").to_ascii_lowercase();
+        if !matches!(format.as_str(), "jpeg" | "mp4") {
+            continue;
+        }
+        let id = identifier(item, "id")?
+            .context("time-lapse task has no ID")?
+            .to_owned();
+        let params = format!(
+            "{target}{uid}<id>{}</id><taskType>{format}</taskType>",
+            xml::escape(&id)
+        );
+        result.push(Task {
+            id,
+            format,
+            params,
+            closed: field(item, "taskState")
+                .is_some_and(|state| state.eq_ignore_ascii_case("idle")),
+        });
+        ensure!(result.len() <= 128, "too many time-lapse tasks");
+    }
+    Ok(result)
+}
+
+fn calendar_days(raw: &str, days: &mut BTreeSet<NaiveDate>) -> Result<()> {
+    let doc = xml::document(raw)?;
+    let root =
+        xml::find(doc.root_element(), "timelapseDateTbl").context("missing time-lapse calendar")?;
+    for item in root.children().filter(|n| n.has_tag_name("item")) {
+        let year = field(item, "year")
+            .context("missing calendar year")?
+            .parse::<i32>()?;
+        let table = field(item, "dateTable").context("missing time-lapse date table")?;
+        let last =
+            NaiveDate::from_ymd_opt(year, 12, 31).context("invalid time-lapse calendar year")?;
+        ensure!(
+            table.len() == 372 || table.len() == last.ordinal() as usize,
+            "unknown time-lapse calendar format"
+        );
+        for (index, byte) in table.bytes().enumerate() {
+            ensure!(
+                matches!(byte, b'0' | b'1'),
+                "invalid time-lapse calendar day"
+            );
+            if byte == b'1' {
+                let n = index as u32;
+                let date = if table.len() == 372 {
+                    NaiveDate::from_ymd_opt(year, n / 31 + 1, n % 31 + 1)
+                } else {
+                    NaiveDate::from_yo_opt(year, n + 1)
+                };
+                days.insert(date.context("invalid capture day")?);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn dates(session: &mut Session, channel: u8) -> Result<BTreeSet<NaiveDate>> {
+    let mut days = BTreeSet::new();
+    for task in tasks(session, channel).await? {
+        let raw = session
+            .command(
+                322,
+                Some(channel),
+                &folder("timelapseDateTbl", &task.params),
+            )
+            .await?;
+        calendar_days(&raw, &mut days)?;
+    }
+    Ok(days)
+}
+
 pub async fn search(
     session: &mut Session,
     channel: u8,
@@ -120,35 +232,23 @@ pub async fn search(
     from: NaiveDateTime,
     to: NaiveDateTime,
 ) -> Result<Vec<Photo>> {
-    let target = format!("<channelId>{channel}</channelId>");
-    let raw = session
-        .command(321, Some(channel), &folder("timelapseTasks", &target))
-        .await?;
-    let doc = xml::document(&raw)?;
-    let root = xml::find(doc.root_element(), "timelapseTasks")
-        .ok_or_else(|| anyhow!("camera time-lapse gallery unavailable"))?;
-    let tasks: Vec<_> = root
-        .children()
-        .filter(|n| {
-            n.has_tag_name("item")
-                && field(*n, "taskType").is_some_and(|v| v.eq_ignore_ascii_case("jpeg"))
-        })
-        .map(|item| identifier(item, "id")?.context("time-lapse task has no ID"))
-        .collect::<Result<_>>()?;
-    ensure!(tasks.len() <= 128, "too many time-lapse tasks");
+    search_files(session, channel, scope, from, to, false).await
+}
+
+pub async fn search_files(
+    session: &mut Session,
+    channel: u8,
+    scope: &str,
+    from: NaiveDateTime,
+    to: NaiveDateTime,
+    include_movies: bool,
+) -> Result<Vec<Photo>> {
     let mut photos = BTreeMap::new();
-    if tasks.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Standalone cameras can report a blank storage UID for their local SD card.
-    let uid = identifier(root, "uid")?
-        .map(|uid| format!("<uid>{}</uid>", xml::escape(uid)))
-        .unwrap_or_default();
-    for task in tasks {
-        let params = format!(
-            "{target}{uid}<id>{}</id><taskType>jpeg</taskType>",
-            xml::escape(task)
-        );
+    for task in tasks(session, channel).await? {
+        if !include_movies && task.format != "jpeg" {
+            continue;
+        }
+        let params = &task.params;
         let body = folder(
             "timelapseFileSearch",
             &format!(
@@ -174,7 +274,7 @@ pub async fn search(
             let mut offset = 0;
             for index in 0..=MAX_PHOTOS {
                 let before = photos.len();
-                let (done, returned) = page(&raw, scope, task, from.date(), &mut photos)?;
+                let (done, returned) = page(&raw, scope, &task, from.date(), &mut photos)?;
                 offset += returned;
                 ensure!(
                     offset <= MAX_PHOTOS,

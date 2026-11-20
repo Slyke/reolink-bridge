@@ -43,6 +43,21 @@ pub(super) struct Gallery {
     manifests: Mutex<VecDeque<Manifest>>,
     slots: Semaphore,
 }
+impl Gallery {
+    pub(super) async fn forget(&self, scope: &str, ids: &std::collections::BTreeSet<&str>) {
+        for manifest in self
+            .manifests
+            .lock()
+            .await
+            .iter_mut()
+            .filter(|m| m.scope == scope)
+        {
+            for id in ids {
+                manifest.photos.remove(*id);
+            }
+        }
+    }
+}
 impl Default for Gallery {
     fn default() -> Self {
         Self {

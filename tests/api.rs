@@ -1796,7 +1796,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     if std::env::var("BRIDGE_TEST_VALKEY_URL").is_ok() {
         limited_bridge.kill().await?;
         limited_bridge.wait().await?;
-        let _restarted = start(&config, &client, &origin).await?;
+        limited_bridge = start(&config, &client, &origin).await?;
         assert_eq!(response(&client, &search, PRIMARY, None).await.0, 200);
         assert_eq!(
             client
@@ -1814,5 +1814,93 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         );
     }
     assert_eq!(camera.writes.load(Ordering::SeqCst), 4);
+    assert_exact_media_deletion(&client, &origin, &camera).await?;
+    limited_bridge.kill().await?;
+    Ok(())
+}
+
+async fn assert_exact_media_deletion(
+    client: &Client,
+    origin: &str,
+    camera: &baichuan::Camera,
+) -> Result<()> {
+    let media = format!("{origin}/api/cameras/fixture/media");
+    let caps = format!("{media}/capabilities");
+    let delete = format!("{media}/delete");
+    let list = |kind: &str| format!("{media}/files?kind={kind}&date=2026-11-17");
+    let (status, flags) = response(client, &caps, PRIMARY, None).await;
+    assert_eq!(status, 200, "{flags}");
+    assert_eq!(flags["timeLapse"], true);
+    assert_eq!(flags["video"], true);
+    let body = |kind: &str, files: Value| json!({"kind":kind,"source":flags["source"],"date":"2026-11-17","files":files});
+    let call = |payload| response(client, &delete, PRIMARY, Some(payload));
+    for query in ["kind=video&month=2026-11-01", "kind=timeLapse"] {
+        let (status, data) =
+            response(client, &format!("{media}/days?{query}"), PRIMARY, None).await;
+        assert_eq!(status, 200, "{data}");
+        assert_eq!(data["days"], json!(["2026-11-17"]));
+    }
+    assert_eq!(
+        response(client, &delete, "wrong", Some(json!({}))).await.0,
+        401
+    );
+    camera.reject_read_command.store(114, Ordering::SeqCst);
+    assert_eq!(
+        call(body("video", json!([]))).await,
+        (200, json!({"absent":[],"deleted":[]}))
+    );
+    camera.reject_read_command.store(0, Ordering::SeqCst);
+    assert_eq!(call(body("video", json!(["camera-path"]))).await.0, 400);
+    let (status, original) = response(client, &list("timeLapse"), PRIMARY, None).await;
+    assert_eq!(status, 200, "{original}");
+    assert!(!original.to_string().contains("private-"));
+    assert_eq!(
+        original["skipped"], 1,
+        "the running movie cannot be selected"
+    );
+    let files = original["files"].as_array().unwrap();
+    assert_eq!(files.len(), 18);
+    let mut selected = Vec::new();
+    for time in ["09:15:00", "09:15:01", "09:15:40"] {
+        let file = files
+            .iter()
+            .find(|f| f["completedAt"].as_str().unwrap().ends_with(time))
+            .unwrap();
+        selected.push(file["id"].as_str().unwrap().to_owned());
+    }
+    let mut wrong = body("timeLapse", json!(selected));
+    wrong["source"] = json!("0".repeat(64));
+    assert_eq!(call(wrong).await.0, 409);
+    assert!(camera.deleted_media.lock().unwrap().is_empty());
+    let unknown = "f".repeat(64);
+    let mut requested = selected.clone();
+    requested.extend([selected[0].clone(), unknown.clone()]);
+    let (status, done) = call(body("timeLapse", json!(requested))).await;
+    assert_eq!(status, 200, "{done}");
+    selected.sort();
+    assert_eq!(done, json!({"absent":[unknown],"deleted":selected}));
+    let (status, again) = call(body("timeLapse", json!(selected))).await;
+    assert_eq!(status, 200);
+    assert_eq!(again, json!({"absent":selected,"deleted":[]}));
+    let remaining = response(client, &list("timeLapse"), PRIMARY, None).await.1;
+    assert_eq!(remaining["files"].as_array().unwrap().len(), 15);
+    assert_eq!(remaining["skipped"], 1);
+    let videos = response(client, &list("video"), PRIMARY, None).await.1;
+    assert_eq!(
+        videos["files"].as_array().unwrap().len(),
+        1,
+        "both streams alias one file"
+    );
+    let id = &videos["files"][0]["id"];
+    camera.video_delete_disabled.store(true, Ordering::SeqCst);
+    assert_eq!(call(body("video", json!([id]))).await.0, 422);
+    camera.video_delete_disabled.store(false, Ordering::SeqCst);
+    let mut large: Vec<String> = (0..1023).map(|i| format!("{i:064x}")).collect();
+    large.push(id.as_str().unwrap().into());
+    let (status, result) = call(body("video", json!(large))).await;
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["deleted"], json!([id]));
+    assert_eq!(result["absent"].as_array().unwrap().len(), 1023);
+    assert_eq!(camera.deleted_media.lock().unwrap().len(), 4);
     Ok(())
 }
