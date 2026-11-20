@@ -307,12 +307,13 @@ impl LapseChange {
     fn patch(&self, node: Node<'_, '_>, now: Option<chrono::NaiveDateTime>) -> Result<String> {
         let item = xml::child(node, "item");
         let mut top = Vec::new();
-        if let Some(value) = self.overwrite {
-            ensure!(
-                boolean_field(node, "overwrite").is_some(),
-                "overwrite unavailable"
-            );
-            top.push(("overwrite", u8::from(value).to_string()));
+        let supports_overwrite = boolean_field(node, "overwrite").is_some();
+        if self.overwrite.is_some() || (now.is_some() && supports_overwrite) {
+            ensure!(supports_overwrite, "overwrite unavailable");
+            top.push((
+                "overwrite",
+                u8::from(self.overwrite.unwrap_or(true)).to_string(),
+            ));
         }
         let mut fields = Vec::new();
         if let Some(v) = self.enabled {
@@ -327,11 +328,49 @@ impl LapseChange {
         if let Some(v) = self.stream {
             fields.push(("streamType", v.tag().into()))
         }
-        if let Some(t) = now {
-            // Dates are local to the camera. New jobs run daily until stopped.
-            fields.push(("id", t.format("%Y%m%d_%H%M%S").to_string()));
-            fields.push(("startTime",t.format("<year>%Y</year><month>%-m</month><day>%-d</day><hour>%-H</hour><minute>%-M</minute>").to_string()));
-            fields.push(("neverEnd", "1".into()));
+        if let Some(start) = now {
+            // Reolink identifies a new task by epoch milliseconds. Its date fields use camera-local time.
+            let created = chrono::Utc::now();
+            let start_time = start.format("<year>%Y</year><month>%-m</month><day>%-d</day><hour>%-H</hour><minute>%-M</minute>").to_string();
+            fields.extend([
+                ("id", created.timestamp_millis().to_string()),
+                (
+                    "properties",
+                    format!("v1_{}_Customize", created.timestamp()),
+                ),
+                ("startTime", start_time.clone()),
+                ("endTime", start_time),
+                ("neverEnd", "1".into()),
+            ]);
+        }
+        let adjusting_capture =
+            self.format.is_some() || self.stream.is_some() || self.interval_seconds.is_some();
+        if now.is_some()
+            || (adjusting_capture
+                && item.and_then(|i| boolean_field(i, "buseThumbnail")) == Some(true))
+        {
+            let reported = |name| item.and_then(|i| text(i, name));
+            let format = self
+                .format
+                .map(CaptureFormat::tag)
+                .or_else(|| reported("taskType"))
+                .unwrap_or("jpeg");
+            let stream = self
+                .stream
+                .map(Stream::tag)
+                .or_else(|| reported("streamType"))
+                .unwrap_or("mainStream");
+            let interval = self
+                .interval_seconds
+                .or_else(|| reported("interval")?.parse().ok())
+                .unwrap_or(10);
+            // A Fluent JPEG already is the small image. Separate thumbnails also count toward the camera's daily file limit.
+            let file_limit = text(node, "maxFileNum").and_then(|v| v.parse::<u32>().ok());
+            let thumbnail = format == "jpeg"
+                && stream != "subStream"
+                && interval > 0
+                && file_limit.is_some_and(|limit| 86_400u32.div_ceil(interval) * 2 <= limit);
+            fields.push(("buseThumbnail", u8::from(thumbnail).to_string()));
         }
         if !fields.is_empty() {
             let empty = xml::document(
@@ -378,10 +417,11 @@ pub async fn apply(
     let doc = xml::document(&raw)?;
     let node = group.root(&doc, channel)?;
     group.state(node)?;
+    let new_task = matches!(command, Control::TimeLapse(change) if change.needs_start(node));
     let result = match command {
         Control::RecordingSchedule(change) => change.patch(node)?,
         Control::TimeLapse(change) => {
-            let now = if change.needs_start(node) {
+            let now = if new_task {
                 Some(recordings::clock(session).await?)
             } else {
                 None
@@ -403,9 +443,16 @@ pub async fn apply(
     }
     let readback = group.read(session, channel).await?;
     let doc = xml::document(&readback)?;
-    let actual = group.state(group.root(&doc, channel)?)?.0;
+    let actual_root = group.root(&doc, channel)?;
+    let actual = group.state(actual_root)?.0;
     let verified = match command {
         Control::RecordingSchedule(_) => expected == actual,
+        Control::TimeLapse(_) if new_task => {
+            expected == actual
+                && xml::child(actual_root, "item")
+                    .and_then(|i| text(i, "id"))
+                    .is_some()
+        }
         Control::TimeLapse(change) => [
             ("enabled", change.enabled.is_some()),
             ("interval_seconds", change.interval_seconds.is_some()),
@@ -418,4 +465,41 @@ pub async fn apply(
         _ => unreachable!(),
     };
     Ok((group.key(), actual, verified))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_tasks_honor_opt_out_and_edits_preserve_the_existing_task() {
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 11, 20)
+            .unwrap()
+            .and_hms_opt(19, 14, 30)
+            .unwrap();
+        let empty = xml::document("<timelapseCfg><channelId>0</channelId><overwrite>1</overwrite><maxFileNum>10000</maxFileNum></timelapseCfg>").unwrap();
+        let create: LapseChange = serde_json::from_value(json!({"enabled":true,"overwrite":false,"interval_seconds":30,"format":"jpeg","stream":"main"})).unwrap();
+        let created = create.patch(empty.root_element(), Some(start)).unwrap();
+        let saved = xml::document(&created).unwrap();
+        let root = saved.root_element();
+        assert_eq!(boolean_field(root, "overwrite"), Some(false));
+        let item = xml::child(root, "item").unwrap();
+        assert_eq!(boolean_field(item, "buseThumbnail"), Some(true));
+        let edit: LapseChange = serde_json::from_value(json!({"stream":"sub"})).unwrap();
+        assert!(!edit.needs_start(root));
+        let edited = edit.patch(root, None).unwrap();
+        let after = xml::document(&edited).unwrap();
+        let next = xml::child(after.root_element(), "item").unwrap();
+        assert_eq!(boolean_field(next, "buseThumbnail"), Some(false));
+        assert_eq!(
+            boolean_field(after.root_element(), "overwrite"),
+            Some(false)
+        );
+        for tag in ["id", "properties", "startTime", "endTime", "duration"] {
+            assert_eq!(
+                element(xml::child(next, tag).unwrap()),
+                element(xml::child(item, tag).unwrap())
+            );
+        }
+    }
 }

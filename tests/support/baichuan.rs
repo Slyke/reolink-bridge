@@ -463,10 +463,21 @@ impl Camera {
                 list + "</UserList></body>"
             },
             81 => self.schedule_xml.lock().unwrap().clone().unwrap_or_else(||format!("<body><Record><channelId>0</channelId><enable>1</enable><typeScheduleList><item><type>Normal,</type><valueTable>{}</valueTable></item></typeScheduleList><vendor>keep</vendor></Record></body>","0".repeat(168))),
-            319 => self.time_lapse_xml.lock().unwrap().clone().unwrap_or_else(||"<body><timelapseCfg><channelId>0</channelId><overwrite>0</overwrite></timelapseCfg></body>".into()),
+            319 => self.time_lapse_xml.lock().unwrap().clone().unwrap_or_else(||include_str!("../fixtures/lumus-empty-time-lapse.xml").into()),
             82 | 320 => {
                 let target = if command == 82 { &self.schedule_xml } else { &self.time_lapse_xml };
                 let doc = roxmltree::Document::parse(body)?;
+                if command == 320 && field(&doc, "enable") == Some("1") {
+                    if field(&doc, "streamType") == Some("subStream") && field(&doc, "buseThumbnail") == Some("1") {
+                        return Ok((400,String::new()));
+                    }
+                    if target.lock().unwrap().is_none() {
+                        let millis = field(&doc, "id").and_then(|v| v.parse::<u64>().ok());
+                        if !millis.is_some_and(|n| field(&doc,"properties") == Some(format!("v1_{}_Customize",n/1000).as_str())) {
+                            return Ok((400,String::new()));
+                        }
+                    }
+                }
                 *target.lock().unwrap() = Some(body[doc.root_element().range()].to_owned());
                 self.writes.fetch_add(1,Ordering::SeqCst);
                 String::new()

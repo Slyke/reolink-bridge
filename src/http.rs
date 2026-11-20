@@ -390,6 +390,7 @@ async fn execute_camera(
         Some("PTZ_PRESET_UNKNOWN") => StatusCode::NOT_FOUND,
         Some(
             "CONTROL_VALIDATION_FAILED"
+            | "CONTROL_TIME_LAPSE_REJECTED"
             | "CONTROL_TRANSPORT_DISABLED"
             | "PTZ_TRANSPORT_DISABLED"
             | "PTZ_UNSUPPORTED"

@@ -542,17 +542,40 @@ async fn local_broker_http_websocket_and_camera_controls() {
     assert_eq!(hours.iter().filter(|b| **b == b'1').count(), 2);
     assert_eq!((hours[32], hours[167]), (b'1', b'1'));
     let lapse = request(&mut websocket, json!({"id":"time-lapse", "op":"control", "camera_id":"lab",
-        "command":{"setting":"time_lapse","enabled":true,"interval_seconds":12,"format":"jpeg","stream":"sub"}})).await;
+        "command":{"setting":"time_lapse","enabled":true,"interval_seconds":30,"format":"jpeg","stream":"sub"}})).await;
     assert_eq!(lapse["ok"], true, "{lapse}");
     assert_eq!(lapse["verified"], true);
-    assert!(
-        mock.time_lapse_xml
-            .lock()
-            .unwrap()
-            .as_deref()
-            .unwrap()
-            .contains("<neverEnd>1</neverEnd>")
+    assert_eq!(
+        lapse["state"],
+        json!({"configured":true,"enabled":true,"interval_seconds":30,"format":"jpeg","stream":"sub","overwrite":true})
     );
+    let saved_lapse = mock.time_lapse_xml.lock().unwrap().clone().unwrap();
+    let doc = roxmltree::Document::parse(&saved_lapse).unwrap();
+    let item = doc.descendants().find(|n| n.has_tag_name("item")).unwrap();
+    let date = |tag| {
+        item.children()
+            .find(|n| n.has_tag_name(tag))
+            .unwrap()
+            .children()
+            .filter(|n| n.is_element())
+            .map(|n| n.text().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(date("startTime"), date("endTime"));
+    assert!(saved_lapse.contains("<neverEnd>1</neverEnd>"));
+    assert!(saved_lapse.contains("<buseThumbnail>0</buseThumbnail>"));
+    assert_eq!(saved_lapse.matches("<valid>1</valid>").count(), 1);
+    assert_eq!(saved_lapse.matches("<duration>").count(), 4);
+    mock.reject_read_command.store(320, Ordering::SeqCst);
+    let rejection = request(
+        &mut websocket,
+        json!({"id":"lapse-rejected","op":"control","camera_id":"lab",
+        "command":{"setting":"time_lapse","overwrite":false}}),
+    )
+    .await;
+    assert_eq!(rejection["errorKey"], "CONTROL_TIME_LAPSE_REJECTED");
+    assert_eq!(rejection["cameraStatus"], 405);
+    mock.reject_read_command.store(0, Ordering::SeqCst);
 
     publisher
         .publish(

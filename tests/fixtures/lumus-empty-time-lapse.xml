@@ -1,0 +1,15 @@
+<body>
+  <timelapseCfg version="1.1">
+    <channelId>0</channelId><overwrite>0</overwrite><maxFileNum>10000</maxFileNum>
+    <item>
+      <startTime><year>2000</year><month>1</month><day>1</day><hour>0</hour><minute>0</minute></startTime>
+      <endTime><year>2030</year><month>12</month><day>31</day><hour>23</hour><minute>59</minute></endTime>
+      <duration><valid>0</valid><startTime><hour>0</hour><minute>0</minute><second>0</second></startTime><endTime><hour>23</hour><minute>59</minute><second>59</second></endTime></duration>
+      <duration><valid>0</valid><startTime><hour>0</hour><minute>0</minute><second>0</second></startTime><endTime><hour>23</hour><minute>59</minute><second>59</second></endTime></duration>
+      <duration><valid>0</valid><startTime><hour>0</hour><minute>0</minute><second>0</second></startTime><endTime><hour>23</hour><minute>59</minute><second>59</second></endTime></duration>
+      <duration><valid>0</valid><startTime><hour>0</hour><minute>0</minute><second>0</second></startTime><endTime><hour>23</hour><minute>59</minute><second>59</second></endTime></duration>
+      <enable>0</enable><neverEnd>0</neverEnd><frameRate>15</frameRate><buseThumbnail>1</buseThumbnail>
+      <interval>10</interval><streamType>mainStream</streamType><taskType>mp4</taskType><id/><properties/>
+    </item>
+  </timelapseCfg>
+</body>

@@ -79,6 +79,7 @@
   "reolink-bridge-CONTROL_TRANSPORT_DISABLED": "Baichuan controls are disabled for this camera.",
   "reolink-bridge-CONTROL_ID_CONFLICT": "This command ID is already in use.",
   "reolink-bridge-CONTROL_EXPIRED": "The command expired before execution.",
+  "reolink-bridge-CONTROL_TIME_LAPSE_REJECTED": "The camera rejected the time-lapse settings.",
   "reolink-bridge-CONTROL_WRITE_OR_READBACK_FAILED": "The camera setting could not be written or read back. Check the current state before retrying.",
   "reolink-bridge-CONTROL_READBACK_UNVERIFIED": "The camera acknowledged the write. Its readback did not confirm the requested setting.",
   "reolink-bridge-CALLBACK_UPDATE_MISSING": "The callback to update does not exist.",

@@ -57,6 +57,10 @@ pub struct Rejected {
     status: u16,
 }
 impl Rejected {
+    pub fn command(&self) -> u32 {
+        self.command
+    }
+
     pub fn status(&self) -> u16 {
         self.status
     }

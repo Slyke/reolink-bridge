@@ -361,13 +361,34 @@ impl CameraTask {
                     }
                     reply
                 }
-                Err((key, error)) => self.hub.diagnostics.error(
-                    "camera::controls",
-                    key,
-                    Some(request.correlation_id),
-                    json!({"cameraId":self.config.id}),
-                    Some(error),
-                ),
+                Err((key, error)) => {
+                    let status = error
+                        .downcast_ref::<reolink::wire::Rejected>()
+                        .filter(|e| {
+                            e.command() == 320
+                                && matches!(e.status(), 400 | 401 | 403 | 404 | 405 | 409 | 422)
+                        })
+                        .map(|e| e.status());
+                    let mut context = json!({"cameraId":self.config.id});
+                    if let Some(status) = status {
+                        context["cameraStatus"] = json!(status);
+                    }
+                    let mut reply = self.hub.diagnostics.error(
+                        "camera::controls",
+                        if status.is_some() {
+                            "CONTROL_TIME_LAPSE_REJECTED"
+                        } else {
+                            key
+                        },
+                        Some(request.correlation_id),
+                        context,
+                        Some(error),
+                    );
+                    if let Some(status) = status {
+                        reply["cameraStatus"] = json!(status);
+                    }
+                    reply
+                }
             };
             if let Some(id) = request.replay_id {
                 remember(&mut recent, id, request.control, reply.clone());
