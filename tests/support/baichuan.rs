@@ -54,6 +54,7 @@ pub struct Camera {
     pub rtsp_writes: AtomicUsize,
     pub wifi_xml: Mutex<Option<String>>,
     pub speaker_volume: Mutex<Option<u8>>,
+    pub ftp_xml: Mutex<Option<String>>,
     pub encoder_fps: Mutex<Option<u32>>,
     pub clock: Mutex<Option<(chrono::NaiveDateTime, std::time::Instant)>>,
     pub clock_zone_west: Mutex<Option<i32>>,
@@ -513,6 +514,13 @@ impl Camera {
                 if self.recording.is_none() {return Ok((405,String::new()))}
                 ensure!(body.contains("<streamType>subStream</streamType>"));
                 "<body><FileInfoList/></body>".into()
+            }
+            68 => self.ftp_xml.lock().unwrap().clone().unwrap_or_else(|| "<body><Ftp version=\"1.1\"><server/><port>21</port><userName/><password/><remoteDir/><nonymous>0</nonymous><onlyFtps>0</onlyFtps><mode>2</mode><streamType>1</streamType><pwdMaxLen>64</pwdMaxLen></Ftp></body>".into()),
+            69 => {
+                let doc=roxmltree::Document::parse(body)?;
+                ensure!(field(&doc,"mode")==Some("2") && field(&doc,"streamType")==Some("1"));
+                *self.ftp_xml.lock().unwrap()=Some(body[doc.root_element().range()].to_owned());
+                String::new()
             }
             264 => format!("<body><audioCfg><channelId>0</channelId><volume>{}</volume><timeout>17</timeout></audioCfg></body>",self.speaker_volume.lock().unwrap().unwrap_or(62)),
             265 => {

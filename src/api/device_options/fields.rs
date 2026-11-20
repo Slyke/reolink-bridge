@@ -22,6 +22,12 @@ pub(super) struct Group {
 }
 
 impl Group {
+    pub fn device_wide(&self) -> bool {
+        self.get == 68
+    }
+    pub fn wire_channel(&self, channel: u8) -> Option<u8> {
+        (!self.device_wide()).then_some(channel)
+    }
     pub fn named(name: &str) -> Option<Self> {
         let (get, set, root, fields): (_, _, _, &[Field]) = match name {
             "picture" => (
@@ -163,6 +169,7 @@ impl Group {
                 "EmailTask",
                 &[("emailEnabled", "EmailTask/enable", Switch)],
             ),
+            "ftpDestination" => (68, 69, "Ftp", &[]),
             "ftp" => (
                 70,
                 71,
@@ -196,6 +203,9 @@ impl Group {
         Ok(())
     }
     pub fn describe(&self, root: Node<'_, '_>, channel: u8) -> Result<Value> {
+        if self.device_wide() {
+            return super::ftp::describe(root, channel);
+        }
         self.channel(root, channel)?;
         let mut fields = Map::new();
         for &(key, path, kind) in self.fields {
@@ -222,6 +232,9 @@ impl Group {
         channel: u8,
         fields: &Map<String, Value>,
     ) -> Result<Option<String>> {
+        if self.device_wide() {
+            return super::ftp::edit(root, channel, fields);
+        }
         if fields.is_empty() {
             return Err(Problem::Invalid);
         }

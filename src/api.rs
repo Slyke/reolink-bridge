@@ -535,7 +535,7 @@ async fn contract(
         Vec::new()
     };
     Json(json!({"version":1,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
-       "deviceOptions":true,"displayCameras":api.devices.keys().collect::<Vec<_>>(),
+       "ftpDestination":true,"deviceOptions":true,"displayCameras":api.devices.keys().collect::<Vec<_>>(),
        "encodingCameras":api.devices.keys().collect::<Vec<_>>(),
        "clockCameras":api.devices.keys().collect::<Vec<_>>(),"rtspSettings":true,"networkCameras":api.devices.keys().chain(api.onvif.keys()).collect::<BTreeSet<_>>(),
        "userCameras":api.devices.keys().collect::<Vec<_>>(),

@@ -1068,6 +1068,27 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
         "enabled"
     );
     assert!(!camera.rtsp_enabled.load(Ordering::SeqCst));
+    let ftp = url("/cameras/garage/options/ftpDestination");
+    let (_, view) = response(&client, &ftp, PRIMARY, None).await;
+    assert_eq!(view["fields"]["port"], 21);
+    assert_eq!(view["passwordStored"], false);
+    let fields = json!({"server":"uploads.example.test","port":2121,"username":"camera","password":"fixture-only-ftp","remoteDirectory":"garage & yard","ftpsOnly":true});
+    let saved = client
+        .put(&ftp)
+        .bearer_auth(PRIMARY)
+        .header("content-type", "application/json")
+        .body(json!({"fields":fields}).to_string())
+        .send()
+        .await?;
+    assert_eq!(saved.status(), 200);
+    let after = saved.text().await?;
+    assert!(!after.contains("fixture-only-ftp"));
+    let data: Value = serde_json::from_str(&after)?;
+    assert_eq!(data["outcome"], "confirmed");
+    let (_, view) = response(&client, &ftp, PRIMARY, None).await;
+    assert_eq!(view["fields"]["remoteDirectory"], "garage & yard");
+    assert_eq!(view["passwordStored"], true);
+    assert!(view["fields"].get("password").is_none());
     let audio_options = url("/cameras/garage/options/sound");
     assert_eq!(
         response(&client, &audio_options, PRIMARY, None).await.1["fields"]["speakerVolume"]["value"],

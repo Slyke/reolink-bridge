@@ -1,4 +1,5 @@
 mod fields;
+mod ftp;
 
 use super::*;
 use crate::{
@@ -40,7 +41,7 @@ impl Problem {
 }
 async fn read(session: &mut Session, group: &Group, channel: u8) -> Result<String> {
     session
-        .command(group.get, Some(channel), "")
+        .command(group.get, group.wire_channel(channel), "")
         .await
         .map_err(|e| {
             if e.downcast_ref::<Rejected>()
@@ -107,7 +108,16 @@ pub(super) async fn set(
     let (Some(device), Some(group)) = (api.devices.get(&id), Group::named(&name)) else {
         return Problem::Unsupported.response(&cid);
     };
-    let Ok(_guard) = api.network_writes[&id].try_lock() else {
+    // The FTP destination belongs to the device, including when multiple routes address its channels.
+    let lock_id = if group.device_wide() {
+        api.devices
+            .iter()
+            .find(|(_, d)| d.host == device.host && d.port == device.port)
+            .map_or(&id, |(key, _)| key)
+    } else {
+        &id
+    };
+    let Ok(_guard) = api.network_writes[lock_id].try_lock() else {
         return error(StatusCode::CONFLICT, "API_DISPLAY_BUSY", &cid);
     };
     let Ok(_slot) = api.settings_slots.try_acquire() else {
@@ -123,7 +133,7 @@ pub(super) async fn set(
                 return report(&group, &raw, channel);
             };
             session
-                .command(group.set, Some(channel), &body)
+                .command(group.set, group.wire_channel(channel), &body)
                 .await
                 .map_err(|e| {
                     if e.is::<Rejected>() {
@@ -135,8 +145,12 @@ pub(super) async fn set(
             let raw = read(&mut session, &group, channel)
                 .await
                 .map_err(|_| Problem::Unverified)?;
-            let result = report(&group, &raw, channel).map_err(|_| Problem::Unverified)?;
-            if !change.fields.iter().all(|(key, value)| {
+            let mut result = report(&group, &raw, channel).map_err(|_| Problem::Unverified)?;
+            if group.device_wide() {
+                if !ftp::verify(&raw, channel, &result, &change.fields)? {
+                    result["outcome"] = json!("unverified");
+                }
+            } else if !change.fields.iter().all(|(key, value)| {
                 result["fields"]
                     .get(key)
                     .and_then(|field| field.get("value"))
@@ -155,7 +169,9 @@ pub(super) async fn set(
         .unwrap_or(Err(Problem::Unverified))
     {
         Ok(mut data) => {
-            data["outcome"] = json!("confirmed");
+            if data.get("outcome").is_none() {
+                data["outcome"] = json!("confirmed");
+            }
             data["correlation_id"] = json!(cid.0);
             Json(data).into_response()
         }
