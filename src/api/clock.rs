@@ -98,8 +98,15 @@ impl Reading {
         .into_iter()
         .filter_map(|(name, state)| state.map(|_| name))
         .collect();
-        json!({"cameraTime":self.time.map(|v|v.format(FORMAT).to_string()),"editableOptions":editable,"settings":{
-            "utcOffsetMinutes":self.utc_offset,"daylightSavingEnabled":self.dst_enabled,"ntpEnabled":self.ntp}})
+        let mut settings = json!({
+            "utcOffsetMinutes": self.utc_offset,
+            "daylightSavingEnabled": self.dst_enabled,
+            "ntpEnabled": self.ntp
+        });
+        if let Some(schedule) = self.schedule.as_ref().filter(|s| s.valid()) {
+            settings["daylightSavingSchedule"] = json!(schedule);
+        }
+        json!({"cameraTime": self.time.map(|v| v.format(FORMAT).to_string()), "editableOptions": editable, "settings": settings})
     }
 }
 

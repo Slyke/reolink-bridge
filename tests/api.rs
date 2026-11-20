@@ -1068,6 +1068,32 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
         "enabled"
     );
     assert!(!camera.rtsp_enabled.load(Ordering::SeqCst));
+    let audio_options = url("/cameras/garage/options/sound");
+    assert_eq!(
+        response(&client, &audio_options, PRIMARY, None).await.1["fields"]["speakerVolume"]["value"],
+        62
+    );
+    for (fields, status) in [
+        (json!({"speakerVolume":43}), 200),
+        (json!({"speakerVolume":101}), 422),
+        (json!({"doorbellVolume":40}), 422),
+        (json!({"maskEnabled":false}), 422),
+    ] {
+        let result = client
+            .put(&audio_options)
+            .bearer_auth(PRIMARY)
+            .header("content-type", "application/json")
+            .body(json!({"fields":fields}).to_string())
+            .send()
+            .await?;
+        assert_eq!(result.status().as_u16(), status);
+        if status == 200 {
+            let result: Value = serde_json::from_str(&result.text().await?)?;
+            assert_eq!(result["outcome"], "confirmed");
+            assert_eq!(result["fields"]["speakerVolume"]["value"], 43);
+        }
+    }
+    assert_eq!(*camera.speaker_volume.lock().unwrap(), Some(43));
     let encoding = url("/cameras/garage/encoding");
     let current = response(&client, &encoding, PRIMARY, None).await.1;
     assert_eq!(current["profiles"][0]["current"]["fps"], 20);
@@ -1134,7 +1160,7 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     let after = response(&client, &clock, PRIMARY, None).await.1;
     assert_eq!(
         after["settings"],
-        json!({"utcOffsetMinutes":-420,"daylightSavingEnabled":false,"ntpEnabled":true})
+        json!({"utcOffsetMinutes":-420,"daylightSavingEnabled":false,"ntpEnabled":true,"daylightSavingSchedule":seasonal["daylightSaving"]})
     );
     assert_eq!(*camera.clock_zone_west.lock().unwrap(), Some(25200));
     let manual = json!({"cameraTime":"2028-02-29T20:47:06","ntpEnabled":false});
@@ -1147,7 +1173,7 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     assert_eq!(ntp_only.status(), 200);
     assert_eq!(
         serde_json::from_str::<Value>(&ntp_only.text().await?)?["settings"],
-        json!({"utcOffsetMinutes":-420,"daylightSavingEnabled":false,"ntpEnabled":true})
+        json!({"utcOffsetMinutes":-420,"daylightSavingEnabled":false,"ntpEnabled":true,"daylightSavingSchedule":seasonal["daylightSaving"]})
     );
     assert_eq!(*camera.clock_dst.lock().unwrap(), Some(saved_dst.clone()));
     let dst_only = change_clock(json!({"daylightSavingEnabled":true})).await?;
@@ -1163,7 +1189,7 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     );
     assert_eq!(
         read["settings"],
-        json!({"utcOffsetMinutes":-420,"daylightSavingEnabled":true,"ntpEnabled":true})
+        json!({"utcOffsetMinutes":-420,"daylightSavingEnabled":true,"ntpEnabled":true,"daylightSavingSchedule":seasonal["daylightSaving"]})
     );
     assert_eq!(
         change_clock(json!({"daylightSavingEnabled":false,"ntpEnabled":false}))

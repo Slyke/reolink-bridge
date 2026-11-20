@@ -1,5 +1,6 @@
 mod clock;
 mod credentials;
+mod device_options;
 mod display;
 mod encoding;
 mod media;
@@ -422,6 +423,10 @@ pub fn router(api: Arc<Api>) -> Router {
             "/api/cameras/{id}/encoding",
             get(encoding::get).put(encoding::set),
         )
+        .route(
+            "/api/cameras/{id}/options/{group}",
+            get(device_options::get).put(device_options::set),
+        )
         .route("/api/cameras/{id}/clock", get(clock::get).put(clock::set))
         .route(
             "/api/cameras/{id}/network/wifi",
@@ -530,7 +535,7 @@ async fn contract(
         Vec::new()
     };
     Json(json!({"version":1,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
-       "displayCameras":api.devices.keys().collect::<Vec<_>>(),
+       "deviceOptions":true,"displayCameras":api.devices.keys().collect::<Vec<_>>(),
        "encodingCameras":api.devices.keys().collect::<Vec<_>>(),
        "clockCameras":api.devices.keys().collect::<Vec<_>>(),"rtspSettings":true,"networkCameras":api.devices.keys().chain(api.onvif.keys()).collect::<BTreeSet<_>>(),
        "userCameras":api.devices.keys().collect::<Vec<_>>(),

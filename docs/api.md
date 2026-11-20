@@ -211,3 +211,12 @@ The recording metadata endpoint returns source: "recording", a frames array of o
 HTTP 4xx/5xx responses always generate keyed diagnostics, including framework rejections (HTTP_REQUEST_REJECTED) and failed probes (HTTP_READINESS_FAILED). The middleware preserves already reported causes without duplicate logs. Sink and per-key logging gates decide which outputs receive those records. Preview capture errors use API_PREVIEW_CAPTURE_FAILED even when the last good frame remains available. Recording preview failures use API_RECORDING_PREVIEW_FAILED, and recording metadata failures use API_RECORDING_METADATA_FAILED.
 
 Valkey preview-cache command failures generate API_PREVIEW_CACHE_FAILED with a safe error category. This key defaults to warning level and can be routed or suppressed by the logging gates. A Valkey outage does not disable the memory preview cache.
+
+
+### Camera picture, sound, detection and delivery settings
+
+The contract flag `deviceOptions` enables `GET` and `PUT /api/cameras/{id}/options/{group}` for Baichuan cameras listed under `displayCameras`. The groups are `picture`, `threshold`, `sound`, `recordingAudio`, `privacy`, `tracking`, `siren`, `push`, `email` and `ftp`. Each GET returns the available fields, their current values and applicable bounds or choices. A privacy response can include the number of existing masks. The audio recording switches belong to their individual streams. Alert delivery switches use the schedules and destinations already stored on the device.
+
+Send a JSON object such as `{"fields":{"contrast":140,"dayNight":"auto"}}` to the picture endpoint. The bridge validates the reported channel, updates only the requested fields in that settings group and verifies the values by reading the camera again. A firmware rejection or a missing readback is reported separately. Camera notification addresses, credentials and mask coordinates stay on the bridge.
+
+The clock endpoint includes `settings.daylightSavingSchedule` when the camera supplies valid recurring rules. Enabling DST makes the camera switch on those dates automatically.

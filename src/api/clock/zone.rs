@@ -1,6 +1,6 @@
 use crate::xml;
 use roxmltree::Node;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const DAYS: [&str; 7] = [
     "Sunday",
@@ -12,7 +12,7 @@ const DAYS: [&str; 7] = [
     "Saturday",
 ];
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Transition {
     month: u8,
@@ -60,7 +60,7 @@ impl Transition {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Schedule {
     hours: u8,
@@ -69,6 +69,12 @@ pub(super) struct Schedule {
 }
 
 impl Schedule {
+    pub(super) fn valid(&self) -> bool {
+        matches!(self.hours, 1 | 2)
+            && self.start.valid()
+            && self.end.valid()
+            && self.start != self.end
+    }
     pub(super) fn read(node: Node<'_, '_>) -> Option<Self> {
         Some(Self {
             hours: xml::value(node, "offset")?.parse().ok()?,
@@ -89,9 +95,7 @@ pub(super) struct Zone {
 impl Zone {
     pub(super) fn valid(&self) -> bool {
         (-720..=840).contains(&self.utc_offset_minutes)
-            && self.daylight_saving.as_ref().is_none_or(|s| {
-                matches!(s.hours, 1 | 2) && s.start.valid() && s.end.valid() && s.start != s.end
-            })
+            && self.daylight_saving.as_ref().is_none_or(Schedule::valid)
     }
     pub(super) fn dst_xml(&self) -> String {
         let fields = self.daylight_saving.as_ref().map_or_else(

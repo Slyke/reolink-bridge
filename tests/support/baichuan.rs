@@ -53,6 +53,7 @@ pub struct Camera {
     pub rtsp_enabled: AtomicBool,
     pub rtsp_writes: AtomicUsize,
     pub wifi_xml: Mutex<Option<String>>,
+    pub speaker_volume: Mutex<Option<u8>>,
     pub encoder_fps: Mutex<Option<u32>>,
     pub clock: Mutex<Option<(chrono::NaiveDateTime, std::time::Instant)>>,
     pub clock_zone_west: Mutex<Option<i32>>,
@@ -512,6 +513,13 @@ impl Camera {
                 if self.recording.is_none() {return Ok((405,String::new()))}
                 ensure!(body.contains("<streamType>subStream</streamType>"));
                 "<body><FileInfoList/></body>".into()
+            }
+            264 => format!("<body><audioCfg><channelId>0</channelId><volume>{}</volume><timeout>17</timeout></audioCfg></body>",self.speaker_volume.lock().unwrap().unwrap_or(62)),
+            265 => {
+                let doc=roxmltree::Document::parse(body)?;
+                ensure!(field(&doc,"channelId")==Some("0") && field(&doc,"timeout")==Some("17"));
+                *self.speaker_volume.lock().unwrap()=Some(field(&doc,"volume").unwrap().parse()?);
+                String::new()
             }
             26=>format!("<body><VideoInput><channelId>0</channelId><bright>128</bright></VideoInput><InputAdvanceCfg><Mirror><enable>{}</enable></Mirror><Flip><enable>{}</enable></Flip><rotationRange><angle>0</angle><angle>90</angle><angle>180</angle><angle>270</angle></rotationRange><rotation>{}</rotation><untouched>19</untouched></InputAdvanceCfg></body>",
                 u8::from(self.mirror.load(Ordering::SeqCst)),u8::from(self.flip.load(Ordering::SeqCst)),self.rotation.load(Ordering::SeqCst)),
