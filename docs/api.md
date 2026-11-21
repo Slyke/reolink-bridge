@@ -27,6 +27,7 @@ Replace the documentation address with a private IPv4 target from the installati
 | Method and path under `/api` | Credential | Behavior |
 | --- | --- | --- |
 | GET `/contract` | `http.token` | Contract version and configured inventory, settings, media, callback, and enrollment capabilities. |
+| POST `/terminate` | `http.token` | Send an empty POST with the bearer token. The bridge returns `202` with `status: "terminating"` and a `correlation_id`, drains connections and workers, and exits successfully. The deployment supervisor controls whether it restarts. |
 | GET `/inventory` | `http.token` | Registered public IDs, stable identities and activation status. Devices paused for credential recovery remain visible. |
 | POST `/cameras/{id}/command/exec` | `http.token` | Typed command. [Camera controls](./controls.md) |
 | GET/POST `/callbacks` | `http.token` | List or add callback delivery rules. |

@@ -53,6 +53,7 @@
   "reolink-bridge-CONFIG_SYNTAX_INVALID": "The configuration file contains invalid JSON5.",
   "reolink-bridge-LOG_CONFIG_INVALID": "The logging configuration is invalid.",
   "reolink-bridge-CONFIG_VALIDATION_FAILED": "The bridge configuration is invalid.",
+  "reolink-bridge-SERVICE_TERMINATION_REQUESTED": "An authenticated API request initiated bridge shutdown.",
   "reolink-bridge-SERVICE_BOOT_DIAGNOSTICS": "Bridge starting.",
   "reolink-bridge-SERVICE_RUN_FAILED": "The bridge could not run.",
   "reolink-bridge-SERVICE_WORKER_SHUTDOWN_FAILED": "A bridge worker failed during shutdown.",

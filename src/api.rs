@@ -110,6 +110,7 @@ pub struct Api {
     settings_slots: Semaphore,
     speakers: talk::Speakers,
     network_writes: BTreeMap<String, Mutex<()>>,
+    pub(crate) shutdown_requested: CancellationToken,
     stop: CancellationToken,
 }
 
@@ -332,6 +333,7 @@ impl Api {
             hub: None,
             media_slots: Arc::new(Semaphore::new(4)),
             settings_slots: Semaphore::new(8),
+            shutdown_requested: CancellationToken::new(),
             stop,
         })
     }
@@ -421,6 +423,7 @@ pub fn router(api: Arc<Api>) -> Router {
         .layer(DefaultBodyLimit::max(32 * 1024));
     Router::new()
         .route("/api/contract", get(contract))
+        .route("/api/terminate", post(terminate))
         .route("/api/cameras/{id}/talk", get(talk::capability))
         .route(
             "/api/cameras/{id}/talk/{token}",
@@ -525,6 +528,29 @@ fn progress(status: Status, id: Option<String>, correlation: &CorrelationId) -> 
         .into_response()
 }
 
+async fn terminate(
+    State(api): State<Arc<Api>>,
+    headers: HeaderMap,
+    Extension(correlation): Extension<CorrelationId>,
+) -> Response {
+    if !api.authenticated(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
+    }
+    api.hub().diagnostics.log(
+        "api::terminate",
+        "SERVICE_TERMINATION_REQUESTED",
+        "info",
+        Some(correlation.0.clone()),
+        Value::Null,
+    );
+    api.shutdown_requested.cancel();
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"ok":true,"status":"terminating","correlation_id":correlation.0})),
+    )
+        .into_response()
+}
+
 async fn contract(
     State(api): State<Arc<Api>>,
     headers: HeaderMap,
@@ -545,7 +571,7 @@ async fn contract(
     } else {
         Vec::new()
     };
-    Json(json!({"version":1,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
+    Json(json!({"version":1,"terminate":true,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
        "talk":true,"privacyMaskEditing":true,"ftpDestination":true,"deviceOptions":true,"displayCameras":api.devices.keys().collect::<Vec<_>>(),
        "encodingCameras":api.devices.keys().collect::<Vec<_>>(),
        "clockCameras":api.devices.keys().collect::<Vec<_>>(),"rtspSettings":true,"networkCameras":api.devices.keys().chain(api.onvif.keys()).collect::<BTreeSet<_>>(),

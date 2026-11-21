@@ -338,6 +338,7 @@ async fn run(
         ));
     }
 
+    let shutdown_requested = api.shutdown_requested.clone();
     let app = Arc::new(http::App {
         api: api.attach(hub.clone(), &mut workers),
         hub,
@@ -367,6 +368,7 @@ async fn run(
     let mut server = std::pin::pin!(server);
     let (result, server_exited) = tokio::select! {
         _ = shutdown_signal() => (Ok(()), false),
+        _ = shutdown_requested.cancelled() => (Ok(()), false),
         result = &mut server => (result.context("HTTP server failed"), true),
         _ = workers.join_next(), if !workers.is_empty() => (Err(anyhow::anyhow!("a bridge worker exited unexpectedly")), false),
     };

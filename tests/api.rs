@@ -101,6 +101,66 @@ async fn start(config: &Path, client: &Client, origin: &str) -> Result<Child> {
     anyhow::bail!("fixture bridge did not start")
 }
 
+#[tokio::test]
+async fn authenticated_terminate_acknowledges_and_exits_cleanly() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = directory.path().join("bridge.json");
+    let port = free_port()?;
+    let origin = format!("http://127.0.0.1:{port}");
+    std::fs::write(
+        &config,
+        json!({
+            "mqtt":{"url":"mqtt://127.0.0.1:1","baseTopic":"fixture"},
+            "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
+            "api":{}, "cameras":[]
+        })
+        .to_string(),
+    )?;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let mut bridge = start(&config, &client, &origin).await?;
+    let url = format!("{origin}/api/terminate");
+    for request in [client.post(&url), client.post(&url).bearer_auth("wrong")] {
+        let reply = request.send().await?;
+        assert_eq!(reply.status(), 401);
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply.text().await?)?["errorKey"],
+            "API_SCOPE_DENIED"
+        );
+    }
+    assert_eq!(
+        client.get(&url).bearer_auth(PRIMARY).send().await?.status(),
+        405
+    );
+    assert_eq!(
+        response(&client, &format!("{origin}/api/contract"), PRIMARY, None)
+            .await
+            .1["terminate"],
+        true
+    );
+    let id = Uuid::new_v4().to_string();
+    let reply = client
+        .post(&url)
+        .bearer_auth(PRIMARY)
+        .header("x-correlation-id", &id)
+        .send()
+        .await?;
+    assert_eq!(reply.status(), 202);
+    assert_eq!(reply.headers()["x-correlation-id"], id.as_str());
+    assert_eq!(
+        serde_json::from_str::<Value>(&reply.text().await?)?,
+        json!({"ok":true,"status":"terminating","correlation_id":id})
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(20), bridge.wait())
+            .await??
+            .success()
+    );
+    Ok(())
+}
+
 async fn discovered(client: &Client, url: &str) -> Value {
     let until = Instant::now() + Duration::from_secs(8);
     loop {
