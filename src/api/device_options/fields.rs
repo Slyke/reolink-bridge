@@ -15,6 +15,7 @@ use Kind::*;
 type Field = (&'static str, &'static str, Kind);
 
 pub(super) struct Group {
+    pub zone: Option<super::zones::Zone>,
     pub get: u32,
     pub set: u32,
     root: &'static str,
@@ -29,6 +30,16 @@ impl Group {
         (!self.device_wide()).then_some(channel)
     }
     pub fn named(name: &str) -> Option<Self> {
+        if let Some(zone) = super::zones::Zone::named(name) {
+            let (get, set, root) = zone.commands();
+            return Some(Self {
+                zone: Some(zone),
+                get,
+                set,
+                root,
+                fields: &[],
+            });
+        }
         let (get, set, root, fields): (_, _, _, &[Field]) = match name {
             "picture" => (
                 26,
@@ -179,6 +190,7 @@ impl Group {
             _ => return None,
         };
         Some(Self {
+            zone: None,
             get,
             set,
             root,
@@ -203,6 +215,9 @@ impl Group {
         Ok(())
     }
     pub fn describe(&self, root: Node<'_, '_>, channel: u8) -> Result<Value> {
+        if let Some(zone) = self.zone {
+            return zone.describe(root, channel);
+        }
         if self.device_wide() {
             return super::ftp::describe(root, channel);
         }
@@ -237,6 +252,9 @@ impl Group {
         channel: u8,
         fields: &Map<String, Value>,
     ) -> Result<Option<String>> {
+        if let Some(zone) = self.zone {
+            return zone.edit(root, channel, fields);
+        }
         if self.device_wide() {
             return super::ftp::edit(root, channel, fields);
         }

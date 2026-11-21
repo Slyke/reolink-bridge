@@ -2,6 +2,8 @@
 
 The authenticated API is available under `/api` on the bridge's HTTP listener. Send `http.token` as a bearer token. Inventory is available with the standard bridge configuration. Use the optional `api` section for cached previews, video profiles, recording storage, and enrollment.
 
+With `terminate: true` and `terminationOptions: true`, `POST /api/terminate` accepts a JSON object with an optional `reason` and an optional integer `exitCode` from 0 through 255 (default 0). Use the bridge's HTTP bearer token. The bridge acknowledges the request with HTTP 202, writes the exit code and reason to stdout and the configured logger, and exits. A supervisor such as Kubernetes starts the replacement process.
+
 ```json5
 api: {
   // For provisioning and camera password rotation, mount persistent storage at this path.
@@ -217,6 +219,8 @@ Valkey preview-cache command failures generate API_PREVIEW_CACHE_FAILED with a s
 ### Camera picture, sound, detection and delivery settings
 
 The contract flag `talk` advertises camera speaker negotiation. Read `GET /api/cameras/{id}/talk` for availability. Start with `POST /api/cameras/{id}/talk/{session-uuid}` and use the returned mono `sampleRate` and `blockSamples`. Send `PUT` to the same URL with `{"sequence":0,"pcm":"…"}` using sequential chunks of one to four complete 16-bit little-endian PCM blocks encoded in Base64. The bridge encodes the audio for the camera. Release with `DELETE`. One session can hold a physical speaker at a time. The bridge also releases it after four seconds without audio.
+
+With `detectionZones: true`, the camera option groups `motionZone`, `personZone`, `vehicleZone`, `petZone` and `faceZone` expose their individual detection grids on supported cameras. The response's `zone` contains `width`, `height`, `revision`, and a row-major `cells` string. Each `0` excludes that cell and each `1` enables detection. A PUT with `fields.expectedRevision` and `fields.cells` changes one detector. The bridge verifies the result against a fresh camera read. Stale revisions return HTTP 409.
 
 The contract flag `deviceOptions` enables `GET` and `PUT /api/cameras/{id}/options/{group}` for Baichuan cameras listed under `displayCameras`. The groups are `picture`, `threshold`, `sound`, `recordingAudio`, `privacy`, `tracking`, `siren`, `push`, `email` and `ftp`. Each GET returns the available fields, their current values and applicable bounds or choices. When the contract advertises `privacyMaskEditing`, the privacy response can also include `privacyMasks` with `areas`, `maxAreas`, and a `revision`. Rectangles use `id, x, y, width, height` in a 1024 × 768 reference frame. Send `fields.maskAreas`, `fields.maskEnabled` and `fields.expectedRevision` to replace the rectangles. A stale revision returns HTTP 409. The audio recording switches belong to their individual streams. Alert delivery switches use the schedules and destinations already stored on the device.
 

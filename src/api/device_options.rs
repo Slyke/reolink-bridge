@@ -1,6 +1,7 @@
 mod fields;
 mod ftp;
 mod privacy;
+mod zones;
 
 use super::*;
 use crate::{
@@ -13,6 +14,7 @@ use serde_json::Map;
 #[derive(Debug)]
 enum Problem {
     Changed,
+    ZoneChanged,
     Invalid,
     Unsupported,
     Read,
@@ -23,6 +25,7 @@ type Result<T> = std::result::Result<T, Problem>;
 impl Problem {
     fn response(self, cid: &CorrelationId) -> Response {
         let (status, key) = match self {
+            Self::ZoneChanged => (StatusCode::CONFLICT, "API_DETECTION_ZONE_CHANGED"),
             Self::Changed => (StatusCode::CONFLICT, "API_PRIVACY_MASKS_CHANGED"),
             Self::Invalid => (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -43,8 +46,12 @@ impl Problem {
     }
 }
 async fn read(session: &mut Session, group: &Group, channel: u8) -> Result<String> {
+    let query = group
+        .zone
+        .map(|zone| zone.query(channel))
+        .unwrap_or_default();
     session
-        .command(group.get, group.wire_channel(channel), "")
+        .command(group.get, group.wire_channel(channel), &query)
         .await
         .map_err(|e| {
             if e.downcast_ref::<Rejected>()
@@ -149,7 +156,11 @@ pub(super) async fn set(
                 .await
                 .map_err(|_| Problem::Unverified)?;
             let mut result = report(&group, &raw, channel).map_err(|_| Problem::Unverified)?;
-            if group.device_wide() {
+            if group.zone.is_some() {
+                if result["zone"]["cells"] != change.fields["cells"] {
+                    return Err(Problem::Unverified);
+                }
+            } else if group.device_wide() {
                 if !ftp::verify(&raw, channel, &result, &change.fields)? {
                     result["outcome"] = json!("unverified");
                 }

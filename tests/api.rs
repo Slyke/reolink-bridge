@@ -185,12 +185,11 @@ async fn authenticated_terminate_validates_logs_and_exits_with_the_requested_cod
                 client.get(&url).bearer_auth(PRIMARY).send().await?.status(),
                 405
             );
-            assert_eq!(
-                response(&client, &format!("{origin}/api/contract"), PRIMARY, None)
-                    .await
-                    .1["terminate"],
-                true
-            );
+            let contract = response(&client, &format!("{origin}/api/contract"), PRIMARY, None)
+                .await
+                .1;
+            assert_eq!(contract["terminate"], true);
+            assert_eq!(contract["terminationOptions"], true);
         }
         let id = Uuid::new_v4().to_string();
         let mut request = client
@@ -1215,6 +1214,27 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     assert_eq!(view["fields"]["remoteDirectory"], "garage & yard");
     assert_eq!(view["passwordStored"], true);
     assert!(view["fields"].get("password").is_none());
+    let zone = url("/cameras/garage/options/motionZone");
+    let view = response(&client, &zone, PRIMARY, None).await.1;
+    let grid = &view["zone"];
+    assert_eq!(grid["cells"], "1".repeat(4800));
+    let mut cells = grid["cells"].as_str().unwrap().to_owned();
+    cells.replace_range(79..81, "00");
+    let fields = json!({"fields":{"expectedRevision":grid["revision"],"cells":cells}});
+    let put_zone = || {
+        client
+            .put(&zone)
+            .bearer_auth(PRIMARY)
+            .header("content-type", "application/json")
+            .body(fields.to_string())
+            .send()
+    };
+    let saved = put_zone().await?;
+    assert_eq!(saved.status(), 200);
+    let result: Value = serde_json::from_str(&saved.text().await?)?;
+    assert_eq!(result["outcome"], "confirmed");
+    assert_eq!(result["zone"]["cells"], cells);
+    assert_eq!(put_zone().await?.status(), 409);
     let masks = url("/cameras/garage/options/privacy");
     let current = response(&client, &masks, PRIMARY, None).await.1;
     let revision = &current["privacyMasks"]["revision"];

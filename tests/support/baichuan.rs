@@ -58,6 +58,7 @@ pub struct Camera {
     pub talk_packets: AtomicUsize,
     pub talk_stops: AtomicUsize,
     pub privacy_xml: Mutex<Option<String>>,
+    pub motion_zone_xml: Mutex<Option<String>>,
     pub ftp_xml: Mutex<Option<String>>,
     pub encoder_fps: Mutex<Option<u32>>,
     pub clock: Mutex<Option<(chrono::NaiveDateTime, std::time::Instant)>>,
@@ -547,6 +548,8 @@ impl Camera {
                 ensure!(body.contains("<streamType>subStream</streamType>"));
                 "<body><FileInfoList/></body>".into()
             }
+            46 => self.motion_zone_xml.lock().unwrap().clone().unwrap_or_else(||format!("<body><MD><channelId>0</channelId><width>80</width><height>60</height><enable>1</enable><scope><columns>96</columns><rows>64</rows><valueTable>{}</valueTable></scope></MD></body>", "/".repeat(1024))),
+            47 => {let doc=roxmltree::Document::parse(body)?;*self.motion_zone_xml.lock().unwrap()=Some(body[doc.root_element().range()].into());String::new()}
             52=>self.privacy_xml.lock().unwrap().clone().unwrap_or_else(||"<body><Shelter><channelId>0</channelId><enable>0</enable><shelterList/></Shelter></body>".into()),
             53=>{let doc=roxmltree::Document::parse(body)?;*self.privacy_xml.lock().unwrap()=Some(body[doc.root_element().range()].into());String::new()}
             68 => self.ftp_xml.lock().unwrap().clone().unwrap_or_else(|| "<body><Ftp version=\"1.1\"><server/><port>21</port><userName/><password/><remoteDir/><nonymous>0</nonymous><onlyFtps>0</onlyFtps><mode>2</mode><streamType>1</streamType><pwdMaxLen>64</pwdMaxLen></Ftp></body>".into()),

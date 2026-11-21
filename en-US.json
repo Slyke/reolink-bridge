@@ -23,6 +23,7 @@
   "reolink-bridge-API_TALK_EXPIRED": "The talk session has ended.",
   "reolink-bridge-API_TALK_INVALID": "Invalid audio block or sequence.",
   "reolink-bridge-API_TALK_FAILED": "The bridge could not communicate with the camera speaker.",
+  "reolink-bridge-API_DETECTION_ZONE_CHANGED": "The detection zone changed on the camera. Reload it before saving.",
   "reolink-bridge-API_PRIVACY_MASKS_CHANGED": "Privacy masks changed on the camera. Reload before saving.",
   "reolink-bridge-API_DEVICE_OPTIONS_INVALID": "Invalid camera option or value.",
   "reolink-bridge-API_DEVICE_OPTIONS_UNSUPPORTED": "This camera does not expose the requested option.",

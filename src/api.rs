@@ -444,7 +444,9 @@ pub fn router(api: Arc<Api>) -> Router {
         )
         .route(
             "/api/cameras/{id}/options/{group}",
-            get(device_options::get).put(device_options::set),
+            get(device_options::get)
+                .put(device_options::set)
+                .layer(DefaultBodyLimit::max(20 * 1024)),
         )
         .route("/api/cameras/{id}/clock", get(clock::get).put(clock::set))
         .route(
@@ -623,8 +625,8 @@ async fn contract(
     } else {
         Vec::new()
     };
-    Json(json!({"version":1,"terminate":true,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
-       "talk":true,"privacyMaskEditing":true,"ftpDestination":true,"deviceOptions":true,"displayCameras":api.devices.keys().collect::<Vec<_>>(),
+    Json(json!({"version":1,"terminate":true,"terminationOptions":true,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
+       "talk":true,"detectionZones":true,"privacyMaskEditing":true,"ftpDestination":true,"deviceOptions":true,"displayCameras":api.devices.keys().collect::<Vec<_>>(),
        "encodingCameras":api.devices.keys().collect::<Vec<_>>(),
        "clockCameras":api.devices.keys().collect::<Vec<_>>(),"rtspSettings":true,"networkCameras":api.devices.keys().chain(api.onvif.keys()).collect::<BTreeSet<_>>(),
        "userCameras":api.devices.keys().collect::<Vec<_>>(),
