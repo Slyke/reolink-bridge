@@ -54,6 +54,10 @@ pub struct Camera {
     pub rtsp_writes: AtomicUsize,
     pub wifi_xml: Mutex<Option<String>>,
     pub speaker_volume: Mutex<Option<u8>>,
+    pub drop_storage_read: AtomicBool,
+    pub talk_packets: AtomicUsize,
+    pub talk_stops: AtomicUsize,
+    pub privacy_xml: Mutex<Option<String>>,
     pub ftp_xml: Mutex<Option<String>>,
     pub encoder_fps: Mutex<Option<u32>>,
     pub clock: Mutex<Option<(chrono::NaiveDateTime, std::time::Instant)>>,
@@ -141,6 +145,25 @@ impl Camera {
                 (200, String::new())
             } else {
                 ensure!(logged_in);
+                if command == 202 {
+                    cfb_mode::Decryptor::<Aes128>::new((&key).into(), IV.into())
+                        .decrypt(&mut body[..offset]);
+                    ensure!(
+                        std::str::from_utf8(&body[..offset])?
+                            .contains("<binaryData>1</binaryData>")
+                    );
+                    let packet = &body[offset..];
+                    ensure!(!packet.is_empty() && packet.len().is_multiple_of(532));
+                    ensure!(
+                        packet
+                            .as_chunks::<532>()
+                            .0
+                            .iter()
+                            .all(|block| block[0..4] == 0x62773130u32.to_le_bytes())
+                    );
+                    self.talk_packets.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
                 cfb_mode::Decryptor::<Aes128>::new((&key).into(), IV.into())
                     .decrypt(&mut body[offset..]);
                 if command == 59 {
@@ -199,6 +222,9 @@ impl Camera {
                         self.block_login.store(true, Ordering::SeqCst);
                     }
                     // The device can apply the write and close the connection without replying.
+                    return Ok(());
+                }
+                if command == 102 && self.drop_storage_read.swap(false, Ordering::SeqCst) {
                     return Ok(());
                 }
                 if command == 318 && header[12] == 2 {
@@ -316,6 +342,12 @@ impl Camera {
             }
         }
         let response = match command {
+            10 => "<body><TalkAbility><duplexList><duplex>FDX</duplex></duplexList><audioStreamModeList><audioStreamMode>followVideoStream</audioStreamMode></audioStreamModeList><audioConfigList><audioConfig><audioType>adpcm</audioType><sampleRate>16000</sampleRate><samplePrecision>16</samplePrecision><lengthPerEncoder>1024</lengthPerEncoder><soundTrack>mono</soundTrack></audioConfig></audioConfigList></TalkAbility></body>".into(),
+            201 => {
+                ensure!(body.contains("<TalkConfig") && body.contains("<sampleRate>16000</sampleRate>"));
+                String::new()
+            }
+            11 => { self.talk_stops.fetch_add(1, Ordering::SeqCst); String::new() }
             76 => "<body><Ip><ip>192.0.2.7</ip><mask>255.255.255.0</mask><gateway>192.0.2.1</gateway></Ip><Dhcp><enable>1</enable></Dhcp></body>".into(),
             37 => format!("<body><HttpPort><enable>0</enable></HttpPort><RtspPort><rtspPort>8554</rtspPort><enable>{}</enable></RtspPort></body>", u8::from(self.rtsp_enabled.load(Ordering::SeqCst))),
             36 => {
@@ -515,6 +547,8 @@ impl Camera {
                 ensure!(body.contains("<streamType>subStream</streamType>"));
                 "<body><FileInfoList/></body>".into()
             }
+            52=>self.privacy_xml.lock().unwrap().clone().unwrap_or_else(||"<body><Shelter><channelId>0</channelId><enable>0</enable><shelterList/></Shelter></body>".into()),
+            53=>{let doc=roxmltree::Document::parse(body)?;*self.privacy_xml.lock().unwrap()=Some(body[doc.root_element().range()].into());String::new()}
             68 => self.ftp_xml.lock().unwrap().clone().unwrap_or_else(|| "<body><Ftp version=\"1.1\"><server/><port>21</port><userName/><password/><remoteDir/><nonymous>0</nonymous><onlyFtps>0</onlyFtps><mode>2</mode><streamType>1</streamType><pwdMaxLen>64</pwdMaxLen></Ftp></body>".into()),
             69 => {
                 let doc=roxmltree::Document::parse(body)?;

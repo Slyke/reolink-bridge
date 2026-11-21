@@ -524,7 +524,7 @@ pub(super) async fn storage(
             &correlation,
         );
     };
-    let result = timeout(Duration::from_secs(15), async {
+    let read = || async {
         let mut session = device.connect().await?;
         let result = match recordings::storage(&mut session).await {
             Ok(cards) => Ok((cards, recordings::clock(&mut session).await)),
@@ -532,6 +532,25 @@ pub(super) async fn storage(
         };
         session.logout().await;
         result
+    };
+    let result = timeout(Duration::from_secs(15), async {
+        match read().await {
+            Err(cause)
+                if cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::UnexpectedEof
+                    )
+                }) =>
+            {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                read().await
+            }
+            result => result,
+        }
     })
     .await
     .map_err(anyhow::Error::from)

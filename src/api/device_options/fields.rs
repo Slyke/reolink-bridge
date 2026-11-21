@@ -215,6 +215,11 @@ impl Group {
         }
         let mut result = json!({"fields":fields});
         if self.get == 52 {
+            if let Ok(masks) = super::privacy::describe(root, channel) {
+                result["privacyZones"] = json!(masks["areas"].as_array().map_or(0, Vec::len));
+                result["privacyMasks"] = masks;
+                return Ok(result);
+            }
             let zones = at(root, "Shelter/shelterList").map(|list| {
                 list.children()
                     .filter(|node| node.has_tag_name("Shelter"))
@@ -234,6 +239,9 @@ impl Group {
     ) -> Result<Option<String>> {
         if self.device_wide() {
             return super::ftp::edit(root, channel, fields);
+        }
+        if self.get == 52 && fields.contains_key("maskAreas") {
+            return super::privacy::edit(root, channel, fields);
         }
         if fields.is_empty() {
             return Err(Problem::Invalid);

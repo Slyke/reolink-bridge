@@ -171,6 +171,26 @@ impl Session {
             .await
     }
 
+    pub fn talk_sequence(&mut self, channel: u8) -> u32 {
+        self.sequence = (self.sequence + 1) & 0x00ff_ffff;
+        self.sequence << 8 | u32::from(channel + 1)
+    }
+    /// Baichuan talk uses an encrypted extension followed by an unencrypted BC-media payload.
+    pub async fn talk_audio(&mut self, sequence: u32, channel: u8, payload: &[u8]) -> Result<()> {
+        let extension=self.encode(&format!("<Extension version=\"1.1\"><channelId>{channel}</channelId><binaryData>1</binaryData></Extension>"),channel+1);
+        let mut frame = Vec::with_capacity(24 + extension.len() + payload.len());
+        frame.extend(MAGIC);
+        frame.extend(202u32.to_le_bytes());
+        frame.extend(((extension.len() + payload.len()) as u32).to_le_bytes());
+        frame.extend(sequence.to_le_bytes());
+        frame.extend([0, 0, 0x14, 0x64]);
+        frame.extend((extension.len() as u32).to_le_bytes());
+        frame.extend(extension);
+        frame.extend(payload);
+        timeout(Duration::from_secs(2), self.socket.write_all(&frame)).await??;
+        Ok(())
+    }
+
     pub async fn user_list(&mut self, username: &str) -> Result<String> {
         let extension = format!(
             r#"<Extension version="1.1"><userName>{}</userName></Extension>"#,
@@ -363,7 +383,11 @@ impl Session {
                 return Ok(packet);
             }
             if self.socket.read_buf(&mut self.buffer).await? == 0 {
-                bail!("Baichuan connection closed");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Baichuan connection closed",
+                )
+                .into());
             }
         }
     }

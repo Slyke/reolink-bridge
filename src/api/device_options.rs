@@ -1,5 +1,6 @@
 mod fields;
 mod ftp;
+mod privacy;
 
 use super::*;
 use crate::{
@@ -11,6 +12,7 @@ use serde_json::Map;
 
 #[derive(Debug)]
 enum Problem {
+    Changed,
     Invalid,
     Unsupported,
     Read,
@@ -21,6 +23,7 @@ type Result<T> = std::result::Result<T, Problem>;
 impl Problem {
     fn response(self, cid: &CorrelationId) -> Response {
         let (status, key) = match self {
+            Self::Changed => (StatusCode::CONFLICT, "API_PRIVACY_MASKS_CHANGED"),
             Self::Invalid => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "API_DEVICE_OPTIONS_INVALID",
@@ -149,6 +152,10 @@ pub(super) async fn set(
             if group.device_wide() {
                 if !ftp::verify(&raw, channel, &result, &change.fields)? {
                     result["outcome"] = json!("unverified");
+                }
+            } else if group.get == 52 && change.fields.contains_key("maskAreas") {
+                if !privacy::verified(&result, &change.fields) {
+                    return Err(Problem::Unverified);
                 }
             } else if !change.fields.iter().all(|(key, value)| {
                 result["fields"]

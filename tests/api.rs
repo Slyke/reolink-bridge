@@ -1089,6 +1089,103 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     assert_eq!(view["fields"]["remoteDirectory"], "garage & yard");
     assert_eq!(view["passwordStored"], true);
     assert!(view["fields"].get("password").is_none());
+    let masks = url("/cameras/garage/options/privacy");
+    let current = response(&client, &masks, PRIMARY, None).await.1;
+    let revision = &current["privacyMasks"]["revision"];
+    assert!(revision.is_string(), "{current}");
+    let rectangle = json!({"id":0,"x":50,"y":100,"width":256,"height":192});
+    let save_masks = |revision: Value, enabled: bool, areas: Value| {
+        client.put(&masks).bearer_auth(PRIMARY)
+        .header("content-type","application/json").body(json!({"fields":{"expectedRevision":revision,"maskEnabled":enabled,"maskAreas":areas}}).to_string()).send()
+    };
+    let add = save_masks(revision.clone(), true, json!([rectangle])).await?;
+    assert_eq!(add.status(), 200);
+    let current = response(&client, &masks, PRIMARY, None).await.1;
+    assert_eq!(current["privacyMasks"]["areas"][0], rectangle);
+    assert_eq!(
+        save_masks(revision.clone(), false, json!([]))
+            .await?
+            .status(),
+        409
+    );
+    assert_eq!(
+        save_masks(
+            current["privacyMasks"]["revision"].clone(),
+            false,
+            json!([])
+        )
+        .await?
+        .status(),
+        200
+    );
+    assert_eq!(
+        response(&client, &masks, PRIMARY, None).await.1["privacyZones"],
+        0
+    );
+
+    let speaker = url("/cameras/garage/talk");
+    let talk_url = format!("{speaker}/{}", Uuid::new_v4());
+    let second_url = format!("{speaker}/{}", Uuid::new_v4());
+    assert_eq!(response(&client, &speaker, "denied", None).await.0, 401);
+    assert_eq!(
+        response(&client, &speaker, PRIMARY, None).await.1["blockSamples"],
+        1025
+    );
+    assert_eq!(
+        client
+            .post(&talk_url)
+            .bearer_auth(PRIMARY)
+            .send()
+            .await?
+            .status(),
+        200
+    );
+    assert_eq!(
+        client
+            .post(&second_url)
+            .bearer_auth(PRIMARY)
+            .send()
+            .await?
+            .status(),
+        409
+    );
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let chunk = json!({"sequence":0,"pcm":STANDARD.encode(vec![0u8;4100])}).to_string();
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .put(&talk_url)
+                .bearer_auth(PRIMARY)
+                .header("content-type", "application/json")
+                .body(chunk.clone())
+                .send()
+                .await?
+                .status(),
+            204
+        );
+    }
+    assert_eq!(
+        client
+            .delete(&talk_url)
+            .bearer_auth(PRIMARY)
+            .send()
+            .await?
+            .status(),
+        204
+    );
+    assert_eq!(camera.talk_packets.load(Ordering::SeqCst), 1);
+    assert_eq!(camera.talk_stops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        client
+            .put(&talk_url)
+            .bearer_auth(PRIMARY)
+            .header("content-type", "application/json")
+            .body(chunk)
+            .send()
+            .await?
+            .status(),
+        404
+    );
     let audio_options = url("/cameras/garage/options/sound");
     assert_eq!(
         response(&client, &audio_options, PRIMARY, None).await.1["fields"]["speakerVolume"]["value"],
@@ -1672,6 +1769,7 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     );
     let storage = format!("{origin}/api/cameras/fixture/storage");
     assert_eq!(response(&client, &storage, "wrong", None).await.0, 401);
+    camera.drop_storage_read.store(true, Ordering::SeqCst);
     let card = response(&client, &storage, PRIMARY, None).await;
     assert_eq!(card.0, 200, "{card:?}");
     assert_eq!(card.1["cards"][0]["totalBytes"], 63_500_000_000u64);

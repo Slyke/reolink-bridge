@@ -10,6 +10,7 @@ mod photos;
 mod preview;
 mod recordings;
 mod rtsp;
+mod talk;
 mod users;
 
 use std::{
@@ -107,6 +108,7 @@ pub struct Api {
     hub: Option<Arc<Hub>>,
     media_slots: Arc<Semaphore>,
     settings_slots: Semaphore,
+    speakers: talk::Speakers,
     network_writes: BTreeMap<String, Mutex<()>>,
     stop: CancellationToken,
 }
@@ -318,6 +320,7 @@ impl Api {
             identities,
             inactive_identities,
             active,
+            speakers: talk::Speakers::new(&devices),
             network_writes: devices
                 .keys()
                 .chain(onvif.keys())
@@ -418,6 +421,14 @@ pub fn router(api: Arc<Api>) -> Router {
         .layer(DefaultBodyLimit::max(32 * 1024));
     Router::new()
         .route("/api/contract", get(contract))
+        .route("/api/cameras/{id}/talk", get(talk::capability))
+        .route(
+            "/api/cameras/{id}/talk/{token}",
+            post(talk::start)
+                .put(talk::send)
+                .delete(talk::stop)
+                .layer(DefaultBodyLimit::max(28 * 1024)),
+        )
         .route("/api/inventory", get(inventory))
         .route(
             "/api/cameras/{id}/encoding",
@@ -535,7 +546,7 @@ async fn contract(
         Vec::new()
     };
     Json(json!({"version":1,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
-       "ftpDestination":true,"deviceOptions":true,"displayCameras":api.devices.keys().collect::<Vec<_>>(),
+       "talk":true,"privacyMaskEditing":true,"ftpDestination":true,"deviceOptions":true,"displayCameras":api.devices.keys().collect::<Vec<_>>(),
        "encodingCameras":api.devices.keys().collect::<Vec<_>>(),
        "clockCameras":api.devices.keys().collect::<Vec<_>>(),"rtspSettings":true,"networkCameras":api.devices.keys().chain(api.onvif.keys()).collect::<BTreeSet<_>>(),
        "userCameras":api.devices.keys().collect::<Vec<_>>(),
