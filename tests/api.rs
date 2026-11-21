@@ -73,10 +73,19 @@ async fn event_message(response: &mut reqwest::Response, buffer: &mut Vec<u8>) -
 }
 
 async fn start(config: &Path, client: &Client, origin: &str) -> Result<Child> {
+    start_with_stdout(config, client, origin, Stdio::null()).await
+}
+
+async fn start_with_stdout(
+    config: &Path,
+    client: &Client,
+    origin: &str,
+    stdout: Stdio,
+) -> Result<Child> {
     let mut bridge = Command::new(env!("CARGO_BIN_EXE_reolink-bridge"))
         .arg(config)
         .kill_on_drop(true)
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .spawn()?;
     let until = Instant::now() + Duration::from_secs(8);
     while Instant::now() < until {
@@ -102,62 +111,119 @@ async fn start(config: &Path, client: &Client, origin: &str) -> Result<Child> {
 }
 
 #[tokio::test]
-async fn authenticated_terminate_acknowledges_and_exits_cleanly() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let config = directory.path().join("bridge.json");
-    let port = free_port()?;
-    let origin = format!("http://127.0.0.1:{port}");
-    std::fs::write(
-        &config,
-        json!({
-            "mqtt":{"url":"mqtt://127.0.0.1:1","baseTopic":"fixture"},
-            "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
-            "api":{}, "cameras":[]
-        })
-        .to_string(),
-    )?;
+async fn authenticated_terminate_validates_logs_and_exits_with_the_requested_code() -> Result<()> {
     let client = Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(10))
         .build()?;
-    let mut bridge = start(&config, &client, &origin).await?;
-    let url = format!("{origin}/api/terminate");
-    for request in [client.post(&url), client.post(&url).bearer_auth("wrong")] {
-        let reply = request.send().await?;
-        assert_eq!(reply.status(), 401);
-        assert_eq!(
-            serde_json::from_str::<Value>(&reply.text().await?)?["errorKey"],
-            "API_SCOPE_DENIED"
-        );
-    }
-    assert_eq!(
-        client.get(&url).bearer_auth(PRIMARY).send().await?.status(),
-        405
-    );
-    assert_eq!(
-        response(&client, &format!("{origin}/api/contract"), PRIMARY, None)
-            .await
-            .1["terminate"],
-        true
-    );
-    let id = Uuid::new_v4().to_string();
-    let reply = client
-        .post(&url)
-        .bearer_auth(PRIMARY)
-        .header("x-correlation-id", &id)
-        .send()
+    let reason = "Maintenance\nrequested from the WUI";
+    for (body, expected_code, expected_reason) in [
+        (None, 0, None),
+        (Some(json!({})), 0, None),
+        (Some(json!({"reason":reason})), 0, Some(reason)),
+        (Some(json!({"exitCode":255})), 255, None),
+        (
+            Some(json!({"exitCode":75,"reason":reason})),
+            75,
+            Some(reason),
+        ),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("bridge.json");
+        let stdout = directory.path().join("stdout.jsonl");
+        let sink = directory.path().join("sink.jsonl");
+        let port = free_port()?;
+        let origin = format!("http://127.0.0.1:{port}");
+        std::fs::write(&config,json!({
+            "mqtt":{"url":"mqtt://127.0.0.1:1","baseTopic":"fixture"},
+            "http":{"listen":format!("127.0.0.1:{port}"),"token":PRIMARY},
+            "api":{},"cameras":[],
+            "logging":{"sinks":{"console":{"enabled":false},"file":{"enabled":true,"format":"json","levels":["info"],"path":sink}}}
+        }).to_string())?;
+        let mut bridge = start_with_stdout(
+            &config,
+            &client,
+            &origin,
+            std::fs::File::create(&stdout)?.into(),
+        )
         .await?;
-    assert_eq!(reply.status(), 202);
-    assert_eq!(reply.headers()["x-correlation-id"], id.as_str());
-    assert_eq!(
-        serde_json::from_str::<Value>(&reply.text().await?)?,
-        json!({"ok":true,"status":"terminating","correlation_id":id})
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_secs(20), bridge.wait())
-            .await??
-            .success()
-    );
+        let url = format!("{origin}/api/terminate");
+        if body.is_none() {
+            for request in [client.post(&url), client.post(&url).bearer_auth("wrong")] {
+                let reply = request.send().await?;
+                assert_eq!(reply.status(), 401);
+                assert_eq!(
+                    serde_json::from_str::<Value>(&reply.text().await?)?["errorKey"],
+                    "API_SCOPE_DENIED"
+                );
+            }
+            for invalid in [
+                r#"{"exitCode":-1}"#,
+                r#"{"exitCode":256}"#,
+                r#"{"exitCode":1.5}"#,
+                r#"{"exitCode":"7"}"#,
+                r#"{"reason":7}"#,
+                r#"{"code":5}"#,
+                "[]",
+                "null",
+                "{",
+            ] {
+                let reply = client
+                    .post(&url)
+                    .bearer_auth(PRIMARY)
+                    .header("content-type", "application/json")
+                    .body(invalid)
+                    .send()
+                    .await?;
+                assert_eq!(reply.status(), 400, "{invalid}");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&reply.text().await?)?["errorKey"],
+                    "API_TERMINATE_INVALID"
+                );
+            }
+            assert_eq!(
+                client.get(&url).bearer_auth(PRIMARY).send().await?.status(),
+                405
+            );
+            assert_eq!(
+                response(&client, &format!("{origin}/api/contract"), PRIMARY, None)
+                    .await
+                    .1["terminate"],
+                true
+            );
+        }
+        let id = Uuid::new_v4().to_string();
+        let mut request = client
+            .post(&url)
+            .bearer_auth(PRIMARY)
+            .header("x-correlation-id", &id);
+        if let Some(payload) = body {
+            request = request
+                .header("content-type", "application/json")
+                .body(payload.to_string());
+        }
+        let reply = request.send().await?;
+        assert_eq!(reply.status(), 202);
+        assert_eq!(reply.headers()["x-correlation-id"], id.as_str());
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply.text().await?)?,
+            json!({"ok":true,"status":"terminating","exitCode":expected_code,"correlation_id":id})
+        );
+        let status = tokio::time::timeout(Duration::from_secs(20), bridge.wait()).await??;
+        assert_eq!(status.code(), Some(expected_code));
+        for path in [stdout, sink] {
+            let logs = std::fs::read_to_string(&path)?;
+            let records: Vec<Value> = logs
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|entry| entry["loggerKey"] == "SERVICE_TERMINATION_REQUESTED")
+                .collect();
+            assert_eq!(records.len(), 1, "{}", path.display());
+            assert_eq!(records[0]["correlationId"], id);
+            assert_eq!(records[0]["context"]["exitCode"], expected_code);
+            assert_eq!(records[0]["context"]["reason"].as_str(), expected_reason);
+        }
+    }
     Ok(())
 }
 

@@ -76,7 +76,7 @@ async fn main() -> ExitCode {
     let env = |name: &str| std::env::var(name).ok();
     let code = match config::parse(document.clone(), &env) {
         Ok(config) => match run(&diagnostics, path, raw, document, config).await {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(code) => ExitCode::from(code),
             Err(error) => {
                 diagnostics.error(
                     "main::run",
@@ -141,7 +141,7 @@ async fn run(
     raw: String,
     document: Value,
     mut config: config::Config,
-) -> Result<()> {
+) -> Result<u8> {
     let stop = CancellationToken::new();
     let auth_token = config
         .http
@@ -338,7 +338,7 @@ async fn run(
         ));
     }
 
-    let shutdown_requested = api.shutdown_requested.clone();
+    let mut shutdown_requested = api.shutdown_requested.subscribe();
     let app = Arc::new(http::App {
         api: api.attach(hub.clone(), &mut workers),
         hub,
@@ -367,9 +367,9 @@ async fn run(
     };
     let mut server = std::pin::pin!(server);
     let (result, server_exited) = tokio::select! {
-        _ = shutdown_signal() => (Ok(()), false),
-        _ = shutdown_requested.cancelled() => (Ok(()), false),
-        result = &mut server => (result.context("HTTP server failed"), true),
+        Ok(()) = shutdown_requested.changed() => (Ok(shutdown_requested.borrow_and_update().unwrap_or_default()), false),
+        _ = shutdown_signal() => (Ok(0), false),
+        result = &mut server => (result.context("HTTP server failed").map(|()| 0), true),
         _ = workers.join_next(), if !workers.is_empty() => (Err(anyhow::anyhow!("a bridge worker exited unexpectedly")), false),
     };
     stop.cancel();

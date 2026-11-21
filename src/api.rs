@@ -15,6 +15,7 @@ mod users;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Write,
     net::Ipv4Addr,
     path::PathBuf,
     sync::Arc,
@@ -24,7 +25,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection},
+    body::Bytes,
+    extract::{
+        DefaultBodyLimit, Path, Query, State,
+        rejection::{BytesRejection, JsonRejection},
+    },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -32,7 +37,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::{
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Semaphore, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -110,7 +115,7 @@ pub struct Api {
     settings_slots: Semaphore,
     speakers: talk::Speakers,
     network_writes: BTreeMap<String, Mutex<()>>,
-    pub(crate) shutdown_requested: CancellationToken,
+    pub(crate) shutdown_requested: watch::Sender<Option<u8>>,
     stop: CancellationToken,
 }
 
@@ -333,7 +338,7 @@ impl Api {
             hub: None,
             media_slots: Arc::new(Semaphore::new(4)),
             settings_slots: Semaphore::new(8),
-            shutdown_requested: CancellationToken::new(),
+            shutdown_requested: watch::Sender::new(None),
             stop,
         })
     }
@@ -528,25 +533,72 @@ fn progress(status: Status, id: Option<String>, correlation: &CorrelationId) -> 
         .into_response()
 }
 
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerminationRequest {
+    #[serde(default)]
+    exit_code: u8,
+    reason: Option<String>,
+}
+
 async fn terminate(
     State(api): State<Arc<Api>>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
     if !api.authenticated(&headers) {
         return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
     }
-    api.hub().diagnostics.log(
-        "api::terminate",
-        "SERVICE_TERMINATION_REQUESTED",
-        "info",
-        Some(correlation.0.clone()),
-        Value::Null,
-    );
-    api.shutdown_requested.cancel();
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => return error(rejection.status(), "API_TERMINATE_INVALID", &correlation),
+    };
+    let request = if body.is_empty() {
+        Some(TerminationRequest::default())
+    } else if body.trim_ascii_start().starts_with(b"{") {
+        serde_json::from_slice(&body).ok()
+    } else {
+        None
+    };
+    let Some(request) = request else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "API_TERMINATE_INVALID",
+            &correlation,
+        );
+    };
+    let mut exit_code = request.exit_code;
+    // A second caller can still reach the listener while the first response is draining.
+    let first = api.shutdown_requested.send_if_modified(|selected| {
+        if let Some(code) = *selected {
+            exit_code = code;
+            return false;
+        }
+        *selected = Some(exit_code);
+        true
+    });
+    if first {
+        let key = "SERVICE_TERMINATION_REQUESTED";
+        let mut context = json!({"exitCode":exit_code});
+        if let Some(reason) = request.reason {
+            context["reason"] = Value::String(reason);
+        }
+        let record = json!({"timestamp":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),
+            "level":"info","caller":"api::terminate","loggerKey":key,
+            "message":crate::diagnostics::text(key),"correlationId":correlation.0,"context":context});
+        let _ = writeln!(std::io::stdout().lock(), "{record}");
+        api.hub().diagnostics.log(
+            "api::terminate",
+            key,
+            "info",
+            Some(correlation.0.clone()),
+            context,
+        );
+    }
     (
         StatusCode::ACCEPTED,
-        Json(json!({"ok":true,"status":"terminating","correlation_id":correlation.0})),
+        Json(json!({"ok":true,"status":"terminating","exitCode":exit_code,"correlation_id":correlation.0})),
     )
         .into_response()
 }
