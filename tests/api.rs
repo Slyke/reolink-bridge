@@ -1921,6 +1921,47 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     assert_eq!(card.1["cards"][0]["totalBytes"], 63_500_000_000u64);
     assert_eq!(card.1["cards"][0]["usedBytes"], 39_700_000_000u64);
     assert_eq!(card.1["cameraTime"], "2026-11-17T12:30:00");
+    assert!(card.1["cards"][0]["formatSource"].is_null());
+    let format_info = response(&client, &format!("{storage}?format=true"), PRIMARY, None).await;
+    let source = format_info.1["cards"][0]["formatSource"]
+        .as_str()
+        .expect("format-capable card");
+    let format_url = format!("{storage}/format");
+    let selection = json!({"source":source,"slot":0,"confirm":true});
+    assert_eq!(
+        response(&client, &format_url, "wrong", Some(selection.clone()))
+            .await
+            .0,
+        401
+    );
+    for (body, status) in [
+        (json!({"source":source,"slot":0,"confirm":false}), 400),
+        (
+            json!({"source":"a".repeat(64),"slot":0,"confirm":true}),
+            409,
+        ),
+        (json!({"source":source,"slot":9,"confirm":true}), 422),
+    ] {
+        assert_eq!(
+            response(&client, &format_url, PRIMARY, Some(body)).await.0,
+            status
+        );
+    }
+    camera.read_only_disk.store(true, Ordering::SeqCst);
+    let readonly = response(&client, &format!("{storage}?format=true"), PRIMARY, None).await;
+    assert!(readonly.1["cards"][0]["formatSource"].is_null());
+    assert_eq!(
+        response(&client, &format_url, PRIMARY, Some(selection.clone()))
+            .await
+            .0,
+        422
+    );
+    assert!(camera.formatted_slots.lock().unwrap().is_empty());
+    camera.read_only_disk.store(false, Ordering::SeqCst);
+    let accepted = response(&client, &format_url, PRIMARY, Some(selection)).await;
+    assert_eq!(accepted.0, 202, "{accepted:?}");
+    assert_eq!(accepted.1["outcome"], "acknowledged");
+    assert_eq!(camera.formatted_slots.lock().unwrap().as_slice(), &[0]);
     let denied = response(&client, &storage, "wrong", None).await;
     let correlation = denied.1["correlation_id"].as_str().unwrap();
     let until = Instant::now() + Duration::from_secs(2);

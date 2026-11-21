@@ -10,6 +10,7 @@ mod photos;
 mod preview;
 mod recordings;
 mod rtsp;
+mod storage_format;
 mod talk;
 mod users;
 
@@ -486,6 +487,10 @@ pub fn router(api: Arc<Api>) -> Router {
             post(media_files::delete).layer(DefaultBodyLimit::max(80 * 1024)),
         )
         .route("/api/cameras/{id}/storage", get(recordings::storage))
+        .route(
+            "/api/cameras/{id}/storage/format",
+            post(storage_format::format_card),
+        )
         .route("/api/cameras/{id}/recordings", get(recordings::list))
         .route(
             "/api/cameras/{id}/recordings/{recording}/video",

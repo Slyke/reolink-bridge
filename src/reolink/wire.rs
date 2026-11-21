@@ -191,6 +191,18 @@ impl Session {
         Ok(())
     }
 
+    pub async fn format_sd_card(&mut self, slot: u32) -> Result<()> {
+        let body = format!(
+            r#"<body><HddInitList version="1.1"><HddInit><initId>{slot}</initId></HddInit></HddInitList></body>"#
+        );
+        let reply = self.exchange(103, 250, "", &body, false).await?;
+        ensure!(
+            matches!(reply.status, 200 | 201),
+            "format acknowledgement unknown"
+        );
+        Ok(())
+    }
+
     pub async fn user_list(&mut self, username: &str) -> Result<String> {
         let extension = format!(
             r#"<Extension version="1.1"><userName>{}</userName></Extension>"#,

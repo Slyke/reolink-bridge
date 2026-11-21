@@ -100,7 +100,7 @@ async fn features(session: &mut Session, channel: u8) -> Result<Capabilities> {
     support(&session.command(199, None, "").await?, channel)
 }
 
-async fn source(session: &mut Session, channel: u8) -> Result<String> {
+pub(super) async fn source(session: &mut Session, channel: u8) -> Result<String> {
     let uid = recordings::uid(session).await?;
     Ok(format!("{:x}", Sha256::digest(format!("{uid}\0{channel}"))))
 }

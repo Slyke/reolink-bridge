@@ -55,6 +55,8 @@ pub struct Camera {
     pub wifi_xml: Mutex<Option<String>>,
     pub speaker_volume: Mutex<Option<u8>>,
     pub drop_storage_read: AtomicBool,
+    pub formatted_slots: Mutex<Vec<u32>>,
+    pub read_only_disk: AtomicBool,
     pub talk_packets: AtomicUsize,
     pub talk_stops: AtomicUsize,
     pub privacy_xml: Mutex<Option<String>>,
@@ -391,6 +393,15 @@ impl Camera {
                 String::new()
             }
             2 | 4 | 16 | 31 | 93 | 144 => String::new(),
+            151 => format!("<body><AbilityInfo><disk><subModule><abilityValue>{}</abilityValue></subModule></disk></AbilityInfo></body>", if self.read_only_disk.load(Ordering::SeqCst) {"hddInit_ro"} else {"hddInit_rw"}),
+            103 => {
+                let doc = roxmltree::Document::parse(body)?;
+                let ids: Vec<_> = doc.descendants().filter(|n| n.has_tag_name("HddInit")).collect();
+                ensure!(ids.len() == 1);
+                let slot = ids[0].children().find(|n| n.has_tag_name("initId")).and_then(|n| n.text()).unwrap_or("").parse()?;
+                self.formatted_slots.lock().unwrap().push(slot);
+                String::new()
+            },
             102=>"<body><HddInfoList><HddInfo><number>0</number><storageType>2</storageType><mount>1</mount><format>1</format><capacity>63</capacity><capacityM>500</capacityM><remainSize>23</remainSize><remainSizeM>800</remainSizeM></HddInfo></HddInfoList></body>".into(),
             56=>format!("<body><Compression><channelId>0</channelId><mainStream><width>1920</width><height>1080</height><frame>{}</frame><bitRate>2048</bitRate></mainStream><subStream><width>640</width><height>360</height><frame>4</frame></subStream></Compression></body>",self.encoder_fps.lock().unwrap().unwrap_or(20)),
             146=>"<body><StreamInfoList><StreamInfo><channelBits>1</channelBits><encodeTable><type>mainStream</type><resolution><width>1920</width><height>1080</height></resolution><framerateTable>20,15</framerateTable><bitrateTable>2048,4096</bitrateTable></encodeTable></StreamInfo></StreamInfoList></body>".into(),

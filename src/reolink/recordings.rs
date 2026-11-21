@@ -19,6 +19,12 @@ pub struct Card {
     pub total_bytes: Option<u64>,
     pub used_bytes: Option<u64>,
     pub free_bytes: Option<u64>,
+    #[serde(skip)]
+    pub explicit_sd_slot: bool,
+    #[serde(skip)]
+    pub reported_storage_type: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format_source: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -66,6 +72,11 @@ fn parse_cards(raw: &str) -> Result<Vec<Card>> {
             );
             Ok(Card {
                 number: slot,
+                explicit_sd_slot: number(node, "number").is_some()
+                    && (xml::child(node, "storageType").is_none()
+                        || number(node, "storageType") == Some(2)),
+                reported_storage_type: xml::child(node, "storageType").is_some(),
+                format_source: None,
                 kind: if number(node, "storageType") == Some(1) {
                     "hdd"
                 } else {

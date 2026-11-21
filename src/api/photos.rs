@@ -44,6 +44,13 @@ pub(super) struct Gallery {
     slots: Semaphore,
 }
 impl Gallery {
+    pub(super) async fn forget_camera(&self, scope: &str) {
+        self.manifests
+            .lock()
+            .await
+            .retain(|manifest| manifest.scope != scope);
+    }
+
     pub(super) async fn forget(&self, scope: &str, ids: &std::collections::BTreeSet<&str>) {
         for manifest in self
             .manifests

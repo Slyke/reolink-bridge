@@ -47,6 +47,8 @@ Replace the documentation address with a private IPv4 target from the installati
 | GET `/cameras/{id}/media/capabilities` | `http.token` | Read the physical camera/channel binding, camera-local clock, and support for individual video and time-lapse file deletion. |
 | GET `/cameras/{id}/media/days` | `http.token` | List camera-local dates. Use `kind=video&month=YYYY-MM-01` for one month of SD videos or `kind=timeLapse` for the time-lapse task calendars. |
 | GET `/cameras/{id}/media/files` | `http.token` | Supply `kind=video\|timeLapse` and `date=YYYY-MM-DD`. Returns the camera binding, exact file IDs with completion times, and a skipped count. |
+| GET `/cameras/{id}/storage?format=true` | `http.token` | Includes a per-card `formatSource` when the camera reports writable disk formatting for that SD slot. |
+| POST `/cameras/{id}/storage/format` | `http.token` | Format one SD card. Send `slot`, the freshly read `source` and `confirm: true`. HTTP 202 means the camera acknowledged the command. It may reboot before formatting finishes. |
 | POST `/cameras/{id}/media/delete` | `http.token` | Delete the selected original SD files. Body fields are `source`, `kind`, `date` and `files` (0–1024 opaque IDs from the corresponding inventory). |
 | GET `/cameras/{id}/time-lapse/photos` | `http.token` | List saved time-lapse photos for a camera-local `date`. Optional inclusive `from` and `to` use HH:mm:ss. Returns an opaque ID and capture time when available. |
 | GET `/cameras/{id}/time-lapse/photos/{photo}` | `http.token` | Download the original JPEG converted to a full-resolution PNG. Add `?preview=true` for a JPEG thumbnail up to 480 × 270 pixels. Repeat the search when its ten-minute reference expires. |

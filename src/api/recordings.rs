@@ -215,6 +215,14 @@ impl Recordings {
             entries.remove(&format!("{scope}/{id}"));
         }
     }
+    pub(super) async fn forget_camera(&self, scope: &str) {
+        let prefix = format!("{scope}/");
+        self.entries
+            .lock()
+            .await
+            .retain(|key, _| !key.starts_with(&prefix));
+    }
+
     pub(super) async fn clean(&self) {
         self.prune(&mut *self.entries.lock().await, Instant::now());
         self.clean_thumbnails().await;
@@ -501,9 +509,16 @@ pub(super) fn read_failure(
     error(status, key, correlation)
 }
 
+#[derive(Default, Deserialize)]
+pub(super) struct StorageOptions {
+    #[serde(default)]
+    format: bool,
+}
+
 pub(super) async fn storage(
     State(api): State<Arc<Api>>,
     Path(camera): Path<String>,
+    Query(options): Query<StorageOptions>,
     headers: HeaderMap,
     Extension(correlation): Extension<CorrelationId>,
 ) -> Response {
@@ -526,12 +541,16 @@ pub(super) async fn storage(
     };
     let read = || async {
         let mut session = device.connect().await?;
-        let result = match recordings::storage(&mut session).await {
-            Ok(cards) => Ok((cards, recordings::clock(&mut session).await)),
-            Err(cause) => Err(cause),
-        };
-        session.logout().await;
-        result
+        match recordings::storage(&mut session).await {
+            Ok(cards) => {
+                let clock = recordings::clock(&mut session).await;
+                Ok((cards, clock, session))
+            }
+            Err(cause) => {
+                session.logout().await;
+                Err(cause)
+            }
+        }
     };
     let result = timeout(Duration::from_secs(15), async {
         match read().await {
@@ -556,7 +575,28 @@ pub(super) async fn storage(
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
     match result {
-        Ok((cards, clock)) => {
+        Ok((mut cards, clock, mut session)) => {
+            if options.format && cards.iter().any(|card| card.explicit_sd_slot) {
+                let check = timeout(
+                    Duration::from_secs(8),
+                    super::storage_format::identify(&mut session, device, &mut cards),
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+                if let Err(cause) = check
+                    && let Some(hub) = &api.hub
+                {
+                    hub.diagnostics.error(
+                        "api::storage_format::identify",
+                        "API_STORAGE_FORMAT_CHECK_FAILED",
+                        Some(correlation.0.clone()),
+                        json!({"cameraId":camera}),
+                        Some(cause),
+                    );
+                }
+            }
+            session.logout().await;
             let clock = match clock {
                 Ok(time) => Some(time),
                 Err(cause) => {
