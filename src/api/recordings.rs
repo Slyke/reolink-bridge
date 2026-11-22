@@ -350,51 +350,13 @@ impl Recordings {
                     .context(PreparationStage("camera-download"))?;
             drop(output);
             let size = async {
-                let result = Command::new("ffmpeg")
-                    .args([
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-nostdin",
-                        "-threads",
-                        "1",
-                        "-filter_threads",
-                        "1",
-                        "-fflags",
-                        "+genpts",
-                    ])
-                    .arg("-i")
-                    .arg(&input)
-                    .args([
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "0:a:0?",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "ultrafast",
-                        "-crf",
-                        "23",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-threads",
-                        "1",
-                        "-c:a",
-                        "aac",
-                        "-movflags",
-                        "+faststart",
-                        "-f",
-                        "mp4",
-                    ])
-                    .arg(&path)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .kill_on_drop(true)
-                    .status()
-                    .await?;
-                ensure!(result.success(), "recording conversion failed");
+                let copy = can_remux_video(&input).await;
+                if !copy || !write_playback(&input, &path, true).await? {
+                    ensure!(
+                        write_playback(&input, &path, false).await?,
+                        "recording conversion failed"
+                    );
+                }
                 let size = tokio::fs::metadata(&path).await?.len();
                 ensure!(
                     (32..=MAX_MEDIA_BYTES).contains(&size),
@@ -421,6 +383,90 @@ impl Recordings {
         });
         self.cache(key, clip, media).await
     }
+}
+
+// The camera transfer already contains a timestamped video track. Copy ordinary
+// browser-compatible H.264 so metadata and playback do not wait for a full transcode.
+async fn can_remux_video(input: &std::path::Path) -> bool {
+    let Ok(probe) = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,pix_fmt,has_b_frames",
+            "-of",
+            "json",
+        ])
+        .arg(input)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+    else {
+        return false;
+    };
+    if !probe.status.success() {
+        return false;
+    }
+    let Ok(info) = serde_json::from_slice::<serde_json::Value>(&probe.stdout) else {
+        return false;
+    };
+    let stream = &info["streams"][0];
+    stream["codec_name"] == "h264" && stream["pix_fmt"] == "yuv420p" && stream["has_b_frames"] == 0
+}
+
+async fn write_playback(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    copy_video: bool,
+) -> std::io::Result<bool> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-fflags",
+            "+genpts",
+            "-i",
+        ])
+        .arg(input)
+        .args(["-map", "0:v:0", "-map", "0:a:0?"]);
+    if copy_video {
+        command.args(["-c:v", "copy"]);
+    } else {
+        command.args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-threads",
+            "1",
+        ]);
+    }
+    Ok(command
+        .args(["-c:a", "aac", "-movflags", "+faststart", "-f", "mp4"])
+        .arg(output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .status()
+        .await?
+        .success())
 }
 
 #[derive(Default, Deserialize)]

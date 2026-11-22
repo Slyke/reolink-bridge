@@ -164,7 +164,9 @@ impl Hub {
                 continue;
             }
             if camera.identity.is_some() {
-                camera.snapshots.clear();
+                // Availability describes the event subscription for this route. It can stay
+                // connected across identity discovery without publishing another status.
+                camera.snapshots.retain(|topic, _| topic == "availability");
                 camera.observed.clear();
                 camera.properties.clear();
             }
@@ -638,5 +640,46 @@ fn opaque_http_cause(error: &reqwest::Error) -> anyhow::Error {
         anyhow!("HTTP connection failed")
     } else {
         anyhow!("HTTP transport failed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::HardwareId;
+
+    #[tokio::test]
+    async fn identity_changes_preserve_subscription_status_and_clear_camera_content() {
+        let (diagnostics, worker) = Diagnostics::start(None).unwrap();
+        let ids = BTreeSet::from(["indoor".to_owned()]);
+        let callbacks = Callbacks::new(
+            PathBuf::new(),
+            CallbackFile::new(String::new(), json!({}), vec![]),
+            ids.clone(),
+            reqwest::Client::new(),
+            CancellationToken::new(),
+            diagnostics.clone(),
+        );
+        let hub = Hub::new(ids, callbacks, vec![], diagnostics);
+        hub.identify("indoor", HardwareId::serial("OLD-SERIAL"));
+        hub.availability("indoor", Some("baichuan"), "subscribed");
+        let first = hub.snapshot("indoor", "availability").unwrap();
+        hub.section("indoor", "state/settings", "image", json!({"hflip": true}));
+        hub.identify("indoor", None);
+        hub.identify("indoor", HardwareId::serial("NEW-SERIAL"));
+        let live = hub.snapshot("indoor", "availability").unwrap();
+        assert_eq!(live.payload["online"], true);
+        assert_eq!(live.payload["transport"], "baichuan");
+        assert_eq!(live.payload["updated_at"], first.payload["updated_at"]);
+        assert_eq!(live.payload["stable_id"], "NEW-SERIAL");
+        assert!(hub.snapshot("indoor", "state/settings").is_none());
+
+        hub.availability("indoor", None, "event_transport_unavailable");
+        hub.identify("indoor", HardwareId::serial("OTHER-SERIAL"));
+        let offline = hub.snapshot("indoor", "availability").unwrap();
+        assert_eq!(offline.payload["online"], false);
+        assert_eq!(offline.payload["stable_id"], "OTHER-SERIAL");
+        drop(hub);
+        worker.await.unwrap();
     }
 }

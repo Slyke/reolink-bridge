@@ -2087,6 +2087,33 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     let samples = metadata.1["frames"].as_array().unwrap();
     assert_eq!(samples.len(), 16);
     assert_eq!(samples[1]["offsetMs"], 125);
+    let playback = directory.path().join("checked-playback.mp4");
+    std::fs::write(&playback, &data)?;
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "frame=best_effort_timestamp_time",
+            "-of",
+            "json",
+        ])
+        .arg(playback)
+        .output()
+        .await?;
+    ensure!(probe.status.success(), "decode the prepared recording");
+    let probe: Value = serde_json::from_slice(&probe.stdout)?;
+    let frames = probe["frames"].as_array().context("decoded video frames")?;
+    assert_eq!(frames.len(), samples.len());
+    for (frame, sample) in frames.iter().zip(samples) {
+        let seconds: f64 = frame["best_effort_timestamp_time"]
+            .as_str()
+            .context("video timestamp")?
+            .parse()?;
+        assert_eq!((seconds * 1000.).round() as u64, sample["offsetMs"]);
+    }
     assert_eq!(samples[0]["objects"][0]["class"], "person");
     assert!(
         (samples[0]["objects"][0]["bounding_box"]["top"]
