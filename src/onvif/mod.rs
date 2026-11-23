@@ -236,19 +236,8 @@ impl Onvif {
             )
             .await
             .ok()?;
-        let info = device_info(&info)?;
-        let serial = HardwareId::serial(info["serial_number"].as_str()?)?;
-        // Some Reolink ONVIF servers return the address with its dots removed.
-        let address = self.device.host_str()?.parse::<std::net::Ipv4Addr>().ok();
-        let reolink = info["manufacturer"]
-            .as_str()
-            .is_some_and(|name| name.to_ascii_lowercase().contains("reolink"));
-        if (reolink && serial.value.bytes().all(|b| b.is_ascii_digit()))
-            || address.is_some_and(|ip| serial.value == ip.to_string().replace('.', ""))
-        {
-            return None;
-        }
-        Some(serial)
+        let info = device_info(&info, &self.device)?;
+        HardwareId::serial(info["serial_number"].as_str()?)
     }
 
     pub async fn discover(&self) -> Discovery {
@@ -330,7 +319,7 @@ impl Onvif {
             }
         }
         Discovery {
-            info: info.ok().and_then(|body| device_info(&body)),
+            info: info.ok().and_then(|body| device_info(&body, &self.device)),
             capabilities: json!({
                 "device": services.capabilities,
                 "events": event_caps.ok().and_then(|body| response_node(&body, "Capabilities")),
@@ -430,14 +419,24 @@ fn camera_url(base: &Url, value: &str, schemes: &[&str]) -> Option<Url> {
     Some(url)
 }
 
-fn device_info(body: &str) -> Option<Value> {
+fn device_info(body: &str, endpoint: &Url) -> Option<Value> {
     let doc = xml::document(body).ok()?;
     let info = xml::find(doc.root_element(), "GetDeviceInformationResponse")?;
+    let manufacturer = xml::value(info, "Manufacturer");
+    let reolink = manufacturer.is_some_and(|name| name.to_ascii_lowercase().contains("reolink"));
+    let address = endpoint
+        .host_str()
+        .and_then(|host| host.parse::<std::net::Ipv4Addr>().ok());
+    // The manufacturer's raw response is retained under vendor for diagnostics.
+    let serial = xml::value(info, "SerialNumber")
+        .and_then(crate::identity::HardwareId::serial)
+        .filter(|id| !(reolink && id.value.bytes().all(|b| b.is_ascii_digit())))
+        .filter(|id| !address.is_some_and(|ip| id.value == ip.to_string().replace('.', "")));
     Some(json!({
-        "manufacturer": xml::value(info, "Manufacturer"),
+        "manufacturer": manufacturer,
         "model": xml::value(info, "Model"),
         "firmware": xml::value(info, "FirmwareVersion"),
-        "serial_number": xml::value(info, "SerialNumber"),
+        "serial_number": serial.map(|id| id.value),
         "hardware": xml::value(info, "HardwareId"),
         "vendor": xml::tree(info),
     }))
