@@ -21,6 +21,8 @@ Authenticate the selected builder to Docker Hub and any configured mirror. Run t
 
 The script checks the Cargo package version and any existing release tag before building. It pushes the version and commit-specific tags to `docker.io/$BUILD_USERNAME/$BUILD_APP_NAME`. Set `PUSH_TAGS` to a space-separated list of additional tags. After verifying a stable release, set `PUSH_TAGS=latest` to promote it. The version must use `MAJOR.MINOR.PATCH` with an optional leading `v` to publish `latest`.
 
+Run `./build.sh --build-only` to inspect and test the commit-tagged image locally. Then run `./build.sh --push-only` from the same revision and with the same build settings to publish that image by its local image ID. Both modes accept the same config path and optional mirror arguments.
+
 Set `MIRROR_DOMAIN` to publish the same tags to a mirror. The script attempts every tag for each configured registry even if a publish step fails. It returns the first failure's exit status after all attempts finish. The script uses the mirror hostname in temporary registry tags and removes each local mirror tag after its push attempt. To select a mirror for one run, pass the hostname after the config path.
 
 ```bash

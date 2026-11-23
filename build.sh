@@ -6,8 +6,12 @@ fail() {
   exit 1
 }
 
+mode=build-and-push
+case ${1:-} in
+  --build-only|--push-only) mode=${1#--}; shift ;;
+esac
 if (( $# > 2 )); then
-  fail "Usage: $0 [BUILD_ENV] [MIRROR_DOMAIN]"
+  fail "Usage: $0 [--build-only|--push-only] [BUILD_ENV] [MIRROR_DOMAIN]"
 fi
 
 build_env=${1:-}
@@ -64,15 +68,28 @@ done
 tags=("$commit_tag" "$BUILD_VERSION" "${custom_tags[@]}")
 
 image="$BUILD_APP_NAME:$commit_tag"
-"$BUILDER_BIN" build -f ./dockerfiles/reolink-bridge.Dockerfile \
-  --build-arg "BUILD_HASH=$build_hash" \
-  --build-arg "BUILD_VERSION=$BUILD_VERSION" \
-  --build-arg "BUILD_DATE=$build_date" \
-  --build-arg "GIT_SHA=$git_sha" \
-  --build-arg "GIT_DIRTY=$git_dirty" \
-  --build-arg "CI_RUN_ID=$ci_run_id" \
-  --label "org.opencontainers.image.title=$BUILD_APP_NAME" \
-  -t "$image" .
+if [[ $mode != push-only ]]; then
+  "$BUILDER_BIN" build -f ./dockerfiles/reolink-bridge.Dockerfile \
+    --build-arg "BUILD_HASH=$build_hash" \
+    --build-arg "BUILD_VERSION=$BUILD_VERSION" \
+    --build-arg "BUILD_DATE=$build_date" \
+    --build-arg "GIT_SHA=$git_sha" \
+    --build-arg "GIT_DIRTY=$git_dirty" \
+    --build-arg "CI_RUN_ID=$ci_run_id" \
+    --label "org.opencontainers.image.title=$BUILD_APP_NAME" \
+    -t "$image" .
+fi
+
+# Resolve the image once so every release tag publishes the inspected content.
+image_id=$("$BUILDER_BIN" image inspect --format '{{.Id}}' "$image")
+image_revision=$("$BUILDER_BIN" image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_id")
+image_version=$("$BUILDER_BIN" image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image_id")
+[[ $image_revision == "$git_sha" && $image_version == "$BUILD_VERSION" ]] ||
+  fail "The local image $image does not match revision $git_sha and version $BUILD_VERSION"
+if [[ $mode == build-only ]]; then
+  printf 'Built %s (%s)\n' "$image" "$image_id"
+  exit 0
+fi
 
 primary="docker.io/$BUILD_USERNAME/$BUILD_APP_NAME"
 destinations=("$primary")
@@ -95,7 +112,7 @@ record_publish_failure() {
 for destination in "${destinations[@]}"; do
   for tag in "${tags[@]}"; do
     ref="$destination:$tag"
-    "$BUILDER_BIN" tag "$image" "$ref" || {
+    "$BUILDER_BIN" tag "$image_id" "$ref" || {
       record_publish_failure "$?" "Failed to tag $ref"
       continue
     }
