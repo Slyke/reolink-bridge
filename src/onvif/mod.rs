@@ -236,24 +236,19 @@ impl Onvif {
             )
             .await
             .ok()?;
-        if let Some(serial) = device_info(&info)
-            .and_then(|value| HardwareId::serial(value["serial_number"].as_str()?))
+        let info = device_info(&info)?;
+        let serial = HardwareId::serial(info["serial_number"].as_str()?)?;
+        // Some Reolink ONVIF servers return the address with its dots removed.
+        let address = self.device.host_str()?.parse::<std::net::Ipv4Addr>().ok();
+        let reolink = info["manufacturer"]
+            .as_str()
+            .is_some_and(|name| name.to_ascii_lowercase().contains("reolink"));
+        if (reolink && serial.value.bytes().all(|b| b.is_ascii_digit()))
+            || address.is_some_and(|ip| serial.value == ip.to_string().replace('.', ""))
         {
-            return Some(serial);
+            return None;
         }
-        let raw = self
-            .call(
-                &self.device,
-                format!("{DEV}/GetNetworkInterfaces"),
-                "<tds:GetNetworkInterfaces/>",
-            )
-            .await
-            .ok()?;
-        let doc = xml::document(&raw).ok()?;
-        doc.descendants()
-            .filter(|n| n.has_tag_name("HwAddress"))
-            .filter_map(|n| HardwareId::mac(n.text()?))
-            .min_by(|a, b| a.value.cmp(&b.value))
+        Some(serial)
     }
 
     pub async fn discover(&self) -> Discovery {

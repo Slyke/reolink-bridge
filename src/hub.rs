@@ -163,6 +163,15 @@ impl Hub {
             if camera.identity == unique {
                 continue;
             }
+            if camera
+                .identity
+                .as_ref()
+                .zip(unique.as_ref())
+                .is_some_and(|(old, new)| old.value == new.value && old.source == new.source)
+            {
+                camera.identity = unique;
+                continue;
+            }
             if camera.identity.is_some() {
                 // Availability describes the event subscription for this route. It can stay
                 // connected across identity discovery without publishing another status.

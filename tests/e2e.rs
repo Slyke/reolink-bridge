@@ -269,7 +269,7 @@ async fn local_broker_http_websocket_and_camera_controls() {
     };
     assert_eq!(
         inventory["cameras"],
-        json!([{"id":"fixed","stableId":"FIXTURE-CHANNEL-1","identitySource":"serial","previousId":"fixed","active":true},{"id":"lab","stableId":"FIXTURE-SERIAL","identitySource":"serial","previousId":"lab","active":true}])
+        json!([{"id":"fixed","stableId":"FIXTURE-CHANNEL-1","identitySource":"serial","hardwareSerial":"FIXTURE-CHANNEL-1","previousId":"fixed","active":true},{"id":"lab","stableId":"952700FIXTURE0001","identitySource":"uid","hardwareSerial":"FIXTURE-SERIAL","previousId":"lab","active":true}])
     );
     let (status, live) = probe(&http, address, "/livez").await;
     assert_eq!(status, StatusCode::OK);

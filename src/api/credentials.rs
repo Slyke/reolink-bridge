@@ -99,25 +99,18 @@ async fn reported_identity(session: &mut Session) -> Result<(Identifiers, Option
     let raw = session.command(114, None, "").await?;
     let doc = xml::document(&raw)?;
     let uid = xml::value(doc.root_element(), "uid")
-        .context("camera omitted its UID")?
-        .to_owned();
+        .and_then(crate::identity::HardwareId::uid)
+        .context("camera omitted a valid Device UID")?;
     let mut identity = Identifiers {
-        uid: Some(uid),
+        uid: Some(uid.value),
         serial: None,
     };
-    ensure!(identity.valid(), "camera reported an invalid UID");
     let mut model = None;
     if let Ok(raw) = session.command(80, None, "").await
         && let Ok(doc) = xml::document(&raw)
     {
         let root = doc.root_element();
-        identity.serial = ["serialNumber", "serialNo"]
-            .iter()
-            .find_map(|key| {
-                crate::identity::HardwareId::serial(xml::value(root, key)?)
-                    .map(|serial| serial.value)
-            })
-            .filter(|s| s.len() >= 4);
+        identity.serial = crate::identity::native_serial(root).map(|id| id.value);
         model = xml::value(root, "name")
             .filter(|s| !s.is_empty() && s.len() <= 96 && !s.chars().any(char::is_control))
             .map(str::to_owned);
@@ -152,6 +145,15 @@ pub struct Identifiers {
 }
 
 impl Identifiers {
+    pub(super) fn hardware(&self) -> Option<crate::identity::HardwareId> {
+        use crate::identity::HardwareId;
+        let serial = self.serial.as_deref().and_then(HardwareId::serial);
+        if let Some(uid) = self.uid.as_deref() {
+            return Some(HardwareId::uid(uid)?.with_serial(serial));
+        }
+        serial
+    }
+
     fn matches(&self, reported: &Identifiers) -> bool {
         [(&self.uid, &reported.uid), (&self.serial, &reported.serial)]
             .into_iter()
@@ -392,7 +394,7 @@ impl Vault {
         lock.try_lock()
             .map_err(|_| anyhow::anyhow!("API credential directory already in use"))?;
         let file = path.join("vault.json");
-        let data = if file.exists() {
+        let mut data: Data = if file.exists() {
             let meta = fs::symlink_metadata(&file)?;
             ensure!(
                 meta.is_file() && meta.permissions().mode() & 0o077 == 0 && meta.len() <= 1_000_000,
@@ -403,6 +405,30 @@ impl Vault {
         } else {
             Data::default()
         };
+        // Older enrollments automatically copied the decimal VersionInfo field alongside the UID.
+        // Explicit rotationIds and new enrollment requests still have to match every supplied field.
+        for credential in data.devices.values_mut().chain(
+            data.rotations
+                .values_mut()
+                .filter_map(|r| r.staged.as_mut())
+                .flat_map(|(old, new)| [old, new]),
+        ) {
+            if credential.enrolled
+                && credential
+                    .identifiers
+                    .uid
+                    .as_deref()
+                    .and_then(crate::identity::HardwareId::uid)
+                    .is_some()
+                && credential
+                    .identifiers
+                    .serial
+                    .as_ref()
+                    .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            {
+                credential.identifiers.serial = None;
+            }
+        }
         Ok(Self {
             file,
             _lock: lock,
@@ -632,15 +658,9 @@ impl Vault {
                 return self.save(data);
             }
         }
-        // Keep the verified serial available for recovery when a credential change pauses this camera.
-        if old.identifiers.serial.is_none()
-            && let Ok(raw) = session.command(80, None, "").await
-            && let Ok(doc) = xml::document(&raw)
-            && let Some(id) = ["serialNumber", "serialNo"].iter().find_map(|field| {
-                xml::value(doc.root_element(), field).and_then(crate::identity::HardwareId::serial)
-            })
-        {
-            old.identifiers.serial = Some(id.value);
+        if let Ok((identity, _)) = reported_identity(&mut session).await {
+            old.identifiers.uid = identity.uid;
+            old.identifiers.serial = old.identifiers.serial.or(identity.serial);
         }
         if !factory {
             let _ = session.logout().await;
@@ -959,11 +979,9 @@ async fn identified(session: &mut Session, expected: &Identifiers) -> bool {
         let Ok(doc) = xml::document(&raw) else {
             return false;
         };
-        if !matched(
-            xml::value(doc.root_element(), "serialNumber")
-                .or_else(|| xml::value(doc.root_element(), "serialNo")),
-            serial,
-        ) {
+        if !crate::identity::native_serial(doc.root_element())
+            .is_some_and(|id| id.value.eq_ignore_ascii_case(serial))
+        {
             return false;
         }
     }

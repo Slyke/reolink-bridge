@@ -241,10 +241,7 @@ impl Api {
             .difference(&active)
             .filter_map(|id| {
                 let credential = vault.as_ref()?.credential(&identities[id])?;
-                Some((
-                    id.clone(),
-                    crate::identity::HardwareId::serial(credential.identifiers.serial.as_deref()?)?,
-                ))
+                Some((id.clone(), credential.identifiers.hardware()?))
             })
             .collect();
         let devices: BTreeMap<String, Device> = cameras
@@ -657,8 +654,12 @@ async fn inventory(
     }
     Json(json!({"cameras":api.registered.iter().map(|id| {
         let hardware = api.hardware(id);
-        json!({"id":id,"stableId":hardware.as_ref().map(|v| &v.value),"identitySource":hardware.as_ref().map(|v| v.source),
-            "previousId":api.identities[id],"active":api.active.contains(id)})
+        let mut entry = json!({"id":id,"stableId":hardware.as_ref().map(|v| &v.value),"identitySource":hardware.as_ref().map(|v| v.source),
+            "previousId":api.identities[id],"active":api.active.contains(id)});
+        if let Some(serial) = hardware.and_then(|id| if id.source == "serial" { Some(id.value) } else { id.serial_alias }) {
+            entry["hardwareSerial"] = json!(serial);
+        }
+        entry
     }).collect::<Vec<_>>(), "correlation_id":correlation.0})).into_response()
 }
 
@@ -1094,13 +1095,9 @@ async fn finish_enrollment(
         && !gate.is_cancelled()
     {
         if let Some(credential) = api.vault_key(name).and_then(|key| vault.credential(key))
-            && let Some(serial) = credential
-                .identifiers
-                .serial
-                .as_deref()
-                .and_then(crate::identity::HardwareId::serial)
+            && let Some(identity) = credential.identifiers.hardware()
         {
-            api.hub().identify(name, Some(serial));
+            api.hub().identify(name, Some(identity));
         }
         gate.cancel();
     }

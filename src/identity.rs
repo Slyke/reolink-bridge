@@ -1,10 +1,17 @@
 //! Camera-reported physical identity, independent of the configured route and interface.
-use crate::{config::valid_id, onvif::Onvif, reolink::wire::Device, xml};
+use crate::{
+    config::valid_id,
+    onvif::Onvif,
+    reolink::wire::{Device, Rejected, Session},
+    xml,
+};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct HardwareId {
     pub value: String,
     pub source: &'static str,
+    /// A serial observed on the same authenticated camera, for upgrading existing clients.
+    pub serial_alias: Option<String>,
 }
 
 impl HardwareId {
@@ -27,7 +34,26 @@ impl HardwareId {
         .then_some(Self {
             value,
             source: "serial",
+            serial_alias: None,
         })
+    }
+
+    pub fn uid(raw: &str) -> Option<Self> {
+        let mut id = Self::serial(raw)?;
+        if !(8..=40).contains(&id.value.len())
+            || !id.value.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        id.source = "uid";
+        Some(id)
+    }
+
+    pub fn with_serial(mut self, serial: Option<Self>) -> Self {
+        self.serial_alias = serial
+            .filter(|id| id.source == "serial" && id.value != self.value)
+            .map(|id| id.value);
+        self
     }
 
     pub fn mac(raw: &str) -> Option<Self> {
@@ -39,30 +65,64 @@ impl HardwareId {
             .then_some(Self {
                 value,
                 source: "mac",
+                serial_alias: None,
             })
     }
 }
 
-async fn native(device: &Device) -> Option<HardwareId> {
-    let mut session = device.connect().await.ok()?;
-    // Channel-specific information on recorders. A recorder's serial cannot identify every channel.
-    let commands = [(318, Some(device.channel)), (80, None)];
-    for (command, channel) in commands {
-        if channel.is_none() && device.channel != 0 {
-            continue;
+// Reolink VersionInfo also puts decimal device numbers in serialNumber. On the E1 Pro
+// that number changes on reboot. Only use an unambiguous serial from this protocol.
+pub fn native_serial(root: roxmltree::Node<'_, '_>) -> Option<HardwareId> {
+    ["serialNumber", "serialNo"]
+        .into_iter()
+        .filter_map(|field| xml::value(root, field).and_then(HardwareId::serial))
+        .find(|id| id.value.len() >= 4 && !id.value.bytes().all(|b| b.is_ascii_digit()))
+}
+
+async fn native(
+    device: &Device,
+    session: &mut Session,
+    soap: Option<HardwareId>,
+) -> Option<HardwareId> {
+    // A recorder can supply a channel-specific identity. Never use its chassis UID on another channel.
+    if let Ok(raw) = session.command(318, Some(device.channel), "").await
+        && let Ok(doc) = xml::document(&raw)
+        && let Some(channel) = doc
+            .descendants()
+            .find(|node| node.has_tag_name("ChnTypeInfo"))
+    {
+        let serial = native_serial(channel);
+        if let Some(uid) = xml::value(channel, "uid").and_then(HardwareId::uid) {
+            return Some(uid.with_serial(serial));
         }
-        if let Ok(raw) = session.command(command, channel, "").await
-            && let Ok(doc) = xml::document(&raw)
-            && let Some(serial) = ["serialNumber", "serialNo"]
-                .iter()
-                .find_map(|name| xml::value(doc.root_element(), name).and_then(HardwareId::serial))
-        {
-            return Some(serial);
+        if serial.is_some() {
+            return serial;
         }
     }
-    let raw = session.command(76, Some(device.channel), "").await.ok()?;
-    let doc = xml::document(&raw).ok()?;
-    HardwareId::mac(xml::value(doc.root_element(), "mac")?)
+    if device.channel != 0 {
+        return None;
+    }
+    let uid = match session.command(114, None, "").await {
+        Ok(raw) => Some(HardwareId::uid(xml::value(
+            xml::document(&raw).ok()?.root_element(),
+            "uid",
+        )?)?),
+        Err(error)
+            if error
+                .downcast_ref::<Rejected>()
+                .is_some_and(|e| matches!(e.status(), 400 | 404 | 405 | 501)) =>
+        {
+            None
+        }
+        Err(_) => return None,
+    };
+    let version = session.command(80, None, "").await.ok();
+    let serial =
+        soap.or_else(|| native_serial(xml::document(version.as_ref()?).ok()?.root_element()));
+    match uid {
+        Some(uid) => Some(uid.with_serial(serial)),
+        None => serial,
+    }
 }
 
 pub async fn read(
@@ -70,52 +130,54 @@ pub async fn read(
     device: Option<&Device>,
     channel: u8,
 ) -> Option<HardwareId> {
-    let (soap, native) = tokio::join!(
-        async {
-            if channel != 0 {
-                return None;
-            }
+    let read_onvif = async {
+        if channel == 0 {
             onvif?.hardware_id().await
-        },
-        async { native(device?).await }
-    );
-    preferred(soap, native)
-}
-
-fn preferred(soap: Option<HardwareId>, native: Option<HardwareId>) -> Option<HardwareId> {
-    soap.iter()
-        .chain(native.iter())
-        .find(|id| id.source == "serial")
-        .cloned()
-        .or(native)
-        .or(soap)
+        } else {
+            None
+        }
+    };
+    let Some(device) = device else {
+        return read_onvif.await;
+    };
+    let (soap, session) = tokio::join!(read_onvif, device.connect());
+    let mut session = session.ok()?;
+    let id = native(device, &mut session, soap).await;
+    session.logout().await;
+    id
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn serial_survives_interface_changes_and_invalid_identifiers_are_excluded() {
-        let serial = HardwareId::serial("  fixture-a123 ").unwrap();
-        assert_eq!(serial.value, "FIXTURE-A123");
-        for mac in ["02:01:02:03:04:05", "04-01-02-03-04-05"] {
-            for (a, b) in [
-                (HardwareId::mac(mac), Some(serial.clone())),
-                (Some(serial.clone()), HardwareId::mac(mac)),
-            ] {
-                assert_eq!(preferred(a, b), Some(serial.clone()));
-            }
+    fn physical_identifiers_exclude_placeholders_and_volatile_device_numbers() {
+        for device_number in ["141484730899624", "141484730899590", "00326417514496"] {
+            let xml =
+                format!("<VersionInfo><serialNumber>{device_number}</serialNumber></VersionInfo>");
+            assert_eq!(
+                native_serial(xml::document(&xml).unwrap().root_element()),
+                None
+            );
         }
-        assert_eq!(
-            HardwareId::mac("02:01:02:03:04:05").unwrap().value,
-            "020102030405"
-        );
-        assert!(HardwareId::mac("00:00:00:00:00:00").is_none());
-        assert!(HardwareId::mac("ff:ff:ff:ff:ff:ff").is_none());
+        let id = HardwareId::uid(" 952700test000001 ")
+            .unwrap()
+            .with_serial(HardwareId::serial("factory-123"));
+        assert_eq!(id.value, "952700TEST000001");
+        assert_eq!(id.source, "uid");
+        assert_eq!(id.serial_alias.as_deref(), Some("FACTORY-123"));
         for placeholder in [
             "", "00000001", "00000000", "FFFFFFFF", "unknown", "12345678", "n/a",
         ] {
             assert!(HardwareId::serial(placeholder).is_none());
+            assert!(HardwareId::uid(placeholder).is_none());
         }
+        assert!(HardwareId::uid("SW6S").is_none());
+        assert!(HardwareId::uid("FIXTURE-SERIAL").is_none());
+        assert_eq!(
+            HardwareId::mac("02:01:02:03:04:05").unwrap().value,
+            "020102030405"
+        );
+        assert!(HardwareId::mac("ff:ff:ff:ff:ff:ff").is_none());
     }
 }

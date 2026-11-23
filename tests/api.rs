@@ -575,7 +575,7 @@ async fn configured_camera_enrolls_in_place_by_address() -> Result<()> {
     let inventory = response(&client, &format!("{origin}/api/inventory"), PRIMARY, None)
         .await
         .1;
-    assert_eq!(inventory["cameras"][0]["stableId"], "FIXTURE-SERIAL");
+    assert_eq!(inventory["cameras"][0]["stableId"], UID);
     assert_eq!(
         response(
             &client,
@@ -657,7 +657,7 @@ async fn e1_pro_factory_enrollment_uses_configured_password_and_hands_off_to_sta
     let vault = directory.path().join("vault");
     std::fs::create_dir(&vault)?;
     std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o700))?;
-    let version = "<body><VersionInfo><name>E1 Pro</name><itemNo>E Series E330</itemNo><hardwareVersion>IPC_NT1NA45MP</hardwareVersion><firmwareVersion>v3.1.0.4417_2412122130</firmwareVersion><serialNumber>FIXTURE-SERIAL</serialNumber></VersionInfo></body>";
+    let version = "<body><VersionInfo><name>E1 Pro</name><itemNo>E Series E330</itemNo><hardwareVersion>IPC_NT1NA45MP</hardwareVersion><firmwareVersion>v3.1.0.4417_2412122130</firmwareVersion><serialNumber>140000000000001</serialNumber></VersionInfo></body>";
     let camera = Arc::new(baichuan::Camera {
         version_info: Some(version.replace("4417", "9999")).into(),
         password: Some(String::new()).into(),
@@ -725,11 +725,30 @@ async fn e1_pro_factory_enrollment_uses_configured_password_and_hands_off_to_sta
     assert_eq!(camera.credential_writes.load(Ordering::SeqCst), 1);
     bridge.kill().await?;
 
+    // Simulate a vault written by the old bridge and the firmware number changing on reboot.
+    let file = vault.join("vault.json");
+    let mut previous: Value = serde_json::from_slice(&std::fs::read(&file)?)?;
+    assert_eq!(previous["devices"]["e1-pro"]["identifiers"]["uid"], UID);
+    assert!(previous["devices"]["e1-pro"]["identifiers"]["serial"].is_null());
+    previous["devices"]["e1-pro"]["identifiers"]["serial"] = json!("140000000000001");
+    std::fs::write(file, serde_json::to_vec(&previous)?)?;
+    *camera.version_info.lock().unwrap() =
+        Some(version.replace("140000000000001", "140000000000002"));
     body["api"]["targets"] = json!({});
     body["cameras"] = json!([{"id":"e1-pro","host":"127.0.0.1","username":"admin","password":first_password,
         "channel":0,"baichuanPort":camera_port,"onvifPort":null,"eventTransport":"auto","ptz":"auto"}]);
     std::fs::write(&config, body.to_string())?;
+    let mut restarted = start(&config, &client, &origin).await?;
+    let inventory = format!("{origin}/api/inventory");
+    let first = discovered(&client, &inventory).await;
+    assert_eq!(first[0]["stableId"], UID);
+    assert_eq!(first[0]["identitySource"], "uid");
+    assert!(first[0].get("hardwareSerial").is_none());
+    restarted.kill().await?;
+    *camera.version_info.lock().unwrap() =
+        Some(version.replace("140000000000001", "140000000000003"));
     let _bridge = start(&config, &client, &origin).await?;
+    assert_eq!(discovered(&client, &inventory).await, first);
     let status = response(&client, &format!("{enrollments}/{id}"), PRIMARY, None).await;
     assert_eq!(status.1["status"], "active");
     let accounts = response(
@@ -968,7 +987,7 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     );
     assert_eq!(
         discovered(&client, &url("/inventory")).await,
-        json!([{"id":"new","stableId":"FIXTURE-SERIAL","identitySource":"serial","previousId":"new","active":true}])
+        json!([{"id":"new","stableId":"952700FIXTURE0001","identitySource":"uid","hardwareSerial":"FIXTURE-SERIAL","previousId":"new","active":true}])
     );
     let until = Instant::now() + Duration::from_secs(6);
     loop {
@@ -1092,7 +1111,7 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     bridge = start(&config, &client, &origin).await?;
     assert_eq!(
         discovered(&client, &url("/inventory")).await,
-        json!([{"id":"new","stableId":"FIXTURE-SERIAL","identitySource":"serial","previousId":"new","active":false}])
+        json!([{"id":"new","stableId":"952700FIXTURE0001","identitySource":"uid","hardwareSerial":"FIXTURE-SERIAL","previousId":"new","active":false}])
     );
     camera.block_login.store(false, Ordering::SeqCst);
     let recovered = response(
@@ -1121,7 +1140,7 @@ async fn single_psk_enrollment_and_interrupted_rotation_recover_after_restart() 
     let _bridge = start(&config, &client, &origin).await?;
     assert_eq!(
         discovered(&client, &url("/inventory")).await,
-        json!([{"id":"garage","stableId":"FIXTURE-SERIAL","identitySource":"serial","previousId":"new","active":true}])
+        json!([{"id":"garage","stableId":"952700FIXTURE0001","identitySource":"uid","hardwareSerial":"FIXTURE-SERIAL","previousId":"new","active":true}])
     );
     assert_eq!(
         response(&client, &url("/cameras/garage/rotation"), PRIMARY, None)
