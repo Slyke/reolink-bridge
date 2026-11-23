@@ -1,3 +1,4 @@
+mod exposure;
 mod fields;
 mod ftp;
 mod privacy;
@@ -18,7 +19,7 @@ enum Problem {
     Invalid,
     Unsupported,
     Read,
-    Rejected,
+    Rejected(u16),
     Unverified,
 }
 type Result<T> = std::result::Result<T, Problem>;
@@ -36,7 +37,7 @@ impl Problem {
                 "API_DEVICE_OPTIONS_UNSUPPORTED",
             ),
             Self::Read => (StatusCode::BAD_GATEWAY, "API_DEVICE_OPTIONS_READ_FAILED"),
-            Self::Rejected => (
+            Self::Rejected(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "API_DEVICE_OPTIONS_REJECTED",
             ),
@@ -142,16 +143,36 @@ pub(super) async fn set(
             let Some(body) = group.edit(doc.root_element(), channel, &change.fields)? else {
                 return report(&group, &raw, channel);
             };
-            session
+            if let Err(error) = session
                 .command(group.set, group.wire_channel(channel), &body)
                 .await
-                .map_err(|e| {
-                    if e.is::<Rejected>() {
-                        Problem::Rejected
-                    } else {
-                        Problem::Unverified
-                    }
-                })?;
+            {
+                let rejection = error
+                    .downcast_ref::<Rejected>()
+                    .ok_or(Problem::Unverified)?;
+                if !matches!(rejection.status(), 400 | 422)
+                    || !group.ambiguous_exposure(doc.root_element(), &change.fields)
+                {
+                    return Err(Problem::Rejected(rejection.status()));
+                }
+                // With no mode list, Auto and Manual look identical on both firmware variants.
+                // Only an explicit invalid-value response justifies trying the other spelling.
+                let fresh = read(&mut session, &group, channel).await?;
+                let doc = xml::document(&fresh).map_err(|_| Problem::Read)?;
+                if let Some(body) =
+                    group.edit_fields(doc.root_element(), channel, &change.fields, true)?
+                {
+                    session
+                        .command(group.set, group.wire_channel(channel), &body)
+                        .await
+                        .map_err(|e| {
+                            e.downcast_ref::<Rejected>()
+                                .map_or(Problem::Unverified, |rejection| {
+                                    Problem::Rejected(rejection.status())
+                                })
+                        })?;
+                }
+            }
             let raw = read(&mut session, &group, channel)
                 .await
                 .map_err(|_| Problem::Unverified)?;
@@ -192,6 +213,15 @@ pub(super) async fn set(
             }
             data["correlation_id"] = json!(cid.0);
             Json(data).into_response()
+        }
+        Err(Problem::Rejected(status)) => {
+            let mut report = api.hub().diagnostics.error(
+                "api::device_options::set", "API_DEVICE_OPTIONS_REJECTED", Some(cid.0.clone()),
+                json!({"cameraId":id,"channel":channel,"group":name,"command":group.set,"cameraStatus":status,
+                    "requestedFields":change.fields.keys().collect::<Vec<_>>(),"httpStatus":422}), None,
+            );
+            report["cameraStatus"] = json!(status);
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(report)).into_response()
         }
         Err(problem) => problem.response(&cid),
     }

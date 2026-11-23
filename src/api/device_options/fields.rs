@@ -10,6 +10,7 @@ enum Kind {
     ReportedRange,
     Choice(&'static [&'static str]),
     Flicker,
+    Exposure,
 }
 use Kind::*;
 type Field = (&'static str, &'static str, Kind);
@@ -61,11 +62,7 @@ impl Group {
                         "InputAdvanceCfg/PowerLineFrequency/mode",
                         Flicker,
                     ),
-                    (
-                        "exposure",
-                        "InputAdvanceCfg/Exposure/mode",
-                        Choice(&["auto", "lownoise", "anti-smearing", "manual"]),
-                    ),
+                    ("exposure", "InputAdvanceCfg/Exposure/mode", Exposure),
                     (
                         "whiteBalance",
                         "InputAdvanceCfg/Scene/mode",
@@ -261,6 +258,27 @@ impl Group {
         if self.get == 52 && fields.contains_key("maskAreas") {
             return super::privacy::edit(root, channel, fields);
         }
+        self.edit_fields(root, channel, fields, false)
+    }
+
+    pub fn ambiguous_exposure(&self, root: Node<'_, '_>, fields: &Map<String, Value>) -> bool {
+        self.get == 26
+            && fields
+                .get("exposure")
+                .and_then(Value::as_str)
+                .is_some_and(|requested| {
+                    at(root, "InputAdvanceCfg/Exposure/mode")
+                        .is_some_and(|mode| super::exposure::ambiguous(mode, requested))
+                })
+    }
+
+    pub(super) fn edit_fields(
+        &self,
+        root: Node<'_, '_>,
+        channel: u8,
+        fields: &Map<String, Value>,
+        legacy_exposure: bool,
+    ) -> Result<Option<String>> {
         if fields.is_empty() {
             return Err(Problem::Invalid);
         }
@@ -283,7 +301,7 @@ impl Group {
                 return Err(Problem::Unsupported);
             }
             let node = at(root, path).ok_or(Problem::Unsupported)?;
-            kind.write(node, spec, value, &mut edits)?;
+            kind.write(node, spec, value, &mut edits, legacy_exposure)?;
         }
         Ok((!edits.is_empty()).then(|| xml::replace_nodes(root, edits)))
     }
@@ -343,6 +361,7 @@ impl Kind {
                     .contains(&raw)
                     .then(|| json!({"value":raw,"choices":valid}))
             }
+            Exposure => super::exposure::describe(node),
             Flicker => {
                 let enabled = xml::child(parent, "enable").and_then(xml::text)?;
                 let value = match enabled {
@@ -360,6 +379,7 @@ impl Kind {
         spec: &Value,
         value: &Value,
         edits: &mut Vec<(Node<'a, 'b>, String)>,
+        legacy_exposure: bool,
     ) -> Result<()> {
         match self {
             Switch => scalar(
@@ -380,6 +400,12 @@ impl Kind {
                     })
                     .ok_or(Problem::Invalid)?;
                 scalar(edits, node, &n.to_string())
+            }
+            Exposure => {
+                let name = value.as_str().ok_or(Problem::Invalid)?;
+                let wire = super::exposure::wire_value(node, name, legacy_exposure)
+                    .ok_or(Problem::Invalid)?;
+                scalar(edits, node, wire)
             }
             Choice(_) | Flicker => {
                 let choice = value
@@ -439,6 +465,66 @@ mod tests {
                 .replace("<enable>0", "<enable>1")
         );
     }
+    #[test]
+    fn exposure_writes_and_reads_the_camera_spelling() {
+        let group = Group::named("picture").unwrap();
+        let raw = "<body><VideoInput><channelId>0</channelId></VideoInput><InputAdvanceCfg><Exposure><mode>auto</mode><shutterLevel>1/60</shutterLevel></Exposure></InputAdvanceCfg></body>";
+        for (api, wire) in [("anti-smearing", "shutterFirst"), ("lownoise", "gainFist")] {
+            let change = json!({"exposure":api});
+            let fields = change.as_object().unwrap();
+            let doc = xml::document(raw).unwrap();
+            assert!(group.ambiguous_exposure(doc.root_element(), fields));
+            let written = group.edit(doc.root_element(), 0, fields).unwrap().unwrap();
+            assert_eq!(written, raw.replace(">auto<", &format!(">{wire}<")));
+            let saved = xml::document(&written).unwrap();
+            assert_eq!(
+                group.describe(saved.root_element(), 0).unwrap()["fields"]["exposure"]["value"],
+                api
+            );
+            assert!(
+                group
+                    .edit(saved.root_element(), 0, fields)
+                    .unwrap()
+                    .is_none()
+            );
+            let legacy = group
+                .edit_fields(doc.root_element(), 0, fields, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(legacy, raw.replace(">auto<", &format!(">{api}<")));
+            let doc = xml::document(&legacy).unwrap();
+            assert_eq!(
+                group.describe(doc.root_element(), 0).unwrap()["fields"]["exposure"]["value"],
+                api
+            );
+        }
+        let limited = raw.replace(
+            "<mode>auto",
+            "<modeList>auto, Anti-Smearing</modeList><mode>auto",
+        );
+        let doc = xml::document(&limited).unwrap();
+        let root = doc.root_element();
+        let result = group.describe(root, 0).unwrap();
+        assert_eq!(
+            result["fields"]["exposure"]["choices"],
+            json!(["auto", "anti-smearing"])
+        );
+        let change = json!({"exposure":"anti-smearing"});
+        assert!(!group.ambiguous_exposure(root, change.as_object().unwrap()));
+        assert!(
+            group
+                .edit(root, 0, change.as_object().unwrap())
+                .unwrap()
+                .unwrap()
+                .contains("<mode>Anti-Smearing</mode>")
+        );
+        assert!(
+            group
+                .edit(root, 0, json!({"exposure":"lownoise"}).as_object().unwrap())
+                .is_err()
+        );
+    }
+
     #[test]
     fn a_single_stream_and_existing_privacy_regions_are_independent() {
         let raw = "<body><Compression><channelId>0</channelId><mainStream><audio>1</audio></mainStream><subStream><audio>1</audio></subStream></Compression></body>";
