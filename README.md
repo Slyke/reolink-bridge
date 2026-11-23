@@ -29,6 +29,7 @@ Use [the Docker build and publish example](./docs/deployment.md) from this repos
 
 - Run `cargo test --locked` for protocol and configuration fixtures.
 - With Mosquitto installed, run `cargo test --locked -- --include-ignored` for the loopback camera, broker, HTTP, WebSocket, and TLS tests.
+- To include the real WUI, run `npm ci && npm run build` in the sibling [WUI repository](https://github.com/Slyke/reolink-wui), then set `WUI_TEST_PROJECT` to its absolute path and `WUI_TEST_NODE` to the absolute Node 24 executable before running the suite with ignored tests. This exercises callback delivery, all three WUI event sources, commands, snapshots and media on loopback.
 - Run `cargo error-validate` to validate the [structured error catalog](./errors.json5).
 - Check `/livez` for process liveness and `/readyz` for camera and MQTT readiness. Subscribe to the camera's MQTT branch, trigger and clear a detection, and check `events` and the matching retained state.
 

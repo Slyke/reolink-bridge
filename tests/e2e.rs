@@ -42,7 +42,7 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest},
 };
 
-const WS_TOKEN: &str = "fixture-websocket-token";
+const WS_TOKEN: &str = "fixture-websocket-token-for-loopback";
 const WEBHOOK_TOKEN: &str = "fixture-native-webhook-token";
 const PERSON_TOPIC: &str = "tns1:RuleEngine/MyRuleDetector/PeopleDetect";
 const VENDOR_TOPIC: &str = "tns1:RuleEngine/FutureDetector/ParcelMoved";
@@ -54,6 +54,7 @@ struct Fixture {
     renewals: AtomicUsize,
     unsubscribes: AtomicUsize,
     delivered: mpsc::UnboundedSender<Value>,
+    wui_deliveries: Mutex<Vec<Value>>,
 }
 
 async fn soap(State(fixture): State<Arc<Fixture>>, body: String) -> Response {
@@ -133,11 +134,24 @@ async fn local_broker_http_websocket_and_camera_controls() {
         renewals: AtomicUsize::new(0),
         unsubscribes: AtomicUsize::new(0),
         delivered,
+        wui_deliveries: Mutex::default(),
     });
     let router = Router::new()
         .route("/onvif/{service}", post(soap))
         .route("/subscription", post(soap))
         .route("/callback", post(callback))
+        .route(
+            "/wui-callback",
+            post(
+                async |State(f): State<Arc<Fixture>>, axum::Json(event): axum::Json<Value>| {
+                    f.wui_deliveries.lock().unwrap().push(event);
+                    StatusCode::NO_CONTENT
+                },
+            )
+            .get(async |State(f): State<Arc<Fixture>>| {
+                axum::Json(f.wui_deliveries.lock().unwrap().clone())
+            }),
+        )
         .route("/slow", post(slow))
         .with_state(fixture.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -191,6 +205,7 @@ async fn local_broker_http_websocket_and_camera_controls() {
         .unwrap();
     next_mqtt(&mut observed, "site/cameras/lab/command/exec").await;
     let callback_url = format!("http://{}/callback", fixture.addr);
+    let wui_callback = format!("http://{}/wui-callback", fixture.addr);
     std::fs::write(&path, json!({
         "mqtt":{"url":format!("mqtt://{mqtt}"),"baseTopic":"site/cameras"},
         "http":{"listen":address.to_string(),"advertiseBaseUrl":format!("http://{address}")},
@@ -200,6 +215,7 @@ async fn local_broker_http_websocket_and_camera_controls() {
             "eventTransport":"onvif_push","nativeWebhook":{"token":"${FIXTURE_NATIVE}"}},
             {"id":"fixed","host":"127.0.0.1","username":"admin","password":"${FIXTURE_PASSWORD}",
                 "onvifPort":null,"baichuanPort":baichuan_port,"channel":1,"eventTransport":"baichuan"}],
+        "api":{"callbackDestinations":[wui_callback]},
         "callbacks":[
             {"id":"slow","url":"${FIXTURE_CALLBACK}","events":["person"]},
             {"id":"good","url":callback_url,"cameras":["lab"],"events":["person"]}
@@ -615,7 +631,7 @@ async fn local_broker_http_websocket_and_camera_controls() {
     let native = mock.webhook.lock().unwrap().clone().unwrap();
     assert!(native.ends_with(&format!("/ingest/reolink/lab/{WEBHOOK_TOKEN}")));
     let response = http
-        .post(native)
+        .post(&native)
         .header("content-type", "application/json")
         .body(r#"{"data":{"event":"wake","reason":"doorbell"}}"#)
         .send()
@@ -626,6 +642,23 @@ async fn local_broker_http_websocket_and_camera_controls() {
     let (_, doorbell) = next_mqtt(&mut observed, "site/cameras/lab/events").await;
     assert_eq!(awake["type"], "awake");
     assert_eq!(doorbell["type"], "doorbell");
+
+    if let Some(project) = std::env::var_os("WUI_TEST_PROJECT") {
+        let node = std::env::var_os("WUI_TEST_NODE").expect("set WUI_TEST_NODE to Node 24");
+        let status = Command::new(node)
+            .current_dir(project)
+            .args(["--test", "tests/integration/bridge-events.mjs"])
+            .env("FIXTURE_BRIDGE", format!("http://{address}"))
+            .env("FIXTURE_TOKEN", WS_TOKEN)
+            .env("FIXTURE_BROKER", format!("mqtt://{mqtt}"))
+            .env("FIXTURE_INGRESS", native)
+            .env("FIXTURE_RECEIVER", wui_callback)
+            .kill_on_drop(true)
+            .status()
+            .await
+            .expect("start the sibling WUI event test");
+        assert!(status.success(), "WUI event integration failed: {status}");
+    }
 
     until(|| fixture.renewals.load(Ordering::SeqCst) > 0).await;
     broker.kill().await.unwrap();
