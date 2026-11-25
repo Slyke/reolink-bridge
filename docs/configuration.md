@@ -8,6 +8,10 @@ cargo run --locked --release -- ./local-only/bridge.json5
 
 The bridge resolves whole JSON5 string values such as `${CAMERA_PASSWORD}` from the environment. An unset variable resolves to null, and defined values keep their string type. Use JSON5 numbers and booleans for options such as ports and flags. Required secrets must be non-empty. Keep the config, private keys, and files with site-specific URLs or credentials under `./local-only/`.
 
+## Camera read retries
+
+Set `api.cameraReadRetries` to an integer from 0 through 10. The default of 2 allows three attempts in total. A temporary connection failure on a supported camera read opens a fresh session with a short backoff. Each operation keeps its existing deadline. Camera writes and movements use a single dispatch. A WUI administrator can override the startup value under **Settings → Private bridges → Bridge connections → HTTP API**.
+
 ## Two cameras and a callback
 
 ```json5

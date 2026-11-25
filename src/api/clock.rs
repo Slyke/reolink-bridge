@@ -142,13 +142,18 @@ pub(super) async fn get(
     let Ok(_slot) = api.settings_slots.try_acquire() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "API_READ_BUSY", &cid);
     };
-    let work = async {
+    let read = || async {
         let mut session = device.connect().await?;
         let result = Reading::read(&mut session).await;
         session.logout().await;
         result
     };
-    match timeout(Duration::from_secs(18), work).await {
+    match timeout(
+        Duration::from_secs(18),
+        device.read_retries.read("clock", read),
+    )
+    .await
+    {
         Ok(Ok(reading)) => Json(reading.json()).into_response(),
         _ => error(StatusCode::BAD_GATEWAY, "API_CLOCK_READ_FAILED", &cid),
     }

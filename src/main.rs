@@ -151,6 +151,7 @@ async fn run(
     let snapshot_slot = Arc::new(Semaphore::new(1));
     let api = api::Api::prepare(
         config.api.take().unwrap_or_default(),
+        diagnostics,
         &mut config.cameras,
         auth_token,
         snapshot_slot.clone(),
@@ -262,6 +263,7 @@ async fn run(
             })
             .transpose()?;
         let baichuan = camera.baichuan_port.map(|port| Device {
+            read_retries: api.read_retries.for_camera(&camera.id),
             host: camera.host.clone(),
             port,
             username: camera.username.clone(),

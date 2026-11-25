@@ -351,6 +351,33 @@ pub async fn apply(
     cancel_move: &CancellationToken,
 ) -> std::result::Result<Outcome, Failure> {
     capabilities.check(action)?;
+    let dispatch = || apply_once(device, capabilities, action, shutdown, cancel_move);
+    match action {
+        Action::Status | Action::ListPresets => {
+            device
+                .read_retries
+                .read_if(
+                    if matches!(action, Action::Status) {
+                        "ptz.status"
+                    } else {
+                        "ptz.presets"
+                    },
+                    dispatch,
+                    |(_, error)| super::retry::transient(error),
+                )
+                .await
+        }
+        _ => dispatch().await,
+    }
+}
+
+async fn apply_once(
+    device: &Device,
+    capabilities: &Capabilities,
+    action: &Action,
+    shutdown: &CancellationToken,
+    cancel_move: &CancellationToken,
+) -> std::result::Result<Outcome, Failure> {
     if let Action::Move {
         direction,
         duration_ms,
@@ -567,30 +594,37 @@ async fn read_status(
     capabilities: &Capabilities,
 ) -> Result<Value> {
     let mut status = json!({});
-    if (capabilities.pan || capabilities.tilt)
-        && let Ok(body) = session.command(433, Some(channel), "").await
-        && let Ok(doc) = xml::document(&body)
-        && check_channel(doc.root_element(), channel).is_ok()
-    {
-        for (key, tag) in [("pan", "pPos"), ("tilt", "tPos")] {
-            if let Some(position) =
-                xml::value(doc.root_element(), tag).and_then(|value| value.parse::<i32>().ok())
-            {
-                status[key] = position.into();
+    let mut failure = None;
+    if capabilities.pan || capabilities.tilt {
+        match session.command(433, Some(channel), "").await {
+            Ok(body) => {
+                if let Ok(doc) = xml::document(&body)
+                    && check_channel(doc.root_element(), channel).is_ok()
+                {
+                    for (key, tag) in [("pan", "pPos"), ("tilt", "tPos")] {
+                        if let Some(position) = xml::value(doc.root_element(), tag)
+                            .and_then(|value| value.parse::<i32>().ok())
+                        {
+                            status[key] = position.into();
+                        }
+                    }
+                }
             }
+            Err(error) => failure = Some(error),
         }
     }
-    if capabilities.zoom_range.is_some()
-        && let Ok(zoom) = read_zoom(session, channel).await
-    {
-        status["zoom"] = json!(zoom);
+    if capabilities.zoom_range.is_some() {
+        match read_zoom(session, channel).await {
+            Ok(zoom) => status["zoom"] = json!(zoom),
+            Err(error) if failure.is_none() || super::retry::transient(&error) => {
+                failure = Some(error)
+            }
+            Err(_) => {}
+        }
     }
-    anyhow::ensure!(
-        ["pan", "tilt", "zoom"]
-            .iter()
-            .any(|key| status.get(key).is_some()),
-        "camera did not return PTZ position"
-    );
+    if status == json!({}) {
+        return Err(failure.unwrap_or_else(|| anyhow!("camera did not return PTZ position")));
+    }
     status["received_at"] = json!(chrono::Utc::now());
     Ok(status)
 }

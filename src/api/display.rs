@@ -133,15 +133,25 @@ enum Problem {
     Invalid,
     Unsupported,
     Read,
+    TransientRead,
     Rejected(u16),
     Unverified,
 }
 impl Problem {
+    fn transport(error: anyhow::Error) -> Self {
+        if crate::reolink::retry::transient(&error) {
+            Self::TransientRead
+        } else {
+            Self::Read
+        }
+    }
     fn response(self, cid: &CorrelationId) -> Response {
         let (status, key) = match self {
             Self::Invalid => (StatusCode::UNPROCESSABLE_ENTITY, "API_DISPLAY_INVALID"),
             Self::Unsupported => (StatusCode::UNPROCESSABLE_ENTITY, "API_DISPLAY_UNSUPPORTED"),
-            Self::Read => (StatusCode::BAD_GATEWAY, "API_DISPLAY_READ_FAILED"),
+            Self::Read | Self::TransientRead => {
+                (StatusCode::BAD_GATEWAY, "API_DISPLAY_READ_FAILED")
+            }
             Self::Rejected(_) => (StatusCode::UNPROCESSABLE_ENTITY, "API_DISPLAY_REJECTED"),
             Self::Unverified => (StatusCode::BAD_GATEWAY, "API_DISPLAY_UNVERIFIED"),
         };
@@ -199,7 +209,7 @@ async fn read_raw(session: &mut Session, channel: u8, general: bool) -> DisplayR
     {
         Ok(raw) => Ok(raw),
         Err(e) if e.is::<Rejected>() => Ok("<body/>".into()),
-        Err(_) => Err(Problem::Read),
+        Err(error) => Err(Problem::transport(error)),
     }
 }
 
@@ -314,8 +324,8 @@ pub(super) async fn get(
     let Ok(_slot) = api.settings_slots.try_acquire() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "API_READ_BUSY", &cid);
     };
-    let work = async {
-        let mut session = device.connect().await.map_err(|_| Problem::Read)?;
+    let read_camera = || async {
+        let mut session = device.connect().await.map_err(Problem::transport)?;
         let result = async {
             let mut fields = read(&mut session, device.channel, true).await?;
             fields.extend(read(&mut session, device.channel, false).await?);
@@ -325,9 +335,16 @@ pub(super) async fn get(
         session.logout().await;
         result
     };
-    match timeout(Duration::from_secs(20), work)
-        .await
-        .unwrap_or(Err(Problem::Read))
+    match timeout(
+        Duration::from_secs(20),
+        device
+            .read_retries
+            .read_if("display", read_camera, |problem| {
+                matches!(problem, Problem::TransientRead)
+            }),
+    )
+    .await
+    .unwrap_or(Err(Problem::Read))
     {
         Ok(fields) => {
             publish_name(&api, &id, &fields);

@@ -258,13 +258,18 @@ pub(super) async fn get(
     let Ok(_slot) = api.settings_slots.try_acquire() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "API_READ_BUSY", &cid);
     };
-    let work = async {
+    let read = || async {
         let mut session = device.connect().await?;
         let result = read(&mut session, device.channel).await;
         session.logout().await;
         result
     };
-    match timeout(Duration::from_secs(20), work).await {
+    match timeout(
+        Duration::from_secs(20),
+        device.read_retries.read("encoding", read),
+    )
+    .await
+    {
         Ok(Ok(value)) => Json(value).into_response(),
         _ => error(StatusCode::BAD_GATEWAY, "API_ENCODING_READ_FAILED", &cid),
     }

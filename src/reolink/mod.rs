@@ -8,6 +8,7 @@ pub mod ptz;
 pub mod recording_media;
 pub mod recording_settings;
 pub mod recordings;
+pub mod retry;
 pub mod timelapse_photos;
 pub mod wire;
 
@@ -91,7 +92,7 @@ pub async fn discover(
             .map(Settings::Ai),
     );
     for setting in settings {
-        if let Some((state, supported)) = setting.inspect(&mut session, channel).await {
+        if let Ok((state, supported)) = setting.inspect(&mut session, channel).await {
             hub.section(id, "state/settings", setting.key(), state);
             controls.insert(setting.key().into(), supported);
         }

@@ -268,7 +268,7 @@ impl Settings {
         result
     }
 
-    pub async fn inspect(self, session: &mut Session, channel: u8) -> Option<(Value, Value)> {
+    pub async fn inspect(self, session: &mut Session, channel: u8) -> Result<(Value, Value)> {
         use super::recording_settings::Group;
         match self {
             Self::RecordingSchedule => return Group::Schedule.inspect(session, channel).await,
@@ -278,9 +278,9 @@ impl Settings {
         if matches!(self, Self::Image) {
             return super::orientation::inspect(session, channel).await;
         }
-        let raw = self.read(session, channel).await.ok()?;
-        let doc = xml::document(&raw).ok()?;
-        let node = self.root(&doc, channel).ok()?;
+        let raw = self.read(session, channel).await?;
+        let doc = xml::document(&raw)?;
+        let node = self.root(&doc, channel)?;
         let status = self.status(node);
         let supported = |field| !status[field].is_null();
         let controls = match self {
@@ -302,7 +302,7 @@ impl Settings {
                 json!({"sensitivity": supported("sensitivity"), "delay_seconds": supported("delay_seconds")})
             }
         };
-        Some((status, controls))
+        Ok((status, controls))
     }
 }
 

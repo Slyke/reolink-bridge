@@ -336,19 +336,28 @@ impl Recordings {
         let input = directory.path().join("camera.ts");
         let path = directory.path().join("playback.mp4");
         let work = async {
-            let mut output = File::create(&input)
-                .await
-                .context(PreparationStage("temporary-storage"))?;
-            let mut detections = tokio::io::BufWriter::new(
-                File::create(directory.path().join("detections.jsonl"))
+            let metadata = device
+                .read_retries
+                .read("recordings.download", || async {
+                    let mut output = File::create(&input)
+                        .await
+                        .context(PreparationStage("temporary-storage"))?;
+                    let mut detections = tokio::io::BufWriter::new(
+                        File::create(directory.path().join("detections.jsonl"))
+                            .await
+                            .context(PreparationStage("temporary-storage"))?,
+                    );
+                    recording_media::download(
+                        device,
+                        &clip,
+                        &mut output,
+                        &mut detections,
+                        &api.stop,
+                    )
                     .await
-                    .context(PreparationStage("temporary-storage"))?,
-            );
-            let metadata =
-                recording_media::download(device, &clip, &mut output, &mut detections, &api.stop)
-                    .await
-                    .context(PreparationStage("camera-download"))?;
-            drop(output);
+                    .context(PreparationStage("camera-download"))
+                })
+                .await?;
             let size = async {
                 let copy = can_remux_video(&input).await;
                 if !copy || !write_playback(&input, &path, true).await? {
@@ -598,25 +607,10 @@ pub(super) async fn storage(
             }
         }
     };
-    let result = timeout(Duration::from_secs(15), async {
-        match read().await {
-            Err(cause)
-                if cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                    matches!(
-                        e.kind(),
-                        std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::ConnectionAborted
-                            | std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::UnexpectedEof
-                    )
-                }) =>
-            {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                read().await
-            }
-            result => result,
-        }
-    })
+    let result = timeout(
+        Duration::from_secs(15),
+        device.read_retries.read("storage", read),
+    )
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
@@ -721,13 +715,16 @@ pub(super) async fn list(
             &correlation,
         );
     };
-    let result = timeout(Duration::from_secs(45), async {
-        let mut session = device.connect().await?;
-        let result =
-            recordings::search(&mut session, device.channel, start, end, &query.stream).await;
-        session.logout().await;
-        result
-    })
+    let result = timeout(
+        Duration::from_secs(45),
+        device.read_retries.read("recordings.search", || async {
+            let mut session = device.connect().await?;
+            let result =
+                recordings::search(&mut session, device.channel, start, end, &query.stream).await;
+            session.logout().await;
+            result
+        }),
+    )
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);

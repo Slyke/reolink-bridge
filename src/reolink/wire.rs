@@ -44,6 +44,7 @@ impl LiveStream {
 
 #[derive(Clone)]
 pub struct Device {
+    pub read_retries: super::retry::ReadRetries,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -97,11 +98,15 @@ pub struct Packet {
 
 impl Device {
     pub async fn capture_jpeg(&self) -> Result<(Vec<u8>, DateTime<Utc>)> {
-        let mut session = self.connect().await?;
-        let jpeg = session.snapshot_jpeg(self.channel).await?;
-        let captured_at = Utc::now();
-        session.logout().await;
-        Ok((jpeg, captured_at))
+        self.read_retries
+            .read("snapshot", || async {
+                let mut session = self.connect().await?;
+                let jpeg = session.snapshot_jpeg(self.channel).await?;
+                let captured_at = Utc::now();
+                session.logout().await;
+                Ok((jpeg, captured_at))
+            })
+            .await
     }
 
     pub async fn connect(&self) -> Result<Session> {

@@ -32,6 +32,7 @@
   }],
   // Enable background previews or the HTTP video relay for selected cameras.
   // api: {
+  //   cameraReadRetries: 2, // Additional attempts for transient camera reads (0–10).
   //   previews: { cameras: { "front-door": { intervalMs: 5000 } } },
   //   media: { "front-door": { port: 554, streams: ["sub"] } },
   // },

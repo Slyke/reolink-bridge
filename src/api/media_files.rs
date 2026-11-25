@@ -307,7 +307,7 @@ async fn run(
     camera: &str,
     channel: u8,
     s: &mut Session,
-    request: Request,
+    request: &Request,
 ) -> Result<(StatusCode, Value)> {
     let good = |value| Ok((StatusCode::OK, value));
     if let Request::Calendar(q) = request {
@@ -331,7 +331,7 @@ async fn run(
             )
         }
         Request::List(q) => {
-            let found = inventory(s, channel, &scope, &binding, &q).await?;
+            let found = inventory(s, channel, &scope, &binding, q).await?;
             let files = found
                 .files
                 .iter()
@@ -437,11 +437,18 @@ async fn handle(
     } else {
         None
     };
-    let work = async {
+    let operation = || async {
         let mut session = device.connect().await?;
-        let result = run(&api, &camera, device.channel, &mut session, request).await;
+        let result = run(&api, &camera, device.channel, &mut session, &request).await;
         session.logout().await;
         result
+    };
+    let work = async {
+        if deleting {
+            operation().await
+        } else {
+            device.read_retries.read("mediaFiles.read", operation).await
+        }
     };
     let result = timeout(Duration::from_secs(120), work)
         .await

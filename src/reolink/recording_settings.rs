@@ -243,10 +243,10 @@ impl Group {
             }
         }
     }
-    pub async fn inspect(self, session: &mut Session, channel: u8) -> Option<(Value, Value)> {
-        let raw = self.read(session, channel).await.ok()?;
-        let doc = xml::document(&raw).ok()?;
-        self.state(self.root(&doc, channel).ok()?).ok()
+    pub async fn inspect(self, session: &mut Session, channel: u8) -> Result<(Value, Value)> {
+        let raw = self.read(session, channel).await?;
+        let doc = xml::document(&raw)?;
+        self.state(self.root(&doc, channel)?)
     }
 }
 

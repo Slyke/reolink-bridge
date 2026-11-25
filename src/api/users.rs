@@ -53,7 +53,14 @@ pub(super) async fn list(
             &correlation,
         );
     };
-    match timeout(Duration::from_secs(18), credentials::list_users(device)).await {
+    match timeout(
+        Duration::from_secs(18),
+        device
+            .read_retries
+            .read("accounts.list", || credentials::list_users(device)),
+    )
+    .await
+    {
         Ok(Ok((users, supported))) => {
             let blocked = if api.vault.is_none() {
                 Some("vault")

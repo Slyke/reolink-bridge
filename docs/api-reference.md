@@ -128,6 +128,18 @@ Content-Type: application/json
 }
 ```
 
+#### Camera read retries
+
+The authenticated contract reports the current limit in `cameraReadRetries`. Send
+`PUT /api/settings/camera-read-retries` with `{"retries":2}` to change it for subsequent reads.
+The value is an integer from 0 through 10 and counts attempts after the first one.
+Standalone deployments can set `api.cameraReadRetries` in the bridge configuration for startup.
+The default is 2. An operation keeps its original deadline and its limit at dispatch.
+Temporary socket failures on supported reads reconnect with backoff. Camera rejections and
+invalid responses end the operation. Writes, relative PTZ movement, preset recall,
+formatting, file deletion and credential changes are dispatched once. A timed PTZ movement
+still sends its safety Stop if the acknowledgement is lost.
+
 #### `POST /api/terminate`
 
 The first accepted request selects the process exit code. Both fields are optional. An empty POST defaults to 0. The supervisor determines whether the bridge restarts.

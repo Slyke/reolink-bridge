@@ -950,6 +950,25 @@ async fn check_ptz(
         "{movement}"
     );
     assert_eq!(replies["ws-stop"]["result"]["stopped"], true);
+    let before = camera.motions.lock().unwrap().len();
+    camera.drop_move_reply.store(true, Ordering::SeqCst);
+    let (_, lost) = http_ptz(
+        http,
+        address,
+        "lab",
+        "lost-left-ack",
+        json!({"op":"move","direction":"left","duration_ms":150}),
+    )
+    .await;
+    assert_eq!(lost["errorKey"], "PTZ_MOVE_START_FAILED", "{lost}");
+    let motions = camera.motions.lock().unwrap();
+    assert_eq!(
+        motions[before..]
+            .iter()
+            .map(|m| m.0.as_str())
+            .collect::<Vec<_>>(),
+        ["Left", "Stop"]
+    );
 }
 
 async fn http_ptz(

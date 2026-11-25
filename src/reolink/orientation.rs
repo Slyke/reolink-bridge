@@ -90,20 +90,21 @@ pub fn status(root: Node<'_, '_>) -> (Value, Value) {
     )
 }
 
-pub async fn inspect(session: &mut Session, channel: u8) -> Option<(Value, Value)> {
-    let raw = session.command(26, Some(channel), "").await.ok()?;
-    let doc = xml::document(&raw).ok()?;
+pub async fn inspect(session: &mut Session, channel: u8) -> Result<(Value, Value)> {
+    let raw = session.command(26, Some(channel), "").await?;
+    let doc = xml::document(&raw)?;
     let root = doc.root_element();
     let returned = xml::value(root, "channelId")
-        .or_else(|| xml::value(root, "channel"))?
-        .parse::<u8>()
-        .ok()?;
-    if returned != channel {
-        return None;
-    }
+        .or_else(|| xml::value(root, "channel"))
+        .ok_or_else(|| anyhow!("missing orientation channel"))?
+        .parse::<u8>()?;
+    ensure!(returned == channel, "wrong orientation channel");
     let (state, caps) = status(root);
-    (caps["hflip"] == true || caps["vflip"] == true || caps["rotation"] == true)
-        .then_some((state, caps))
+    ensure!(
+        caps["hflip"] == true || caps["vflip"] == true || caps["rotation"] == true,
+        "camera reported no orientation controls"
+    );
+    Ok((state, caps))
 }
 
 pub async fn apply(

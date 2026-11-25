@@ -1934,7 +1934,59 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
     );
     let storage = format!("{origin}/api/cameras/fixture/storage");
     assert_eq!(response(&client, &storage, "wrong", None).await.0, 401);
-    camera.drop_storage_read.store(true, Ordering::SeqCst);
+    let policy = format!("{origin}/api/settings/camera-read-retries");
+    let contract = format!("{origin}/api/contract");
+    let set_policy = |token: &'static str, value: Value| {
+        client
+            .put(&policy)
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .body(value.to_string())
+            .send()
+    };
+    assert_eq!(
+        response(&client, &contract, PRIMARY, None).await.1["cameraReadRetries"],
+        2
+    );
+    assert_eq!(
+        set_policy("wrong", json!({"retries":0})).await?.status(),
+        401
+    );
+    for value in [
+        json!({"retries":11}),
+        json!({"retries":-1}),
+        json!({"retries":0.5}),
+        json!({"retries":2,"other":1}),
+    ] {
+        assert_eq!(set_policy(PRIMARY, value).await?.status(), 400);
+    }
+    let attempts = || camera.storage_attempts.load(Ordering::SeqCst);
+    for (limit, failures, expected_status, count) in
+        [(0, 1, 502, 1), (2, 4, 502, 3), (1, 1, 200, 2)]
+    {
+        assert_eq!(
+            set_policy(PRIMARY, json!({"retries":limit}))
+                .await?
+                .status(),
+            200
+        );
+        assert_eq!(
+            response(&client, &contract, PRIMARY, None).await.1["cameraReadRetries"],
+            limit
+        );
+        camera.drop_storage_reads.store(failures, Ordering::SeqCst);
+        let before = attempts();
+        assert_eq!(
+            response(&client, &storage, PRIMARY, None).await.0,
+            expected_status
+        );
+        assert_eq!(attempts() - before, count);
+    }
+    assert_eq!(
+        set_policy(PRIMARY, json!({"retries":2})).await?.status(),
+        200
+    );
+    camera.drop_storage_reads.store(2, Ordering::SeqCst);
     let card = response(&client, &storage, PRIMARY, None).await;
     assert_eq!(card.0, 200, "{card:?}");
     assert_eq!(card.1["cards"][0]["totalBytes"], 63_500_000_000u64);
@@ -2025,7 +2077,15 @@ async fn recordings_storage_ranges_and_verified_image_orientation() -> Result<()
         (14, &search, 502, "API_RECORDING_SEARCH_FAILED"),
     ] {
         camera.reject_read_command.store(command, Ordering::SeqCst);
+        let before = attempts();
         let (actual, body) = response(&client, url, PRIMARY, None).await;
+        if command == 102 {
+            assert_eq!(
+                attempts() - before,
+                1,
+                "camera rejection must not be retried"
+            );
+        }
         assert_eq!(actual, status, "{body:?}");
         if command == 104 {
             assert!(body["cameraTime"].is_null());

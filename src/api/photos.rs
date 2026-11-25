@@ -108,12 +108,16 @@ pub(super) async fn list(
         );
     };
     let scope = api.recording_scope(&camera);
-    let result = timeout(Duration::from_secs(60), async {
-        let mut session = device.connect().await?;
-        let result = timelapse_photos::search(&mut session, device.channel, &scope, from, to).await;
-        session.logout().await;
-        result
-    })
+    let result = timeout(
+        Duration::from_secs(60),
+        device.read_retries.read("photos.search", || async {
+            let mut session = device.connect().await?;
+            let result =
+                timelapse_photos::search(&mut session, device.channel, &scope, from, to).await;
+            session.logout().await;
+            result
+        }),
+    )
     .await
     .map_err(anyhow::Error::from)
     .and_then(|r| r);
@@ -206,10 +210,15 @@ pub(super) async fn image(
         {
             return Ok(jpeg);
         }
-        let mut session = device.connect().await?;
-        let result = timelapse_photos::download(&mut session, device.channel, &photo).await;
-        session.logout().await;
-        let jpeg = result?;
+        let jpeg = device
+            .read_retries
+            .read("photos.download", || async {
+                let mut session = device.connect().await?;
+                let result = timelapse_photos::download(&mut session, device.channel, &photo).await;
+                session.logout().await;
+                result
+            })
+            .await?;
         let image = Bytes::from(
             tokio::task::spawn_blocking(move || {
                 if options.preview {

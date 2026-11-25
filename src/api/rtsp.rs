@@ -13,15 +13,23 @@ pub(super) struct RtspSettings {
 pub(super) enum Problem {
     Unsupported,
     Read,
+    TransientRead,
     Rejected,
     Unverified,
 }
 
 impl Problem {
+    fn transport(error: anyhow::Error) -> Self {
+        if crate::reolink::retry::transient(&error) {
+            Self::TransientRead
+        } else {
+            Self::Read
+        }
+    }
     pub(super) fn key(self) -> &'static str {
         match self {
             Self::Unsupported => "API_RTSP_UNSUPPORTED",
-            Self::Read => "API_NETWORK_READ_FAILED",
+            Self::Read | Self::TransientRead => "API_NETWORK_READ_FAILED",
             Self::Rejected => "API_RTSP_REJECTED",
             Self::Unverified => "API_RTSP_UNVERIFIED",
         }
@@ -29,7 +37,7 @@ impl Problem {
     fn response(self, cid: &CorrelationId) -> Response {
         let status = match self {
             Self::Unsupported | Self::Rejected => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::Read | Self::Unverified => StatusCode::BAD_GATEWAY,
+            Self::Read | Self::TransientRead | Self::Unverified => StatusCode::BAD_GATEWAY,
         };
         error(status, self.key(), cid)
     }
@@ -61,7 +69,7 @@ async fn read(session: &mut Session) -> Result<RtspSettings, Problem> {
         if e.is::<Rejected>() {
             Problem::Unsupported
         } else {
-            Problem::Read
+            Problem::transport(e)
         }
     })?;
     parse(&raw)
@@ -106,15 +114,20 @@ pub(super) async fn get(
     let Ok(_slot) = api.settings_slots.try_acquire() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "API_READ_BUSY", &cid);
     };
-    let result = async {
-        let mut session = device.connect().await.map_err(|_| Problem::Read)?;
+    let read_camera = || async {
+        let mut session = device.connect().await.map_err(Problem::transport)?;
         let state = read(&mut session).await;
         session.logout().await;
         state
     };
-    match timeout(Duration::from_secs(18), result)
-        .await
-        .unwrap_or(Err(Problem::Read))
+    match timeout(
+        Duration::from_secs(18),
+        device.read_retries.read_if("rtsp", read_camera, |problem| {
+            matches!(problem, Problem::TransientRead)
+        }),
+    )
+    .await
+    .unwrap_or(Err(Problem::Read))
     {
         Ok(state) => Json(json!({"supported":true,"enabled":state.enabled,"port":state.port}))
             .into_response(),

@@ -313,7 +313,10 @@ fn psi(pid: u16, table: u8, body: &[u8]) -> Vec<u8> {
 }
 
 pub async fn cover(device: &Device, clip: &Clip) -> Result<(&'static str, Vec<u8>)> {
-    frame(device, clip, true).await
+    device
+        .read_retries
+        .read("recordings.cover", || frame(device, clip, true))
+        .await
 }
 
 #[derive(Debug)]
@@ -328,7 +331,10 @@ impl std::error::Error for EmptyPreview {}
 
 /// Read only the first keyframe, then stop the download. Older cameras lack CoverPreview.
 pub async fn download_frame(device: &Device, clip: &Clip) -> Result<(&'static str, Vec<u8>)> {
-    frame(device, clip, false).await
+    device
+        .read_retries
+        .read("recordings.frame", || frame(device, clip, false))
+        .await
 }
 
 async fn frame(device: &Device, clip: &Clip, cover: bool) -> Result<(&'static str, Vec<u8>)> {

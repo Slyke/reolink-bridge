@@ -63,6 +63,7 @@ use credentials::{
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
+    camera_read_retries: Option<u8>,
     pub storage_directory: Option<PathBuf>,
     #[serde(default)]
     pub callback_destinations: BTreeSet<Url>,
@@ -97,6 +98,7 @@ impl Config {
 }
 
 pub struct Api {
+    pub read_retries: crate::reolink::retry::ReadRetries,
     pub config: Config,
     http_token: String,
     vault: Option<Mutex<Vault>>,
@@ -123,6 +125,7 @@ pub struct Api {
 impl Api {
     pub fn prepare(
         mut config: Config,
+        diagnostics: &crate::diagnostics::Diagnostics,
         cameras: &mut Vec<Camera>,
         http_token: &str,
         snapshot_slot: Arc<Semaphore>,
@@ -133,6 +136,12 @@ impl Api {
                 || config.storage_directory.is_some(),
             "camera provisioning and credential rotation require api.storageDirectory"
         );
+        let read_retries = crate::reolink::retry::ReadRetries::new(
+            config
+                .camera_read_retries
+                .unwrap_or(crate::reolink::retry::DEFAULT),
+            diagnostics.clone(),
+        )?;
         let configured: BTreeSet<_> = cameras.iter().map(|cam| cam.id.clone()).collect();
         let mut identities: BTreeMap<_, _> = cameras
             .iter()
@@ -250,6 +259,7 @@ impl Api {
                 Some((
                     cam.id.clone(),
                     Device {
+                        read_retries: read_retries.for_camera(&cam.id),
                         host: cam.host.clone(),
                         port: cam.baichuan_port?,
                         username: cam.username.clone(),
@@ -313,6 +323,7 @@ impl Api {
             recordings::Recordings::new(&config.recordings, devices.keys().cloned())?;
         recordings.thumbnail_store = store;
         Ok(Self {
+            read_retries,
             recordings,
             photos: photos::Gallery::default(),
             config,
@@ -426,6 +437,10 @@ pub fn router(api: Arc<Api>) -> Router {
         .layer(DefaultBodyLimit::max(32 * 1024));
     Router::new()
         .route("/api/contract", get(contract))
+        .route(
+            "/api/settings/camera-read-retries",
+            axum::routing::put(set_read_retries),
+        )
         .route("/api/terminate", post(terminate))
         .route("/api/cameras/{id}/talk", get(talk::capability))
         .route(
@@ -607,6 +622,38 @@ async fn terminate(
         .into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetrySetting {
+    retries: u8,
+}
+
+async fn set_read_retries(
+    State(api): State<Arc<Api>>,
+    headers: HeaderMap,
+    Extension(correlation): Extension<CorrelationId>,
+    body: Result<Json<RetrySetting>, JsonRejection>,
+) -> Response {
+    if !api.authenticated(&headers) {
+        return error(StatusCode::UNAUTHORIZED, "API_SCOPE_DENIED", &correlation);
+    }
+    let Ok(Json(setting)) = body else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "API_READ_RETRIES_INVALID",
+            &correlation,
+        );
+    };
+    if !api.read_retries.set(setting.retries) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "API_READ_RETRIES_INVALID",
+            &correlation,
+        );
+    }
+    Json(json!({"retries":setting.retries,"correlation_id":correlation.0})).into_response()
+}
+
 async fn contract(
     State(api): State<Arc<Api>>,
     headers: HeaderMap,
@@ -627,7 +674,7 @@ async fn contract(
     } else {
         Vec::new()
     };
-    Json(json!({"version":1,"terminate":true,"terminationOptions":true,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
+    Json(json!({"version":1,"cameraReadRetries":api.read_retries.get(),"terminate":true,"terminationOptions":true,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
        "talk":true,"detectionZones":true,"privacyMaskEditing":true,"ftpDestination":true,"deviceOptions":true,"displayCameras":api.devices.keys().collect::<Vec<_>>(),
        "encodingCameras":api.devices.keys().collect::<Vec<_>>(),
        "clockCameras":api.devices.keys().collect::<Vec<_>>(),"rtspSettings":true,"networkCameras":api.devices.keys().chain(api.onvif.keys()).collect::<BTreeSet<_>>(),
@@ -834,20 +881,20 @@ async fn settings(
             &correlation,
         );
     };
-    let values = timeout(Duration::from_secs(15), async {
-        let mut session = device.connect().await?;
-        let mut values = Map::new();
-        for group in groups {
-            let (mut value, _) = group
-                .inspect(&mut session, device.channel)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("settings read incomplete"))?;
-            value.as_object_mut().unwrap().remove("vendor");
-            values.insert(group.key().into(), value);
-        }
-        session.logout().await;
-        Ok::<_, anyhow::Error>(values)
-    })
+    let values = timeout(
+        Duration::from_secs(15),
+        device.read_retries.read("settings", || async {
+            let mut session = device.connect().await?;
+            let mut values = Map::new();
+            for &group in &groups {
+                let (mut value, _) = group.inspect(&mut session, device.channel).await?;
+                value.as_object_mut().unwrap().remove("vendor");
+                values.insert(group.key().into(), value);
+            }
+            session.logout().await;
+            Ok::<_, anyhow::Error>(values)
+        }),
+    )
     .await;
     match values {
         Ok(Ok(values)) => {

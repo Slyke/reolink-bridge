@@ -54,7 +54,9 @@ pub struct Camera {
     pub rtsp_writes: AtomicUsize,
     pub wifi_xml: Mutex<Option<String>>,
     pub speaker_volume: Mutex<Option<u8>>,
-    pub drop_storage_read: AtomicBool,
+    pub drop_storage_reads: AtomicUsize,
+    pub storage_attempts: AtomicUsize,
+    pub drop_move_reply: AtomicBool,
     pub formatted_slots: Mutex<Vec<u32>>,
     pub read_only_disk: AtomicBool,
     pub talk_packets: AtomicUsize,
@@ -227,7 +229,20 @@ impl Camera {
                     // The device can apply the write and close the connection without replying.
                     return Ok(());
                 }
-                if command == 102 && self.drop_storage_read.swap(false, Ordering::SeqCst) {
+                if command == 102 {
+                    self.storage_attempts.fetch_add(1, Ordering::SeqCst);
+                    if self
+                        .drop_storage_reads
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                            left.checked_sub(1)
+                        })
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+                if command == 18 && self.drop_move_reply.swap(false, Ordering::SeqCst) {
+                    self.handle(command, std::str::from_utf8(&body[offset..])?)?;
                     return Ok(());
                 }
                 if command == 318 && header[12] == 2 {

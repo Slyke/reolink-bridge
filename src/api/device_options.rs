@@ -19,11 +19,19 @@ enum Problem {
     Invalid,
     Unsupported,
     Read,
+    TransientRead,
     Rejected(u16),
     Unverified,
 }
 type Result<T> = std::result::Result<T, Problem>;
 impl Problem {
+    fn transport(error: anyhow::Error) -> Self {
+        if crate::reolink::retry::transient(&error) {
+            Self::TransientRead
+        } else {
+            Self::Read
+        }
+    }
     fn response(self, cid: &CorrelationId) -> Response {
         let (status, key) = match self {
             Self::ZoneChanged => (StatusCode::CONFLICT, "API_DETECTION_ZONE_CHANGED"),
@@ -36,7 +44,9 @@ impl Problem {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "API_DEVICE_OPTIONS_UNSUPPORTED",
             ),
-            Self::Read => (StatusCode::BAD_GATEWAY, "API_DEVICE_OPTIONS_READ_FAILED"),
+            Self::Read | Self::TransientRead => {
+                (StatusCode::BAD_GATEWAY, "API_DEVICE_OPTIONS_READ_FAILED")
+            }
             Self::Rejected(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "API_DEVICE_OPTIONS_REJECTED",
@@ -60,7 +70,7 @@ async fn read(session: &mut Session, group: &Group, channel: u8) -> Result<Strin
             {
                 Problem::Unsupported
             } else {
-                Problem::Read
+                Problem::transport(e)
             }
         })
 }
@@ -89,15 +99,22 @@ pub(super) async fn get(
     let Ok(_slot) = api.settings_slots.try_acquire() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "API_READ_BUSY", &cid);
     };
-    let work = async {
-        let mut session = device.connect().await.map_err(|_| Problem::Read)?;
+    let read_camera = || async {
+        let mut session = device.connect().await.map_err(Problem::transport)?;
         let raw = read(&mut session, &group, device.channel).await;
         session.logout().await;
         report(&group, &raw?, device.channel)
     };
-    match timeout(Duration::from_secs(18), work)
-        .await
-        .unwrap_or(Err(Problem::Read))
+    match timeout(
+        Duration::from_secs(18),
+        device
+            .read_retries
+            .read_if("device_options", read_camera, |problem| {
+                matches!(problem, Problem::TransientRead)
+            }),
+    )
+    .await
+    .unwrap_or(Err(Problem::Read))
     {
         Ok(data) => Json(data).into_response(),
         Err(problem) => problem.response(&cid),

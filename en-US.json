@@ -54,6 +54,8 @@
   "reolink-bridge-CONFIG_SYNTAX_INVALID": "The configuration file contains invalid JSON5.",
   "reolink-bridge-LOG_CONFIG_INVALID": "The logging configuration is invalid.",
   "reolink-bridge-CONFIG_VALIDATION_FAILED": "The bridge configuration is invalid.",
+  "reolink-bridge-API_READ_RETRIES_INVALID": "Set retries to a whole number from 0 through 10.",
+  "reolink-bridge-CAMERA_READ_RETRY": "Retrying a camera read after a temporary connection failure.",
   "reolink-bridge-API_TERMINATE_INVALID": "Send an empty body or a JSON object with an optional exitCode from 0 to 255 and an optional reason string.",
   "reolink-bridge-SERVICE_TERMINATION_REQUESTED": "An authenticated API request initiated bridge shutdown.",
   "reolink-bridge-SERVICE_BOOT_DIAGNOSTICS": "Bridge starting.",

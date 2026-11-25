@@ -276,10 +276,13 @@ pub(super) async fn get(
     let (native, interfaces) = tokio::join!(
         async {
             match device {
-                Some(d) => timeout(Duration::from_secs(17), Native::read(d))
-                    .await
-                    .ok()
-                    .and_then(Result::ok),
+                Some(d) => timeout(
+                    Duration::from_secs(17),
+                    d.read_retries.read("network", || Native::read(d)),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok),
                 None => None,
             }
         },

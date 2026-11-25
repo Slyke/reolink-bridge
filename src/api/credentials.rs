@@ -82,6 +82,7 @@ impl Target {
                 .context("missing camera credential")?,
         };
         let device = Device {
+            read_retries: Default::default(),
             host: self.host.to_string(),
             port: self.port,
             channel: 0,
@@ -242,6 +243,7 @@ pub struct Credential {
 impl Credential {
     pub fn device(&self) -> Device {
         Device {
+            read_retries: Default::default(),
             host: self.host.clone(),
             port: self.port,
             channel: self.channel,
