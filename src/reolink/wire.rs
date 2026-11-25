@@ -196,6 +196,57 @@ impl Session {
         Ok(())
     }
 
+    pub async fn start_firmware_update(&mut self) -> Result<()> {
+        let body =
+            r#"<body><OnlineUpdate version="1.1"><needUpdate>1</needUpdate></OnlineUpdate></body>"#;
+        let reply = self.exchange(191, 250, "", body, false).await?;
+        ensure!(
+            matches!(reply.status, 200 | 201),
+            "firmware start acknowledgement unknown"
+        );
+        Ok(())
+    }
+
+    pub async fn upload_firmware(&mut self, filename: &str, package: &[u8]) -> Result<()> {
+        let info = format!(
+            r#"<body><ConfigFileInfo version="1.1"><fileName>{}</fileName><fileSize>{}</fileSize><updateParameter>0</updateParameter><channelBits>0</channelBits></ConfigFileInfo></body>"#,
+            xml::escape(filename),
+            package.len()
+        );
+        let prepare = self.exchange(67, 250, "", &info, false).await?;
+        ensure!(
+            matches!(prepare.status, 200 | 201),
+            "firmware preparation acknowledgement unknown"
+        );
+        // Each chunk is acknowledged on the original sequence. Replaying a chunk would corrupt the upload.
+        let ext = self.encode(
+            r#"<Extension version="1.1"><binaryData>1</binaryData></Extension>"#,
+            250,
+        );
+        for chunk in package.chunks(38_000 - 24 - ext.len()) {
+            let mut frame = Vec::with_capacity(24 + ext.len() + chunk.len());
+            frame.extend(MAGIC);
+            frame.extend(67u32.to_le_bytes());
+            frame.extend(((ext.len() + chunk.len()) as u32).to_le_bytes());
+            frame.extend(prepare.sequence.to_le_bytes());
+            frame.extend([0, 0, 0x14, 0x64]);
+            frame.extend((ext.len() as u32).to_le_bytes());
+            frame.extend(&ext);
+            frame.extend(chunk);
+            timeout(Duration::from_secs(12), async {
+                self.socket.write_all(&frame).await?;
+                let ack = self.reply(67, prepare.sequence, false).await?;
+                ensure!(
+                    matches!(ack.status, 200 | 201),
+                    "firmware chunk acknowledgement unknown"
+                );
+                Ok::<(), anyhow::Error>(())
+            })
+            .await??;
+        }
+        Ok(())
+    }
+
     pub async fn format_sd_card(&mut self, slot: u32) -> Result<()> {
         let body = format!(
             r#"<body><HddInitList version="1.1"><HddInit><initId>{slot}</initId></HddInit></HddInitList></body>"#
@@ -372,26 +423,30 @@ impl Session {
             frame.extend(extension);
             frame.extend(body);
             self.socket.write_all(&frame).await?;
-            loop {
-                let packet = self.read().await?;
-                if packet.command == command && packet.sequence == sequence {
-                    ensure!(
-                        matches!(packet.status, 200 | 201)
-                            || (packet.status == 300 && !matches!(command, 18 | 19 | 295))
-                            || (challenge && packet.status & 0xff00 == 0xdd00),
-                        Rejected {
-                            command,
-                            status: packet.status
-                        }
-                    );
-                    return Ok(packet);
-                }
-                if matches!(packet.command, 33 | 291) && self.pushes.len() < 32 {
-                    self.pushes.push_back(packet);
-                }
-            }
+            self.reply(command, sequence, challenge).await
         })
         .await?
+    }
+
+    async fn reply(&mut self, command: u32, sequence: u32, challenge: bool) -> Result<Packet> {
+        loop {
+            let packet = self.read().await?;
+            if packet.command == command && packet.sequence == sequence {
+                ensure!(
+                    matches!(packet.status, 200 | 201)
+                        || (packet.status == 300 && !matches!(command, 18 | 19 | 295))
+                        || (challenge && packet.status & 0xff00 == 0xdd00),
+                    Rejected {
+                        command,
+                        status: packet.status
+                    }
+                );
+                return Ok(packet);
+            }
+            if matches!(packet.command, 33 | 291) && self.pushes.len() < 32 {
+                self.pushes.push_back(packet);
+            }
+        }
     }
 
     pub async fn read(&mut self) -> Result<Packet> {
@@ -568,4 +623,83 @@ fn xor(bytes: &mut [u8], channel: u8) {
 fn hash(text: &str) -> String {
     let digest = format!("{:X}", md5::compute(text));
     digest[..31].into()
+}
+
+#[cfg(test)]
+mod firmware_upload_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    async fn upload(status: u16) -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let socket = TcpStream::connect(listener.local_addr()?).await?;
+        let package: Vec<u8> = (0..80_000).map(|i| (i % 251) as u8).collect();
+        let expected = package.clone();
+        let camera = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut sequence = None;
+            loop {
+                let mut header = [0; 24];
+                connection.read_exact(&mut header).await.unwrap();
+                assert_eq!(&header[..4], &MAGIC);
+                assert_eq!(le_u32(&header, 4), 67);
+                let seq = le_u32(&header, 12);
+                let mut body = vec![0; le_u32(&header, 8) as usize];
+                assert!(24 + body.len() <= 38_000);
+                connection.read_exact(&mut body).await.unwrap();
+                let offset = le_u32(&header, 20) as usize;
+                let response_status = if let Some(initial) = sequence {
+                    assert_eq!(seq, initial);
+                    xor(&mut body[..offset], seq as u8);
+                    assert!(
+                        std::str::from_utf8(&body[..offset])
+                            .unwrap()
+                            .contains("<binaryData>1</binaryData>")
+                    );
+                    received.extend_from_slice(&body[offset..]);
+                    status
+                } else {
+                    assert_eq!(offset, 0);
+                    xor(&mut body, seq as u8);
+                    let xml = std::str::from_utf8(&body).unwrap();
+                    assert!(xml.contains("<updateParameter>0</updateParameter>"));
+                    assert!(xml.contains("<fileSize>80000</fileSize>"));
+                    sequence = Some(seq);
+                    200
+                };
+                header[8..12].fill(0);
+                header[16..18].copy_from_slice(&response_status.to_le_bytes());
+                header[20..24].fill(0);
+                connection.write_all(&header).await.unwrap();
+                if response_status != 200 {
+                    break;
+                }
+                if received.len() >= expected.len() {
+                    assert_eq!(received, expected);
+                    break;
+                }
+            }
+        });
+        let mut client = Session {
+            socket,
+            buffer: BytesMut::new(),
+            sequence: 0,
+            key: None,
+            stream_sequence: None,
+            preview_type: 0,
+            pushes: VecDeque::new(),
+        };
+        let outcome = client.upload_firmware("fixture.pak", &package).await;
+        drop(client);
+        camera.await.unwrap();
+        outcome
+    }
+
+    #[tokio::test]
+    async fn camera_acknowledges_each_unmodified_firmware_chunk_on_one_sequence() {
+        upload(200).await.unwrap();
+        let err = upload(400).await.unwrap_err();
+        assert_eq!(err.downcast_ref::<Rejected>().unwrap().status(), 400);
+    }
 }

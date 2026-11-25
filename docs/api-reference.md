@@ -1771,6 +1771,14 @@ Content-Type: application/json
 
 Possible progress states include `waiting`, `identity-mismatch`, `local-setup-required`, `recovery-required`, `in-progress`, `verified`, `restart-required`, `active`, `previous-credential-valid` and `not-started`. The camera ID can be null before activation or on a credential-only operation.
 
+## Camera firmware
+
+`GET /api/cameras/{id}/firmware` reads the model, hardware revision, installed firmware, update permission and any progress supplied by the camera. Add `?check=true` to query the camera's online offer. A null `updateAvailable` or `progress` means the camera did not supply that information. The contract lists cameras under `firmwareCameras`.
+
+To start an offered update, send an authenticated `POST /api/cameras/{id}/firmware?source=<source>&confirm=true` with an empty body. For a local installation, also supply the URL-encoded original filename as `file` and the contents of the matching Reolink `.pak` or `.paks` file as `application/octet-stream` (up to 128 MiB). Use the `source` from the latest read. The bridge checks the camera identity and installed build again before starting. A local installation asks the camera to retain settings.
+
+HTTP 202 acknowledges the transfer or start command. Read the installed version after the camera restarts to verify completion. If a connection fails partway, check the camera before making another request.
+
 ## Implementation sources
 
 The router and serializers define the HTTP routes, WebSocket operations and typed camera controls. [HTTP and WebSocket handlers](../src/http.rs) · [REST routes](../src/api.rs) · [Camera controls](../src/reolink/control.rs)

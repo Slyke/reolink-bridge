@@ -2,6 +2,8 @@
 
 The authenticated API is available under `/api` on the bridge's HTTP listener. Send `http.token` as a bearer token. Inventory is available with the standard bridge configuration. Use the optional `api` section for cached previews, video profiles, recording storage, and enrollment.
 
+Camera firmware settings and installation are documented in the [firmware API reference](api-reference.md#camera-firmware).
+
 With `terminate: true` and `terminationOptions: true`, `POST /api/terminate` accepts a JSON object with an optional `reason` and an optional integer `exitCode` from 0 through 255 (default 0). Use the bridge's HTTP bearer token. The bridge acknowledges the request with HTTP 202, writes the exit code and reason to stdout and the configured logger, and exits. A supervisor such as Kubernetes starts the replacement process.
 
 ```json5

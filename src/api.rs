@@ -3,6 +3,7 @@ mod credentials;
 mod device_options;
 mod display;
 mod encoding;
+mod firmware;
 mod media;
 mod media_files;
 mod network;
@@ -461,6 +462,10 @@ pub fn router(api: Arc<Api>) -> Router {
                 .put(device_options::set)
                 .layer(DefaultBodyLimit::max(20 * 1024)),
         )
+        .route(
+            "/api/cameras/{id}/firmware",
+            get(firmware::get).post(firmware::install),
+        )
         .route("/api/cameras/{id}/clock", get(clock::get).put(clock::set))
         .route(
             "/api/cameras/{id}/network/wifi",
@@ -677,7 +682,7 @@ async fn contract(
     Json(json!({"version":1,"cameraReadRetries":api.read_retries.get(),"terminate":true,"terminationOptions":true,"eventStream":true,"media":!profiles.is_empty(),"mediaCameras":profiles,
        "talk":true,"detectionZones":true,"privacyMaskEditing":true,"ftpDestination":true,"deviceOptions":true,"displayCameras":api.devices.keys().collect::<Vec<_>>(),
        "encodingCameras":api.devices.keys().collect::<Vec<_>>(),
-       "clockCameras":api.devices.keys().collect::<Vec<_>>(),"rtspSettings":true,"networkCameras":api.devices.keys().chain(api.onvif.keys()).collect::<BTreeSet<_>>(),
+       "firmwareCameras":api.devices.keys().collect::<Vec<_>>(),"clockCameras":api.devices.keys().collect::<Vec<_>>(),"rtspSettings":true,"networkCameras":api.devices.keys().chain(api.onvif.keys()).collect::<BTreeSet<_>>(),
        "userCameras":api.devices.keys().collect::<Vec<_>>(),
        "storageCameras":api.devices.keys().collect::<Vec<_>>(),
        "mediaFileCameras":api.devices.keys().collect::<Vec<_>>(),

@@ -1,4 +1,10 @@
 {
+  "reolink-bridge-API_FIRMWARE_INVALID": "Supply a valid firmware selection and package.",
+  "reolink-bridge-API_FIRMWARE_NO_OFFER": "The camera did not offer an online firmware update.",
+  "reolink-bridge-API_FIRMWARE_READ_FAILED": "The camera firmware information could not be read.",
+  "reolink-bridge-API_FIRMWARE_REJECTED": "The camera rejected the firmware installation.",
+  "reolink-bridge-API_FIRMWARE_UNKNOWN": "The bridge lost confirmation of the firmware operation. Check the installed version after the camera reconnects.",
+  "reolink-bridge-API_FIRMWARE_UNSUPPORTED": "Firmware installation is unavailable for this camera and login.",
   "reolink-bridge-API_ENROLLMENT_ADDRESS_UNKNOWN": "No configured enrollment camera matches this IP address and port.",
   "reolink-bridge-API_ENROLLMENT_ADDRESS_AMBIGUOUS": "More than one configured camera matches the enrollment address.",
   "reolink-bridge-API_ENROLLMENT_PASSWORD_INVALID": "The configured first camera password must contain 8–31 printable ASCII characters.",
